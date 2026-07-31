@@ -15,6 +15,12 @@ pip install -e ".[dev]"
 
 ## 配置模型
 
+复制模板生成自己的配置（`config.toml` 含密钥，已被 git 忽略）：
+
+```bash
+cp config.example.toml config.toml
+```
+
 编辑项目根目录的 `config.toml`，启动时自动加载：
 
 ```toml
