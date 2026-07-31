@@ -1,0 +1,14 @@
+# LLM Olympics 配置模板
+# 用法：复制为 config.toml 并填入真实配置（config.toml 已被 .gitignore 排除，不会提交）。
+# 取值优先级：环境变量 > config.toml > 默认值。
+
+# OpenAI 及兼容接口（DeepSeek、Kimi、OpenRouter 等都走这里）
+[openai]
+# api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
+# base_url = "https://openrouter.ai/api/v1" # 兼容接口填这里；对应 OPENAI_BASE_URL
+# default_model = "openai/gpt-4o-mini"      # 选手写 openai（不带模型名）时用它
+
+# Ollama 本地模型
+[ollama]
+# base_url = "http://localhost:11434"       # 对应环境变量 OLLAMA_BASE_URL
+# default_model = "llama3.1"                # 选手写 ollama（不带模型名）时用它

@@ -1,0 +1,19 @@
+# 密钥与本地配置（绝不提交）
+config.toml
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 项目内的工具链与虚拟环境
+.venv/
+.bin/
+.pythons/
+.uv-cache/
+
+# 系统
+.DS_Store
