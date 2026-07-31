@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import random
 
+from pydantic import Field
+
 from llmolympic.core.game import FORFEIT_MOVE, GameState, IllegalMoveError
 
 #: 内置题库：question / options / answer（正确选项字母）/ domain。
@@ -92,8 +94,8 @@ _LETTERS = ("A", "B", "C", "D")
 class KnowledgeQuizState(GameState):
     rounds: int
     questions: list[dict]  # 从 QUESTION_BANK 抽出的题目（含 "source": "static"）
-    cursor: dict[str, int] = {}
-    answers: dict[str, list[str]] = {}
+    cursor: dict[str, int] = Field(default_factory=dict)
+    answers: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class KnowledgeQuiz:
@@ -102,6 +104,8 @@ class KnowledgeQuiz:
     name = "knowledge_quiz"
 
     def __init__(self, rounds: int = 5) -> None:
+        if rounds < 1:
+            raise ValueError("rounds 必须至少为 1")
         self.rounds = rounds
 
     def new_state(self, players: list[str], seed: int) -> KnowledgeQuizState:

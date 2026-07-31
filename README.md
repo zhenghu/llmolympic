@@ -30,6 +30,9 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 
 [ollama]
 # base_url = "http://localhost:11434"
+
+[storage]
+# database = "~/.llmolympic/llmolympic.db"
 ```
 
 取值优先级：环境变量 > `config.toml` > 默认值。
@@ -49,10 +52,27 @@ llmolympic play --game math_quiz --players openai:gpt-4o-mini,ollama:llama3.1 --
 
 # 列出所有比赛项目
 llmolympic games
+
+# 查看总体 / 分项目 ELO 榜
+llmolympic leaderboard
+llmolympic leaderboard --game math_quiz
+
+# 查看对局历史与完整档案
+llmolympic history
+llmolympic archive <MATCH_ID>
 ```
+
+每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO。
+完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
+`~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
+或各命令的 `--db` 覆盖。
+
+ELO 目前适用于双人对局：比较双方最终比分后按胜 / 平 / 负更新。单人或多人
+对局仍会完整存档，但不会计入 ELO。榜单身份目前使用档案中的选手名称。
 
 ## 测试
 
 ```bash
 pytest
+ruff check .
 ```

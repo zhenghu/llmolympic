@@ -5,12 +5,14 @@ from __future__ import annotations
 import pytest
 
 from llmolympic import config
+from llmolympic.core.storage import database_path
 
 
 @pytest.fixture(autouse=True)
 def _clear_cache(monkeypatch: pytest.MonkeyPatch, tmp_path):
     """每个用例都用独立配置路径并清掉 lru_cache。"""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLMOLYMPIC_DB", raising=False)
     yield
     load_config_cache_clear()
 
@@ -44,3 +46,15 @@ def test_env_var_overrides_file(monkeypatch: pytest.MonkeyPatch, tmp_path) -> No
     _use_config(monkeypatch, tmp_path, '[openai]\napi_key = "sk-file"\n')
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
     assert config.get("openai", "api_key", env="OPENAI_API_KEY") == "sk-env"
+
+
+def test_database_path_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    configured = tmp_path / "configured.db"
+    environment = tmp_path / "environment.db"
+    explicit = tmp_path / "explicit.db"
+    _use_config(monkeypatch, tmp_path, f'[storage]\ndatabase = "{configured}"\n')
+
+    assert database_path() == configured.resolve()
+    monkeypatch.setenv("LLMOLYMPIC_DB", str(environment))
+    assert database_path() == environment.resolve()
+    assert database_path(explicit) == explicit.resolve()

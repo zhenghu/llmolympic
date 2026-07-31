@@ -89,3 +89,9 @@ class TestKnowledgeQuiz:
 def test_create_game_unknown_name() -> None:
     with pytest.raises(ValueError, match="未知项目"):
         create_game("chess")
+
+
+@pytest.mark.parametrize("game", ["math_quiz", "knowledge_quiz"])
+def test_create_game_rejects_zero_rounds(game: str) -> None:
+    with pytest.raises(ValueError, match="至少为 1"):
+        create_game(game, rounds=0)

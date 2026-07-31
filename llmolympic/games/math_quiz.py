@@ -8,6 +8,8 @@ from __future__ import annotations
 import random
 import re
 
+from pydantic import Field
+
 from llmolympic.core.game import FORFEIT_MOVE, GameState, IllegalMoveError
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -17,8 +19,8 @@ _TOLERANCE = 1e-6
 class MathQuizState(GameState):
     rounds: int
     questions: list[dict]  # {"text": str, "answer": float, "source": "generated"}
-    cursor: dict[str, int] = {}  # 每个选手下一题的下标
-    answers: dict[str, list[str]] = {}  # 每个选手已提交的原始走法
+    cursor: dict[str, int] = Field(default_factory=dict)  # 每个选手下一题的下标
+    answers: dict[str, list[str]] = Field(default_factory=dict)  # 每个选手已提交的原始走法
 
 
 def _gen_question(rng: random.Random) -> dict:
@@ -52,6 +54,8 @@ class MathQuiz:
     name = "math_quiz"
 
     def __init__(self, rounds: int = 5) -> None:
+        if rounds < 1:
+            raise ValueError("rounds 必须至少为 1")
         self.rounds = rounds
 
     def new_state(self, players: list[str], seed: int) -> MathQuizState:

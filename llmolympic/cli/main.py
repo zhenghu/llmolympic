@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -10,9 +13,18 @@ from rich.panel import Panel
 from rich.table import Table
 
 from llmolympic.config import get as cfg_get
+from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
-from llmolympic.core.match import Match
+from llmolympic.core.game import Game
+from llmolympic.core.match import play_match
 from llmolympic.core.player import HumanPlayer, LLMPlayer, Player
+from llmolympic.core.storage import (
+    SQLITE_INT_MAX,
+    SQLITE_INT_MIN,
+    SaveResult,
+    SQLiteStore,
+    StorageError,
+)
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_provider
 
@@ -46,6 +58,9 @@ def _parse_players(spec: str, human_timeout: float) -> list[Player]:
                 )
         provider = create_provider(kind, ident)
         players.append(LLMPlayer(name=f"{kind}:{ident}", provider=provider, model=ident))
+    names = [player.name for player in players]
+    if len(set(names)) != len(names):
+        raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
     return players
 
 
@@ -77,11 +92,49 @@ def _render(ev: MatchEvent) -> None:
         console.print(table)
 
 
-async def _run(game_name: str, players: list[Player], rounds: int, seed: int) -> None:
-    game = create_game(game_name, rounds=rounds)
-    match = Match(game, players, seed=seed)
-    async for ev in match.run():
-        _render(ev)
+def _open_store(path: Path | None, *, create: bool = True) -> SQLiteStore:
+    try:
+        return SQLiteStore(path, create=create)
+    except (OSError, sqlite3.Error, StorageError) as exc:
+        console.print(f"[red]无法打开 SQLite 数据库：{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+
+def _render_saved(archive: MatchArchive, store: SQLiteStore, result: SaveResult) -> None:
+    if not result.inserted:
+        console.print(f"[yellow]档案 {archive.match_id} 已存在，未重复更新 ELO。[/]")
+        return
+
+    console.print(f"[green]✓ 对局已存档[/]  {archive.match_id}\n  {store.path}")
+    if not result.rated:
+        console.print("[yellow]本场不是双人对局，未计入 ELO。[/]")
+        return
+
+    table = Table(title="ELO 更新")
+    table.add_column("榜单")
+    table.add_column("选手")
+    table.add_column("原分", justify="right")
+    table.add_column("新分", justify="right")
+    table.add_column("变化", justify="right")
+    for change in result.rating_changes:
+        scope = "总榜" if change.game is None else change.game
+        delta = change.after - change.before
+        table.add_row(
+            scope,
+            change.player,
+            f"{change.before:.1f}",
+            f"{change.after:.1f}",
+            f"{delta:+.1f}",
+        )
+    console.print(table)
+
+
+async def _run(
+    game: Game, players: list[Player], seed: int, store: SQLiteStore
+) -> None:
+    archive = await play_match(game, players, seed=seed, on_event=_render)
+    result = store.save_match(archive)
+    _render_saved(archive, store, result)
 
 
 @app.command()
@@ -93,12 +146,40 @@ def play(
         "-p",
         help="逗号分隔的选手规格，如 openai:gpt-4o-mini,human:小明,ollama:llama3.1",
     ),
-    rounds: int = typer.Option(5, "--rounds", "-n", help="每人题数"),
-    seed: int = typer.Option(0, "--seed", "-s", help="随机种子（同 seed 同题）"),
-    timeout: float = typer.Option(60.0, "--timeout", "-t", help="人类选手每题限时（秒）"),
+    rounds: int = typer.Option(5, "--rounds", "-n", min=1, help="每人题数"),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        "-s",
+        min=SQLITE_INT_MIN,
+        max=SQLITE_INT_MAX,
+        help="随机种子（同 seed 同题）",
+    ),
+    timeout: float = typer.Option(
+        60.0, "--timeout", "-t", min=0.001, help="人类选手每题限时（秒）"
+    ),
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
 ) -> None:
-    """开始一场对局。"""
-    asyncio.run(_run(game, _parse_players(players, timeout), rounds, seed))
+    """开始一场对局，结束后自动存档并更新 ELO。"""
+    try:
+        selected_game = create_game(game, rounds=rounds)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--game") from exc
+    try:
+        selected_players = _parse_players(players, timeout)
+    except typer.BadParameter:
+        raise
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    store = _open_store(database)
+    try:
+        asyncio.run(_run(selected_game, selected_players, seed, store))
+    except (OSError, sqlite3.Error, StorageError) as exc:
+        console.print(f"[red]对局已完成，但 SQLite 存档失败：{exc}[/]")
+        raise typer.Exit(code=1) from exc
 
 
 @app.command(name="games")
@@ -106,3 +187,79 @@ def list_available_games() -> None:
     """列出已注册的比赛项目。"""
     for name in list_games():
         console.print(f"- {name}")
+
+
+@app.command()
+def history(
+    game: str | None = typer.Option(None, "--game", "-g", help="只看指定比赛项目"),
+    limit: int = typer.Option(20, "--limit", "-n", min=1, help="最多显示多少场"),
+    database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
+) -> None:
+    """查看最近的对局档案。"""
+    try:
+        rows = _open_store(database, create=False).list_matches(limit=limit, game=game)
+    except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+        console.print(f"[red]无法读取 SQLite 对局历史：{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    if not rows:
+        console.print("暂无对局档案。")
+        return
+
+    console.print("[bold]对局历史[/]")
+    for row in rows:
+        score_text = " · ".join(f"{name} {row.scores[name]:.2f}" for name in row.players)
+        console.print(
+            f"[bold cyan]{row.match_id}[/]  {row.game}  "
+            f"{row.finished_at.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
+            f"  {score_text}"
+        )
+
+
+@app.command()
+def leaderboard(
+    game: str | None = typer.Option(None, "--game", "-g", help="项目榜；省略则显示总榜"),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, help="最多显示多少名"),
+    database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
+) -> None:
+    """查看持久化 ELO 排行榜。"""
+    try:
+        entries = _open_store(database, create=False).leaderboard(game=game, limit=limit)
+    except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+        console.print(f"[red]无法读取 SQLite ELO 榜：{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    if not entries:
+        console.print("暂无 ELO 记录。")
+        return
+
+    table = Table(title=f"ELO {'总榜' if game is None else game}")
+    table.add_column("排名", justify="right")
+    table.add_column("选手")
+    table.add_column("等级分", justify="right")
+    table.add_column("场次", justify="right")
+    table.add_column("胜-平-负", justify="right")
+    for rank, entry in enumerate(entries, start=1):
+        table.add_row(
+            str(rank),
+            entry.player,
+            f"{entry.rating:.1f}",
+            str(entry.games_played),
+            f"{entry.wins}-{entry.draws}-{entry.losses}",
+        )
+    console.print(table)
+
+
+@app.command(name="archive")
+def show_archive(
+    match_id: str = typer.Argument(..., help="对局 ID"),
+    database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
+) -> None:
+    """输出一场对局的完整 JSON 档案。"""
+    try:
+        archive = _open_store(database, create=False).get_match(match_id)
+    except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+        console.print(f"[red]无法读取 SQLite 对局档案：{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    if archive is None:
+        console.print(f"[red]未找到对局 {match_id!r}。[/]")
+        raise typer.Exit(code=1)
+    console.print_json(archive.to_json())

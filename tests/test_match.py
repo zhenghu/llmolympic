@@ -30,6 +30,22 @@ def test_mock_match_completes_with_archive() -> None:
     assert "mock-a" in archive.to_json()
 
 
+def test_event_callback_receives_the_archived_event_stream() -> None:
+    players = [_llm("mock-a", "fixed"), _llm("mock-b", "random", seed=3)]
+    rendered = []
+
+    archive = asyncio.run(
+        play_match(
+            create_game("math_quiz", rounds=2),
+            players,
+            seed=9,
+            on_event=rendered.append,
+        )
+    )
+
+    assert rendered == archive.events
+
+
 def test_knowledge_match_scores_sum_consistent() -> None:
     players = [_llm("mock-a", "random", seed=3), _llm("mock-b", "fixed")]
     archive = asyncio.run(play_match(create_game("knowledge_quiz", rounds=5), players, seed=0))

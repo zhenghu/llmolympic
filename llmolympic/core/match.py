@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 
 from llmolympic.core.archive import MatchArchive, archive_from_events
@@ -95,12 +95,24 @@ class Match:
 
 
 async def play_match(
-    game: Game, players: list[Player], seed: int = 0, max_attempts: int = 3
+    game: Game,
+    players: list[Player],
+    seed: int = 0,
+    max_attempts: int = 3,
+    on_event: Callable[[MatchEvent], None] | None = None,
 ) -> MatchArchive:
-    """跑完一整场并返回对局档案（测试 / 脚本场景用）。"""
+    """跑完一整场并返回对局档案。
+
+    ``on_event`` 可用于实时渲染；回调收到的正是最终写入档案的同一批事件，
+    因此界面无需为了存档而重跑一场对局。
+    """
     match = Match(game, players, seed=seed, max_attempts=max_attempts)
     started = datetime.now(UTC)
-    events = [ev async for ev in match.run()]
+    events: list[MatchEvent] = []
+    async for event in match.run():
+        events.append(event)
+        if on_event is not None:
+            on_event(event)
     finished = datetime.now(UTC)
     return archive_from_events(
         game=game.name,
