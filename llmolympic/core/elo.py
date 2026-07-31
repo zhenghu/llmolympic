@@ -1,4 +1,8 @@
-"""标准 ELO 评分（K=32）。内存计算；SQLite 持久化属阶段二。"""
+"""标准 ELO 评分（K=32）。
+
+本模块提供纯计算和轻量内存榜；SQLite 榜单与历史记录由
+``llmolympic.core.storage.SQLiteStore`` 持久化。
+"""
 
 from __future__ import annotations
 

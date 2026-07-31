@@ -11,7 +11,7 @@
 | **Player**（选手） | 统一抽象。`LLMPlayer`（调模型 API）与 `HumanPlayer`（外部输入）对引擎透明 |
 | **Match**（对局） | 通用回合循环：发题面 → 收走法 → 校验推进 → 判分 |
 | **Judge**（裁判） | 规则判分内嵌在各 Game 的 `score()`；`LLMJudgePanel` 接口预留给创意类 |
-| **Rating**（评分） | 标准 ELO（K=32），分项目 + 总榜 |
+| **Rating**（评分） | 标准 ELO（K=32），分项目 + 总榜，SQLite 持久化 |
 
 ## 2. 统一 Game 接口（核心设计）
 
@@ -69,6 +69,8 @@ CLI（今天）          WebSocket（将来）
   标 `source: static`，报表分开统计。
 - 所有选手拿到逐字相同的 prompt；统一超时与 max_tokens；
   采样参数、每步走法、完整事件流记入对局档案（pydantic，可 JSON 序列化），结果可复核。
+- 每场结束后，完整 JSON 档案、选手索引、总榜/项目榜 ELO 与评分历史在同一
+  SQLite 事务中写入；`match_id` 防止重复计分。
 - 人类选手限时作答；同一模型跑 N 局取平均，降低采样运气成分。
 
 ## 6. 比赛模式
@@ -83,7 +85,7 @@ CLI（今天）          WebSocket（将来）
 - **建模**：Pydantic v2（状态、事件、档案）
 - **CLI**：Typer + Rich
 - **Web（阶段四）**：FastAPI + WebSocket；前端 React
-- **存储（阶段二）**：SQLite（题库、对局记录、ELO 历史）
+- **存储**：SQLite（对局记录、总榜/项目榜、ELO 历史；题库待接入）
 - **棋类（阶段二）**：python-chess
 - **模型接入**：OpenAI 官方 SDK / Ollama（本地）/ Mock（离线演示与测试）
 - **工具**：uv 或 pip、pytest、ruff
@@ -92,7 +94,7 @@ CLI（今天）          WebSocket（将来）
 
 1. **MVP** ✅：core 引擎（回合循环 + 事件流）+ 数学/知识问答两个单轮项目 +
    provider 抽象（openai/ollama/mock）+ CLI，LLM vs LLM 与人类入场。
-2. **ELO + SQLite 持久化 + 下棋**：接入 python-chess，验证引擎的多轮状态机能力。
+2. **阶段二（进行中）**：ELO + SQLite 持久化 ✅；接入 python-chess，验证引擎的多轮状态机能力。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜；循环赛与锦标赛模式。
    之后新增项目（猜谜、推理等）纯写插件。

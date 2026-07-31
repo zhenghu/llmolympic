@@ -12,3 +12,7 @@
 [ollama]
 # base_url = "http://localhost:11434"       # 对应环境变量 OLLAMA_BASE_URL
 # default_model = "llama3.1"                # 选手写 ollama（不带模型名）时用它
+
+# SQLite 对局档案与 ELO（对应环境变量 LLMOLYMPIC_DB）
+[storage]
+# database = "~/.llmolympic/llmolympic.db"

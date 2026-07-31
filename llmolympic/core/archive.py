@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from llmolympic.core.events import EventType, MatchEvent
+
+ARCHIVE_SCHEMA_VERSION = 1
 
 
 class MoveRecord(BaseModel):
@@ -22,7 +25,8 @@ class MoveRecord(BaseModel):
 
 
 class MatchArchive(BaseModel):
-    match_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    schema_version: Literal[1] = ARCHIVE_SCHEMA_VERSION
+    match_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     game: str
     seed: int
     players: list[dict]  # Player.describe()，含 provider / 模型 / 采样参数
