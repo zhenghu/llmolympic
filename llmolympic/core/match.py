@@ -18,8 +18,16 @@ from datetime import UTC, datetime
 
 from llmolympic.core.archive import MatchArchive, archive_from_events
 from llmolympic.core.events import EventType, MatchEvent
-from llmolympic.core.game import FORFEIT_MOVE, Game, IllegalMoveError
+from llmolympic.core.game import FORFEIT_MOVE, Game, IllegalMoveError, validate_players
 from llmolympic.core.player import Player, PlayerTimeoutError
+
+_FEEDBACK_PREVIEW_LIMIT = 200
+
+
+def _feedback_preview(text: str) -> str:
+    if len(text) <= _FEEDBACK_PREVIEW_LIMIT:
+        return text
+    return f"{text[: _FEEDBACK_PREVIEW_LIMIT - 3]}..."
 
 
 class Match:
@@ -33,8 +41,9 @@ class Match:
         self, game: Game, players: list[Player], seed: int = 0, max_attempts: int = 3
     ) -> None:
         names = [p.name for p in players]
-        if len(set(names)) != len(names):
-            raise ValueError(f"选手名字必须唯一: {names}")
+        validate_players(game, names)
+        if max_attempts < 1:
+            raise ValueError("max_attempts 必须至少为 1")
         self.game = game
         self.players = {p.name: p for p in players}
         self.seed = seed
@@ -60,8 +69,9 @@ class Match:
         while not self.game.is_over(state):
             for name in self.game.current_players(state):
                 player = self.players[name]
-                prompt = self.game.prompt_for(state, name)
-                yield emit(EventType.TURN_PROMPT, player=name, prompt=prompt)
+                original_prompt = self.game.prompt_for(state, name)
+                prompt = original_prompt
+                yield emit(EventType.TURN_PROMPT, player=name, prompt=original_prompt)
 
                 attempts = 0
                 while True:
@@ -87,9 +97,20 @@ class Match:
                                 reason=f"{exc}；已达最大重试次数，判放弃",
                             )
                             break
+                        reason = str(exc)
                         yield emit(
-                            EventType.MOVE_REJECTED, player=name, move=move, reason=str(exc)
+                            EventType.MOVE_REJECTED, player=name, move=move, reason=reason
                         )
+                        move_preview = _feedback_preview(repr(move))
+                        reason_preview = _feedback_preview(reason)
+                        remaining = self.max_attempts - attempts
+                        prompt = (
+                            f"{original_prompt}\n\n"
+                            f"上次输出 {move_preview} 未被接受：{reason_preview}\n"
+                            f"还可重试 {remaining} 次。请修正后重新作答，"
+                            "只输出符合题面格式的答案。"
+                        )
+                        yield emit(EventType.TURN_PROMPT, player=name, prompt=prompt)
 
         yield emit(EventType.MATCH_FINISHED, scores=self.game.score(state))
 

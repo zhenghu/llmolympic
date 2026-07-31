@@ -40,6 +40,9 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 
 ## 运行
 
+macOS 可以在 Finder 中双击 `play.command`，菜单中的前两项就是五子棋：
+自己执黑对战 mock，或观看两个 mock 自动对战。
+
 ```bash
 # 两个 mock 选手演示（离线，无需 key）
 llmolympic play --game math_quiz --players mock:random,mock:fixed --rounds 5
@@ -49,6 +52,12 @@ llmolympic play --game knowledge_quiz --players human:我,openai:gpt-4o-mini
 
 # 两个模型对战（同 seed 同题，公平对比）
 llmolympic play --game math_quiz --players openai:gpt-4o-mini,ollama:llama3.1 --seed 42
+
+# 五子棋：第一个选手执黑先行，第二个选手执白
+llmolympic play --game gomoku --players human:我,openai:gpt-4o-mini
+
+# 五子棋离线演示（mock 会读取棋盘并选择空位）
+llmolympic play --game gomoku --players mock:random,mock:fixed
 
 # 列出所有比赛项目
 llmolympic games
@@ -61,6 +70,11 @@ llmolympic leaderboard --game math_quiz
 llmolympic history
 llmolympic archive <MATCH_ID>
 ```
+
+五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
+没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
+中心是 `H8`。选手连续 3 次非法落子，或人类选手超时未落子，会立即判负。
+`--rounds` 只用于数学和知识问答，不适用于单局五子棋。
 
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
