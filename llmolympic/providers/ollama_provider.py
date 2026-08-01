@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 
 from llmolympic.config import get as cfg_get
-from llmolympic.providers.base import Provider
+from llmolympic.providers.base import Provider, ProviderTimeoutError
 
 _DEFAULT_BASE_URL = "http://localhost:11434"
 
@@ -17,16 +17,50 @@ class OllamaProvider(Provider):
         url = base_url or cfg_get("ollama", "base_url", _DEFAULT_BASE_URL, env="OLLAMA_BASE_URL")
         self.base_url = url.rstrip("/")
 
-    def chat(self, messages: list[dict], *, model: str, **params) -> str:
-        resp = httpx.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": params or {},
-            },
-            timeout=120.0,
-        )
+    @staticmethod
+    def _payload(messages: list[dict], model: str, params: dict) -> dict:
+        return {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": params or {},
+        }
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        **params,
+    ) -> str:
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/api/chat",
+                json=self._payload(messages, model, params),
+                timeout=120.0 if request_timeout is None else request_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError("Ollama 请求超时") from exc
+        resp.raise_for_status()
+        return resp.json()["message"]["content"].strip()
+
+    async def achat(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        **params,
+    ) -> str:
+        timeout = 120.0 if request_timeout is None else request_timeout
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json=self._payload(messages, model, params),
+                )
+        except httpx.TimeoutException as exc:
+            raise ProviderTimeoutError("Ollama 请求超时") from exc
         resp.raise_for_status()
         return resp.json()["message"]["content"].strip()

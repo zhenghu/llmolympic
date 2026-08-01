@@ -66,6 +66,13 @@ CLI（今天）          WebSocket（将来）
 ```
 
 - `HumanPlayer.get_move` 是异步接口：CLI 里是键盘输入，将来是 API/WebSocket 远端提交，引擎无感。
+- `LLMPlayer` 通过 Provider 的原生异步 `achat()` 调用模型；OpenAI / Ollama
+  请求可在单步截止时间到达时取消，不依赖无法强制停止的工作线程。
+- LLM 超时或 Provider 异常会产生 `move_rejected`，并以 `reason_code`、
+  `forfeit_scope=match` 和 `technical_loss=true` 记录机器可读原因；随后仍会产生
+  `match_finished`，失败方计 0 分，对手计 1 分。
+- 上述字段只保证出现在新档案中；读取没有 `termination` 的 schema v1 历史档案
+  时按 `unknown` 处理，不能把缺失字段解释成 `completed`。
 - **手机端迁移路径**：后端（Python + FastAPI）不动，手机只是新客户端，
   通过 WebSocket 消费同一批事件。客户端优先 React Native（与 Web 前端同源）。
   API key 只存服务端，判分计时在服务端，天然防作弊。
@@ -77,7 +84,7 @@ CLI（今天）          WebSocket（将来）
 - **静态题库为辅**（知识竞答）：可测"知识量"，但接受模型可能见过的偏差，
   标 `source: static`，报表分开统计。
 - 问答项目的所有选手拿到逐字相同的 prompt；棋类按各自角色显示同一局面；
-  统一超时与 max_tokens；
+  LLM 统一单步超时与 max_tokens；人类输入使用独立限时；
   采样参数、每步走法、完整事件流记入对局档案（pydantic，可 JSON 序列化），结果可复核。
 - 每场结束后，完整 JSON 档案、选手索引、总榜/项目榜 ELO 与评分历史在同一
   SQLite 事务中写入；`match_id` 防止重复计分。
@@ -97,7 +104,8 @@ CLI（今天）          WebSocket（将来）
 - **Web（阶段四）**：FastAPI + WebSocket；前端 React
 - **存储**：SQLite（对局记录、总榜/项目榜、ELO 历史；题库待接入）
 - **棋类（阶段二）**：首个项目为纯 Python 规则实现的 15×15 五子棋；国际象棋后续接入
-- **模型接入**：OpenAI 官方 SDK / Ollama（本地）/ Mock（离线演示与测试）
+- **模型接入**：OpenAI 官方异步 SDK / Ollama 异步 HTTP / Mock（离线演示与测试）；
+  同步 `chat()` 仅作为无硬超时的第三方 Provider 兼容接口
 - **工具**：uv 或 pip、pytest、ruff
 
 ## 8. 路线图
@@ -105,7 +113,8 @@ CLI（今天）          WebSocket（将来）
 1. **MVP** ✅：core 引擎（回合循环 + 事件流）+ 数学/知识问答两个单轮项目 +
    provider 抽象（openai/ollama/mock）+ CLI，LLM vs LLM 与人类入场。
 2. **阶段二（进行中）**：ELO + SQLite 持久化 ✅；五子棋多轮状态机 ✅；
-   后续增加交换先手的多番赛与循环赛，国际象棋暂不接入。
+   LLM 超时、Provider 异常技术判负与失败档案 ✅；后续增加交换先手的多番赛
+   与循环赛，国际象棋暂不接入。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜；循环赛与锦标赛模式。
    之后新增项目（猜谜、推理等）纯写插件。

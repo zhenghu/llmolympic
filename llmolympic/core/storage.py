@@ -428,6 +428,73 @@ class SQLiteStore:
         }
         if normalized_finished_scores != archive.scores:
             raise StorageError("match_finished 的比分与档案不一致")
+
+        finished_data = finished_events[0].data
+        termination = finished_data.get("termination")
+        technical_loss_events = [
+            event
+            for event in archive.events
+            if event.type == EventType.MOVE_REJECTED
+            and event.data.get("technical_loss") is True
+        ]
+        technical_control_fields = {
+            "reason_code",
+            "forfeited_by",
+            "cause_event_seq",
+            "failure_details",
+        }
+        has_technical_controls = any(
+            field in finished_data for field in technical_control_fields
+        )
+        if termination is None:
+            if technical_loss_events or has_technical_controls:
+                raise StorageError("技术负事件必须包含结构化 termination")
+            return player_names  # schema v1 历史档案没有结构化终局原因
+        if termination not in ("completed", "technical_loss"):
+            raise StorageError("match_finished 的 termination 无效")
+        if termination == "completed":
+            if technical_loss_events or has_technical_controls:
+                raise StorageError("正常结束的档案不能包含技术负控制字段")
+            return player_names
+        failure_details = finished_data.get("failure_details")
+        if failure_details is not None and not isinstance(failure_details, dict):
+            raise StorageError("match_finished 的 failure_details 必须是对象")
+        forfeited_by = finished_data.get("forfeited_by")
+        reason_code = finished_data.get("reason_code")
+        reason = finished_data.get("reason")
+        cause_event_seq = finished_data.get("cause_event_seq")
+        if forfeited_by not in player_names:
+            raise StorageError("技术负的 forfeited_by 必须是参赛选手")
+        if not isinstance(reason_code, str) or not reason_code:
+            raise StorageError("技术负必须包含非空 reason_code")
+        if not isinstance(reason, str) or not reason:
+            raise StorageError("技术负必须包含非空 reason")
+        if (
+            isinstance(cause_event_seq, bool)
+            or not isinstance(cause_event_seq, int)
+            or not 0 <= cause_event_seq < len(archive.events)
+        ):
+            raise StorageError("技术负必须包含有效 cause_event_seq")
+        cause_event = archive.events[cause_event_seq]
+        if (
+            cause_event.type != EventType.MOVE_REJECTED
+            or cause_event.player != forfeited_by
+            or cause_event.data.get("reason_code") != reason_code
+            or cause_event.data.get("reason") != reason
+            or cause_event.data.get("forfeit") is not True
+            or cause_event.data.get("forfeit_scope") != "match"
+            or cause_event.data.get("technical_loss") is not True
+            or cause_event.data.get("failure_details") != failure_details
+            or len(technical_loss_events) != 1
+            or technical_loss_events[0] is not cause_event
+        ):
+            raise StorageError("技术负的原因事件与 match_finished 不一致")
+        if archive.scores[forfeited_by] != 0.0 or any(
+            score != 1.0
+            for player, score in archive.scores.items()
+            if player != forfeited_by
+        ):
+            raise StorageError("技术负必须记为责任方 0 分、其他选手 1 分")
         return player_names
 
     def _record_ratings(

@@ -72,6 +72,29 @@ def _archive(
     )
 
 
+def _technical_loss_archive() -> MatchArchive:
+    archive = _archive(scores={"甲": 0.0, "乙": 1.0})
+    archive.events[1].data.update(
+        {
+            "reason": "模型服务调用失败，判技术负",
+            "reason_code": "provider_error",
+            "forfeit": True,
+            "technical_loss": True,
+            "forfeit_scope": "match",
+        }
+    )
+    archive.events[-1].data.update(
+        {
+            "termination": "technical_loss",
+            "reason_code": "provider_error",
+            "reason": "模型服务调用失败，判技术负",
+            "forfeited_by": "甲",
+            "cause_event_seq": 1,
+        }
+    )
+    return archive
+
+
 def test_schema_and_full_archive_round_trip(tmp_path) -> None:
     path = tmp_path / "state" / "olympics.db"
     archive = _archive()
@@ -92,6 +115,70 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+
+
+def test_structured_technical_loss_round_trips_and_updates_elo(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "technical-loss.db")
+    archive = _technical_loss_archive()
+
+    result = store.save_match(archive)
+
+    assert result.rated
+    loaded = store.get_match(archive.match_id)
+    assert loaded is not None
+    assert loaded.events[-1].data["termination"] == "technical_loss"
+    board = store.leaderboard(game="math_quiz")
+    assert [(entry.player, entry.rating) for entry in board] == [
+        ("乙", pytest.approx(1516.0)),
+        ("甲", pytest.approx(1484.0)),
+    ]
+
+
+def test_save_rejects_technical_loss_scores_that_reward_forfeiting_player(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "invalid-technical-loss.db")
+    archive = _technical_loss_archive()
+    archive.scores = {"甲": 1.0, "乙": 0.0}
+    archive.events[-1].data["scores"] = dict(archive.scores)
+
+    with pytest.raises(StorageError, match="责任方 0 分"):
+        store.save_match(archive)
+    assert store.list_matches() == []
+
+
+def test_save_rejects_technical_loss_with_mismatched_cause_event(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "invalid-cause.db")
+    archive = _technical_loss_archive()
+    archive.events[-1].data["cause_event_seq"] = 0
+
+    with pytest.raises(StorageError, match="原因事件"):
+        store.save_match(archive)
+    assert store.list_matches() == []
+
+
+@pytest.mark.parametrize("termination", [None, "completed"])
+def test_save_rejects_technical_loss_with_missing_or_disguised_termination(
+    tmp_path, termination: str | None
+) -> None:
+    store = SQLiteStore(tmp_path / "invalid-termination.db")
+    archive = _technical_loss_archive()
+    if termination is None:
+        archive.events[-1].data.pop("termination")
+    else:
+        archive.events[-1].data["termination"] = termination
+
+    with pytest.raises(StorageError, match="技术负"):
+        store.save_match(archive)
+    assert store.list_matches() == []
+
+
+def test_save_rejects_technical_loss_without_match_forfeit_marker(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "invalid-forfeit-marker.db")
+    archive = _technical_loss_archive()
+    archive.events[1].data.pop("forfeit")
+
+    with pytest.raises(StorageError, match="原因事件"):
+        store.save_match(archive)
+    assert store.list_matches() == []
 
 
 def test_quiz_scores_are_converted_to_head_to_head_outcome(tmp_path) -> None:

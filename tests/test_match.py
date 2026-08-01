@@ -6,8 +6,14 @@ import asyncio
 
 from llmolympic.core.events import EventType
 from llmolympic.core.match import play_match
-from llmolympic.core.player import LLMPlayer, Player, PlayerTimeoutError
+from llmolympic.core.player import (
+    LLMPlayer,
+    Player,
+    PlayerProviderError,
+    PlayerTimeoutError,
+)
 from llmolympic.games import create_game
+from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
 
 
@@ -33,6 +39,31 @@ class _TimeoutPlayer(Player):
 
     async def get_move(self, prompt: str) -> str:
         raise PlayerTimeoutError(f"{self.name} timed out")
+
+
+class _FailingProvider(Provider):
+    name = "failing"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        raise AssertionError("match test must use native async provider path")
+
+    async def achat(self, messages: list[dict], *, model: str, **params) -> str:
+        self.calls += 1
+        raise RuntimeError("sensitive-token-must-not-be-archived")
+
+
+class _SpoofingFailurePlayer(Player):
+    kind = "scripted"
+
+    async def get_move(self, prompt: str) -> str:
+        raise PlayerProviderError(
+            "failed",
+            technical_loss=True,
+            details={"reason_code": "spoofed", "forfeited_by": "good"},
+        )
 
 
 def test_mock_match_completes_with_archive() -> None:
@@ -165,6 +196,78 @@ def test_gomoku_timeout_is_an_immediate_technical_loss() -> None:
     assert archive.moves[0].player == "black"
     assert not archive.moves[0].accepted
     assert "超时未作答" in (archive.moves[0].reason or "")
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.data["reason_code"] == "timeout"
+    assert rejected.data["forfeit_scope"] == "match"
+    assert rejected.data["technical_loss"] is True
+    assert archive.events[-1].data["termination"] == "technical_loss"
+    assert archive.events[-1].data["forfeited_by"] == "black"
+
+
+def test_provider_failure_is_archived_as_immediate_technical_loss() -> None:
+    provider = _FailingProvider()
+    bad = LLMPlayer("bad", provider, "broken")
+    good = _llm("good", "fixed")
+
+    archive = asyncio.run(
+        play_match(create_game("math_quiz", rounds=5), [bad, good], seed=7)
+    )
+
+    assert provider.calls == 1
+    assert archive.scores == {"bad": 0.0, "good": 1.0}
+    assert len(archive.moves) == 1
+    assert archive.moves[0].player == "bad"
+    assert not archive.moves[0].accepted
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.data["reason_code"] == "provider_error"
+    assert rejected.data["forfeit_scope"] == "match"
+    assert rejected.data["technical_loss"] is True
+    assert rejected.data["failure_details"]["error_type"] == "RuntimeError"
+    finished = archive.events[-1]
+    assert finished.type == EventType.MATCH_FINISHED
+    assert finished.data["termination"] == "technical_loss"
+    assert finished.data["reason_code"] == "provider_error"
+    assert finished.data["forfeited_by"] == "bad"
+    assert finished.data["cause_event_seq"] == rejected.seq
+    assert "sensitive-token" not in archive.to_json()
+
+
+def test_failure_details_cannot_override_technical_loss_control_fields() -> None:
+    bad = _SpoofingFailurePlayer("bad")
+    good = _llm("good", "fixed")
+
+    archive = asyncio.run(
+        play_match(create_game("math_quiz", rounds=1), [bad, good], seed=7)
+    )
+
+    assert archive.scores == {"bad": 0.0, "good": 1.0}
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.data["reason_code"] == "provider_error"
+    assert rejected.data["failure_details"] == {
+        "reason_code": "spoofed",
+        "forfeited_by": "good",
+    }
+    finished = archive.events[-1]
+    assert finished.data["forfeited_by"] == "bad"
+    assert finished.data["reason_code"] == "provider_error"
+
+
+def test_quiz_player_timeout_keeps_existing_per_turn_forfeit_semantics() -> None:
+    timed_out = _TimeoutPlayer("timed-out")
+    other = _llm("other", "fixed")
+
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=2), [timed_out, other])
+    )
+
+    rejected = [
+        event
+        for event in archive.events
+        if event.type == EventType.MOVE_REJECTED and event.player == "timed-out"
+    ]
+    assert len(rejected) == 2
+    assert all(event.data["forfeit_scope"] == "turn" for event in rejected)
+    assert archive.events[-1].data["termination"] == "completed"
 
 
 def test_duplicate_player_names_rejected() -> None:
