@@ -68,6 +68,21 @@ class _SyncAchatProvider(Provider):
         return "A"
 
 
+class _ResponseAsyncProvider(Provider):
+    name = "response"
+
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.received_params: dict[str, object] = {}
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        raise AssertionError("response validation test must use native async provider path")
+
+    async def achat(self, messages: list[dict], *, model: str, **params) -> str:
+        self.received_params = params
+        return self.response  # type: ignore[return-value]
+
+
 def test_native_async_provider_is_cancelled_at_llm_move_timeout() -> None:
     provider = _SlowAsyncProvider()
     player = LLMPlayer(
@@ -159,6 +174,103 @@ def test_reserved_provider_request_timeout_is_rejected_before_match() -> None:
             "model",
             request_timeout=1.0,
         )
+
+
+def test_llm_response_limit_is_recorded_but_not_sent_to_provider() -> None:
+    provider = _ResponseAsyncProvider("four")
+    player = LLMPlayer(
+        "response:model",
+        provider,
+        "model",
+        max_response_chars=4,
+        temperature=0.2,
+    )
+
+    assert asyncio.run(player.get_move("prompt")) == "four"
+    assert player.describe()["max_response_chars"] == 4
+    assert provider.received_params["temperature"] == 0.2
+    assert "max_response_chars" not in provider.received_params
+
+
+def test_llm_response_over_limit_is_a_sanitized_technical_loss() -> None:
+    player = LLMPlayer(
+        "response:model",
+        _ResponseAsyncProvider("sensitive-response"),
+        "model",
+        max_response_chars=4,
+    )
+
+    with pytest.raises(PlayerProviderError) as raised:
+        asyncio.run(player.get_move("prompt"))
+
+    assert raised.value.technical_loss
+    assert raised.value.reason_code == "provider_error"
+    assert raised.value.details["validation_error"] == "response_too_long"
+    assert "sensitive-response" not in str(raised.value)
+    assert "sensitive-response" not in repr(raised.value.details)
+
+
+def test_non_string_llm_response_is_a_sanitized_technical_loss() -> None:
+    player = LLMPlayer(
+        "response:model",
+        _ResponseAsyncProvider({"secret": "must-not-escape"}),
+        "model",
+    )
+
+    with pytest.raises(PlayerProviderError) as raised:
+        asyncio.run(player.get_move("prompt"))
+
+    assert raised.value.technical_loss
+    assert raised.value.details["validation_error"] == "non_string_response"
+    assert "must-not-escape" not in str(raised.value)
+    assert "must-not-escape" not in repr(raised.value.details)
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, 4097])
+def test_llm_response_limit_must_be_within_platform_bounds(limit: object) -> None:
+    with pytest.raises(ValueError, match="1 到 4096"):
+        LLMPlayer(
+            "response:model",
+            _ResponseAsyncProvider("A"),
+            "model",
+            max_response_chars=limit,  # type: ignore[arg-type]
+        )
+
+
+def test_sampling_params_are_recursively_redacted_only_in_archive_description() -> None:
+    provider = _ResponseAsyncProvider("A")
+    extra_headers = {
+        "Authorization": "Bearer provider-secret",
+        "X-Trace": "safe-trace",
+    }
+    player = LLMPlayer(
+        "response:model",
+        provider,
+        "model",
+        max_tokens=64,
+        extra_headers=extra_headers,
+        auth="Bearer auth-secret",
+        jwt="jwt-secret",
+        metadata={
+            "nested": [
+                {"api_key": "nested-secret", "label": "safe-label"},
+                {"access-token": "token-secret"},
+            ]
+        },
+    )
+
+    assert asyncio.run(player.get_move("prompt")) == "A"
+    description = player.describe()
+
+    assert provider.received_params["extra_headers"] is extra_headers
+    assert provider.received_params["metadata"]["nested"][0]["api_key"] == "nested-secret"
+    assert description["sampling_params"] == {
+        "max_tokens": 64,
+        "extra_headers": "[REDACTED]",
+        "auth": "[REDACTED]",
+        "jwt": "[REDACTED]",
+        "metadata": "[REDACTED]",
+    }
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])

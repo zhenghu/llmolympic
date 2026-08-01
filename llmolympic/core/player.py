@@ -16,6 +16,34 @@ SYSTEM_PROMPT = (
 )
 
 DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
+DEFAULT_MAX_RESPONSE_CHARS = 4096
+
+_REDACTED = "[REDACTED]"
+_ARCHIVE_SAFE_SAMPLING_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_tokens",
+        "n",
+        "num_predict",
+        "presence_penalty",
+        "seed",
+        "temperature",
+        "top_p",
+    }
+)
+
+
+def _archive_sampling_params(params: dict[str, object]) -> dict[str, object]:
+    """Only persist scalar sampling controls with no credential-bearing semantics."""
+
+    return {
+        key: value
+        if key in _ARCHIVE_SAFE_SAMPLING_KEYS
+        and (value is None or isinstance(value, (bool, int, float)))
+        else _REDACTED
+        for key, value in params.items()
+    }
 
 
 class PlayerActionError(Exception):
@@ -80,6 +108,7 @@ class LLMPlayer(Player):
         model: str,
         *,
         move_timeout_seconds: float | None = DEFAULT_LLM_TIMEOUT_SECONDS,
+        max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
         **sampling_params,
     ) -> None:
         super().__init__(name)
@@ -91,6 +120,14 @@ class LLMPlayer(Player):
             not math.isfinite(move_timeout_seconds) or move_timeout_seconds <= 0
         ):
             raise ValueError("LLM 单步超时必须是大于 0 的有限秒数")
+        if (
+            isinstance(max_response_chars, bool)
+            or not isinstance(max_response_chars, int)
+            or not 1 <= max_response_chars <= DEFAULT_MAX_RESPONSE_CHARS
+        ):
+            raise ValueError(
+                f"LLM 响应字符上限必须是 1 到 {DEFAULT_MAX_RESPONSE_CHARS} 之间的整数"
+            )
         if move_timeout_seconds is not None:
             async_implementation = getattr(type(provider), "achat", None)
             if (
@@ -104,6 +141,7 @@ class LLMPlayer(Player):
         self.provider = provider
         self.model = model
         self.move_timeout_seconds = move_timeout_seconds
+        self.max_response_chars = max_response_chars
         self.sampling_params = sampling_params
 
     async def get_move(self, prompt: str) -> str:
@@ -114,22 +152,24 @@ class LLMPlayer(Player):
         try:
             async_chat = getattr(self.provider, "achat", None)
             if async_chat is None:
-                return await asyncio.to_thread(
+                response = await asyncio.to_thread(
                     self.provider.chat,
                     messages,
                     model=self.model,
                     **self.sampling_params,
                 )
-            call = async_chat(
-                messages,
-                model=self.model,
-                request_timeout=self.move_timeout_seconds,
-                **self.sampling_params,
-            )
-            if self.move_timeout_seconds is None:
-                return await call
-            async with asyncio.timeout(self.move_timeout_seconds):
-                return await call
+            else:
+                call = async_chat(
+                    messages,
+                    model=self.model,
+                    request_timeout=self.move_timeout_seconds,
+                    **self.sampling_params,
+                )
+                if self.move_timeout_seconds is None:
+                    response = await call
+                else:
+                    async with asyncio.timeout(self.move_timeout_seconds):
+                        response = await call
         except ProviderTimeoutError as exc:
             raise self._timeout_error() from exc
         except TimeoutError as exc:
@@ -144,6 +184,29 @@ class LLMPlayer(Player):
                     "error_type": type(exc).__name__,
                 },
             ) from exc
+        if not isinstance(response, str):
+            raise PlayerProviderError(
+                f"{self.provider.name} 模型返回了非文本响应，判技术负",
+                technical_loss=True,
+                details={
+                    "provider": self.provider.name,
+                    "model": self.model,
+                    "validation_error": "non_string_response",
+                },
+            )
+        if len(response) > self.max_response_chars:
+            raise PlayerProviderError(
+                f"{self.provider.name} 模型响应超过 {self.max_response_chars} 字符上限，"
+                "判技术负",
+                technical_loss=True,
+                details={
+                    "provider": self.provider.name,
+                    "model": self.model,
+                    "validation_error": "response_too_long",
+                    "max_response_chars": self.max_response_chars,
+                },
+            )
+        return response
 
     def _timeout_error(self) -> PlayerTimeoutError:
         details: dict[str, object] = {
@@ -170,7 +233,8 @@ class LLMPlayer(Player):
             "kind": self.kind,
             "provider": self.provider.name,
             "model": self.model,
-            "sampling_params": self.sampling_params,
+            "sampling_params": _archive_sampling_params(self.sampling_params),
+            "max_response_chars": self.max_response_chars,
         }
         if self.move_timeout_seconds is not None:
             description["move_timeout_seconds"] = self.move_timeout_seconds

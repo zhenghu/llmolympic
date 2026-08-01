@@ -65,6 +65,32 @@ def test_openai_async_timeout_is_converted_to_stable_provider_error() -> None:
     assert client.options == {"timeout": 0.25, "max_retries": 0}
 
 
+def test_openai_requests_have_a_default_output_token_budget() -> None:
+    assert OpenAIProvider._completion_params({}, model="gpt-4o-mini") == {"max_tokens": 1024}
+    assert OpenAIProvider._completion_params({}, model="o3-mini") == {
+        "max_completion_tokens": 1024
+    }
+    assert OpenAIProvider._completion_params({}, model="openai/gpt-5.6-terra") == {
+        "max_completion_tokens": 1024
+    }
+    assert OpenAIProvider._completion_params({"max_tokens": 64}, model="o3") == {
+        "max_tokens": 64
+    }
+    assert OpenAIProvider._completion_params(
+        {"max_completion_tokens": 32}, model="deepseek-chat"
+    ) == {
+        "max_completion_tokens": 32
+    }
+
+
+def test_ollama_requests_have_a_default_output_token_budget() -> None:
+    default = OllamaProvider._payload([], "model", {})
+    explicit = OllamaProvider._payload([], "model", {"num_predict": 64})
+
+    assert default["options"]["num_predict"] == 1024
+    assert explicit["options"]["num_predict"] == 64
+
+
 def test_ollama_sync_timeout_is_converted_to_stable_provider_error(monkeypatch) -> None:
     captured: dict = {}
 

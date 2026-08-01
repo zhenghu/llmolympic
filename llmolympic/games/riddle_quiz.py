@@ -272,7 +272,7 @@ class RiddleQuiz:
         }
 
     def new_state(self, players: list[str], seed: int) -> RiddleQuizState:
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311 - 公平复现用种子，不用于安全令牌
         targets = rng.sample(RIDDLE_BANK, self.rounds)
         return RiddleQuizState(
             players=list(players),

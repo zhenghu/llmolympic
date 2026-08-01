@@ -25,9 +25,33 @@ from llmolympic.core.game import (
     describe_game_config,
     validate_players,
 )
-from llmolympic.core.player import Player, PlayerActionError
+from llmolympic.core.player import DEFAULT_MAX_RESPONSE_CHARS, Player, PlayerActionError
 
 _FEEDBACK_PREVIEW_LIMIT = 200
+MAX_MOVE_CHARS = DEFAULT_MAX_RESPONSE_CHARS
+MAX_MOVE_ATTEMPTS = 10
+
+
+class PlayerResponseLimitError(PlayerActionError):
+    """选手返回的协议数据类型或大小不安全。"""
+
+    reason_code = "response_limit"
+
+
+def _validate_move_response(move: object) -> str:
+    if not isinstance(move, str):
+        raise PlayerResponseLimitError(
+            "选手返回了非文本走法，判技术负",
+            technical_loss=True,
+            details={"response_type": type(move).__name__},
+        )
+    if len(move) > MAX_MOVE_CHARS:
+        raise PlayerResponseLimitError(
+            f"选手输出超过 {MAX_MOVE_CHARS} 字符上限，判技术负",
+            technical_loss=True,
+            details={"limit_chars": MAX_MOVE_CHARS, "actual_chars": len(move)},
+        )
+    return move
 
 
 def _feedback_preview(text: str) -> str:
@@ -55,6 +79,8 @@ class Match:
         validate_players(game, names)
         if max_attempts < 1:
             raise ValueError("max_attempts 必须至少为 1")
+        if max_attempts > MAX_MOVE_ATTEMPTS:
+            raise ValueError(f"max_attempts 最多为 {MAX_MOVE_ATTEMPTS}")
         self.game = game
         self.players = {p.name: p for p in players}
         self.seed = seed
@@ -94,7 +120,7 @@ class Match:
                 attempts = 0
                 while True:
                     try:
-                        move = await player.get_move(prompt)
+                        move = _validate_move_response(await player.get_move(prompt))
                     except PlayerActionError as exc:
                         self.game.apply_move(state, name, FORFEIT_MOVE)
                         forfeit_scope = "match" if exc.technical_loss else self.forfeit_scope

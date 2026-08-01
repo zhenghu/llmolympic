@@ -5,7 +5,11 @@ from __future__ import annotations
 import httpx
 
 from llmolympic.config import get as cfg_get
-from llmolympic.providers.base import Provider, ProviderTimeoutError
+from llmolympic.providers.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    Provider,
+    ProviderTimeoutError,
+)
 
 _DEFAULT_BASE_URL = "http://localhost:11434"
 
@@ -19,11 +23,13 @@ class OllamaProvider(Provider):
 
     @staticmethod
     def _payload(messages: list[dict], model: str, params: dict) -> dict:
+        options = dict(params)
+        options.setdefault("num_predict", DEFAULT_MAX_OUTPUT_TOKENS)
         return {
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": params or {},
+            "options": options,
         }
 
     def chat(

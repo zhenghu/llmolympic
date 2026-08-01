@@ -13,6 +13,28 @@ from pydantic import BaseModel
 #: 选手超时或连续非法走法后被判"放弃"时，由 Match 代为提交的特殊走法。
 FORFEIT_MOVE = "__forfeit__"
 
+# 平台级资源边界。具体项目可以声明更小的 ``max_players``，但不能绕过
+# 这一层上限；这样第三方 Game 忘记声明人数时也不会创建无界并发调用。
+MAX_PLATFORM_PLAYERS = 16
+MAX_PLAYER_NAME_CHARS = 128
+
+_BIDI_CONTROL_CHARS = frozenset(
+    {
+        "\u061c",
+        "\u200e",
+        "\u200f",
+        "\u202a",
+        "\u202b",
+        "\u202c",
+        "\u202d",
+        "\u202e",
+        "\u2066",
+        "\u2067",
+        "\u2068",
+        "\u2069",
+    }
+)
+
 
 class IllegalMoveError(Exception):
     """``Game.apply_move`` 收到非法走法时抛出。"""
@@ -100,10 +122,23 @@ def validate_player_count(game: Game, count: int) -> None:
         raise ValueError(f"项目 {game.name!r} 至少需要 {minimum} 名选手，实际为 {count} 名")
     if maximum is not None and count > maximum:
         raise ValueError(f"项目 {game.name!r} 最多支持 {maximum} 名选手，实际为 {count} 名")
+    if count > MAX_PLATFORM_PLAYERS:
+        raise ValueError(
+            f"平台单场最多支持 {MAX_PLATFORM_PLAYERS} 名选手，实际为 {count} 名"
+        )
 
 
 def validate_players(game: Game, players: list[str]) -> None:
     """统一校验选手名字与项目人数约束。"""
+    if any(not isinstance(name, str) or not name.strip() for name in players):
+        raise ValueError("选手名字必须是非空字符串")
+    if any(len(name) > MAX_PLAYER_NAME_CHARS for name in players):
+        raise ValueError(f"选手名字最多允许 {MAX_PLAYER_NAME_CHARS} 个字符")
+    if any(
+        any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F or char in _BIDI_CONTROL_CHARS for char in name)
+        for name in players
+    ):
+        raise ValueError("选手名字不能包含控制字符或双向文本控制符")
     if len(set(players)) != len(players):
         raise ValueError(f"选手名字必须唯一: {players}")
     validate_player_count(game, len(players))

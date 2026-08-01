@@ -1,5 +1,7 @@
 # LLM Olympics 配置模板
-# 用法：复制为 config.toml 并填入真实配置（config.toml 已被 .gitignore 排除，不会提交）。
+# 用法：复制到源码项目根目录的 config.toml，或用 LLMOLYMPIC_CONFIG 显式指定路径。
+# 程序不会搜索任意当前工作目录中的 config.toml；项目内 config.toml 已被 git 忽略。
+# 文件包含密钥时建议设置权限为 0600。
 # 取值优先级：环境变量 > config.toml > 默认值。
 
 # OpenAI 及兼容接口（DeepSeek、Kimi、OpenRouter 等都走这里）

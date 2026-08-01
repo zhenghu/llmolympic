@@ -67,7 +67,7 @@ class MockProvider(Provider):
         if strategy not in ("random", "fixed", "illegal"):
             raise ValueError(f"未知 mock 策略: {strategy!r}")
         self.strategy = strategy
-        self._rng = random.Random(seed)
+        self._rng = random.Random(seed)  # noqa: S311 - mock 策略需可复现，不用于安全令牌
 
     def chat(
         self,

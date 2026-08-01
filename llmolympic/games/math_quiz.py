@@ -14,6 +14,7 @@ from llmolympic.core.game import FORFEIT_MOVE, GameState, IllegalMoveError
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _TOLERANCE = 1e-6
+MAX_ROUNDS = 100
 
 
 class MathQuizState(GameState):
@@ -59,13 +60,15 @@ class MathQuiz:
     def __init__(self, rounds: int = 5) -> None:
         if rounds < 1:
             raise ValueError("rounds 必须至少为 1")
+        if rounds > MAX_ROUNDS:
+            raise ValueError(f"math_quiz 的 rounds 最多为 {MAX_ROUNDS}")
         self.rounds = rounds
 
     def describe_config(self) -> dict[str, object]:
         return {"rounds": self.rounds}
 
     def new_state(self, players: list[str], seed: int) -> MathQuizState:
-        rng = random.Random(seed)  # 同一 seed 生成完全相同的题目（可复现）
+        rng = random.Random(seed)  # noqa: S311 - 公平复现用种子，不用于安全令牌
         return MathQuizState(
             players=list(players),
             seed=seed,

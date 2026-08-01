@@ -89,6 +89,7 @@ QUESTION_BANK: list[dict] = [
 ]
 
 _LETTERS = ("A", "B", "C", "D")
+MAX_ROUNDS = 100
 
 
 class KnowledgeQuizState(GameState):
@@ -109,13 +110,15 @@ class KnowledgeQuiz:
     def __init__(self, rounds: int = 5) -> None:
         if rounds < 1:
             raise ValueError("rounds 必须至少为 1")
+        if rounds > MAX_ROUNDS:
+            raise ValueError(f"knowledge_quiz 的 rounds 最多为 {MAX_ROUNDS}")
         self.rounds = rounds
 
     def describe_config(self) -> dict[str, object]:
         return {"rounds": self.rounds}
 
     def new_state(self, players: list[str], seed: int) -> KnowledgeQuizState:
-        rng = random.Random(seed)  # 同一 seed 抽出完全相同的题目（可复现）
+        rng = random.Random(seed)  # noqa: S311 - 公平复现用种子，不用于安全令牌
         k = min(self.rounds, len(QUESTION_BANK))
         questions = [dict(q, source="static") for q in rng.sample(QUESTION_BANK, k)]
         return KnowledgeQuizState(

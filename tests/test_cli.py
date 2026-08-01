@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 
 import pytest
@@ -432,6 +433,8 @@ def test_llm_timeout_config_default_is_recorded(tmp_path, monkeypatch) -> None:
     path = tmp_path / "config-timeout.db"
     config_path = tmp_path / "config.toml"
     config_path.write_text('[match]\nllm_timeout_seconds = 0.6\n', encoding="utf-8")
+    if os.name == "posix":
+        config_path.chmod(0o600)
     monkeypatch.setenv("LLMOLYMPIC_CONFIG", str(config_path))
     config.load_config.cache_clear()
     try:
