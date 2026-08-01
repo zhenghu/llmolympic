@@ -61,6 +61,9 @@ class MathQuiz:
             raise ValueError("rounds 必须至少为 1")
         self.rounds = rounds
 
+    def describe_config(self) -> dict[str, object]:
+        return {"rounds": self.rounds}
+
     def new_state(self, players: list[str], seed: int) -> MathQuizState:
         rng = random.Random(seed)  # 同一 seed 生成完全相同的题目（可复现）
         return MathQuizState(

@@ -10,3 +10,5 @@ def test_launcher_exposes_gomoku_human_and_demo_modes() -> None:
     assert "2) 五子棋      观看 mock 对战" in launcher
     assert "--game gomoku         --players human:我,mock:random" in launcher
     assert "--game gomoku         --players mock:random,mock:fixed" in launcher
+    assert "6) 五子棋      双局换先手 mock 对战" in launcher
+    assert "llmolympic series --game gomoku" in launcher

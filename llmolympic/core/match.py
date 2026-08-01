@@ -18,7 +18,13 @@ from datetime import UTC, datetime
 
 from llmolympic.core.archive import MatchArchive, archive_from_events
 from llmolympic.core.events import EventType, MatchEvent
-from llmolympic.core.game import FORFEIT_MOVE, Game, IllegalMoveError, validate_players
+from llmolympic.core.game import (
+    FORFEIT_MOVE,
+    Game,
+    IllegalMoveError,
+    describe_game_config,
+    validate_players,
+)
 from llmolympic.core.player import Player, PlayerActionError
 
 _FEEDBACK_PREVIEW_LIMIT = 200
@@ -71,6 +77,7 @@ class Match:
             EventType.MATCH_STARTED,
             game=self.game.name,
             seed=self.seed,
+            game_config=describe_game_config(self.game),
             players=[p.describe() for p in self.players.values()],
         )
 
