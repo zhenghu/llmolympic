@@ -11,8 +11,10 @@ import pytest
 
 from llmolympic.core.archive import MatchArchive, MoveRecord
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.core.series import SeriesArchive, series_from_legs
 from llmolympic.core.storage import (
     MatchIdCollisionError,
+    SeriesIdCollisionError,
     SQLiteStore,
     StorageError,
     UnsupportedSchemaError,
@@ -35,7 +37,7 @@ def _archive(
             seq=0,
             type=EventType.MATCH_STARTED,
             timestamp=STARTED,
-            data={"game": game, "seed": 42, "players": players},
+            data={"game": game, "seed": 42, "game_config": {}, "players": players},
         ),
         MatchEvent(
             seq=1,
@@ -95,6 +97,28 @@ def _technical_loss_archive() -> MatchArchive:
     return archive
 
 
+def _series_archive(
+    *,
+    series_id: str = "series-1",
+    first_scores: dict[str, float] | None = None,
+    second_scores: dict[str, float] | None = None,
+) -> SeriesArchive:
+    first = _archive(
+        match_id=f"{series_id}-1",
+        scores=first_scores or {"甲": 1.0, "乙": 0.0},
+    )
+    second = _archive(
+        match_id=f"{series_id}-2",
+        scores=second_scores or {"乙": 1.0, "甲": 0.0},
+    ).model_copy(
+        update={
+            "started_at": STARTED + timedelta(seconds=3),
+            "finished_at": STARTED + timedelta(seconds=5),
+        }
+    )
+    return series_from_legs(first, second, series_id=series_id)
+
+
 def test_schema_and_full_archive_round_trip(tmp_path) -> None:
     path = tmp_path / "state" / "olympics.db"
     archive = _archive()
@@ -112,9 +136,186 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
     assert loaded.moves[0].reason == "测试拒绝"
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+
+
+def test_series_is_atomic_and_split_result_has_no_elo_order_drift(tmp_path) -> None:
+    path = tmp_path / "series.db"
+    store = SQLiteStore(path)
+    series = _series_archive()
+
+    result = store.save_series(series)
+
+    assert result.inserted is True
+    assert result.rated is True
+    assert len(result.rating_changes) == 4
+    assert store.get_series(series.series_id) == series
+    assert {row.match_id for row in store.list_matches()} == {
+        series.legs[0].match_id,
+        series.legs[1].match_id,
+    }
+    board = {entry.player: entry for entry in store.leaderboard()}
+    assert board["甲"].rating == pytest.approx(1500.0)
+    assert board["乙"].rating == pytest.approx(1500.0)
+    assert (board["甲"].games_played, board["甲"].wins, board["甲"].losses) == (
+        2,
+        1,
+        1,
+    )
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM series_matches").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+        assert connection.execute(
+            "SELECT rating_policy FROM series_archives"
+        ).fetchone()[0] == "elo_batch_v1"
+
+
+def test_series_sweep_preserves_two_matches_of_elo_weight(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "sweep.db")
+    series = _series_archive(second_scores={"乙": 0.0, "甲": 1.0})
+
+    store.save_series(series)
+
+    board = {entry.player: entry for entry in store.leaderboard(game="math_quiz")}
+    assert board["甲"].rating == pytest.approx(1532.0)
+    assert board["乙"].rating == pytest.approx(1468.0)
+    assert (board["甲"].games_played, board["甲"].wins, board["甲"].losses) == (
+        2,
+        2,
+        0,
+    )
+
+
+def test_series_final_history_rating_exactly_matches_leaderboard_float(tmp_path) -> None:
+    path = tmp_path / "series-history-float.db"
+    store = SQLiteStore(path)
+    store.save_match(_archive(match_id="warmup", scores={"甲": 1.0, "乙": 0.0}))
+    series = _series_archive(series_id="non-integer-split")
+
+    store.save_series(series)
+
+    with sqlite3.connect(path) as connection:
+        rating = connection.execute(
+            """
+            SELECT rating FROM ratings
+            WHERE rating_scope = 'overall' AND game = '' AND player = '甲'
+            """
+        ).fetchone()[0]
+        history_after = connection.execute(
+            """
+            SELECT rating_after FROM rating_history
+            WHERE match_id = ? AND rating_scope = 'overall' AND player = '甲'
+            """,
+            (series.legs[1].match_id,),
+        ).fetchone()[0]
+    assert history_after == rating
+
+
+def test_series_save_is_idempotent_and_rejects_series_id_collision(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "series-idempotent.db")
+    series = _series_archive()
+
+    assert store.save_series(series).inserted is True
+    assert store.save_series(series).inserted is False
+    assert all(entry.games_played == 2 for entry in store.leaderboard())
+
+    collision = _series_archive(
+        series_id=series.series_id,
+        second_scores={"乙": 0.0, "甲": 1.0},
+    )
+    with pytest.raises(SeriesIdCollisionError, match="另一份"):
+        store.save_series(collision)
+
+
+def test_series_rejects_a_match_already_saved_standalone(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "reused-leg.db")
+    series = _series_archive()
+    store.save_match(series.legs[0])
+
+    with pytest.raises(MatchIdCollisionError, match="不能重复归入"):
+        store.save_series(series)
+
+    assert store.get_series(series.series_id) is None
+    assert [row.match_id for row in store.list_matches()] == [series.legs[0].match_id]
+    assert all(entry.games_played == 1 for entry in store.leaderboard())
+
+
+def test_series_rating_failure_rolls_back_both_archives_and_all_ratings(tmp_path) -> None:
+    class FailingStore(SQLiteStore):
+        def _record_series_ratings(self, *args, **kwargs):
+            super()._record_series_ratings(*args, **kwargs)
+            raise RuntimeError("injected series failure")
+
+    path = tmp_path / "series-rollback.db"
+    store = FailingStore(path)
+    series = _series_archive()
+
+    with pytest.raises(RuntimeError, match="injected series failure"):
+        store.save_series(series)
+
+    assert store.get_series(series.series_id) is None
+    assert store.list_matches() == []
+    assert store.leaderboard() == []
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 0
+
+
+def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> None:
+    path = tmp_path / "migrate-v1.db"
+    archive = _archive(match_id="before-migration")
+    SQLiteStore(path).save_match(archive)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE series_matches")
+        connection.execute("DROP TABLE series_archives")
+        connection.execute("PRAGMA user_version = 1")
+
+    migrated = SQLiteStore(path, create=False)
+
+    assert migrated.get_match(archive.match_id) == archive
+    assert all(entry.games_played == 1 for entry in migrated.leaderboard())
+    assert migrated.save_series(_series_archive()).inserted is True
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_failed_v1_migration_keeps_user_version_unchanged(tmp_path) -> None:
+    path = tmp_path / "broken-v1.db"
+    SQLiteStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE series_matches")
+        connection.execute("DROP TABLE series_archives")
+        connection.execute("CREATE TABLE series_archives (series_id TEXT PRIMARY KEY)")
+        connection.execute("PRAGMA user_version = 1")
+
+    with pytest.raises(sqlite3.OperationalError):
+        SQLiteStore(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(series_archives)")
+        }
+        assert columns == {"series_id"}
+
+
+def test_idempotent_series_save_rejects_damaged_leg_mapping(tmp_path) -> None:
+    path = tmp_path / "damaged-series.db"
+    series = _series_archive()
+    store = SQLiteStore(path)
+    store.save_series(series)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM series_matches WHERE series_id = ? AND leg_number = 2",
+            (series.series_id,),
+        )
+
+    with pytest.raises(StorageError, match="映射已损坏"):
+        store.save_series(series)
+
+    assert all(entry.games_played == 2 for entry in store.leaderboard())
 
 
 def test_structured_technical_loss_round_trips_and_updates_elo(tmp_path) -> None:
@@ -355,6 +556,48 @@ def test_concurrent_duplicate_saves_update_elo_once(tmp_path) -> None:
     assert all(entry.games_played == 1 for entry in store.leaderboard())
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+
+
+def test_concurrent_duplicate_series_saves_update_batch_elo_once(tmp_path) -> None:
+    path = tmp_path / "concurrent-series.db"
+    series = _series_archive()
+
+    def save(_: int):
+        return SQLiteStore(path).save_series(series)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(save, range(8)))
+
+    assert sum(result.inserted for result in results) == 1
+    store = SQLiteStore(path)
+    assert len(store.list_matches()) == 2
+    assert all(entry.games_played == 2 for entry in store.leaderboard())
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+
+
+def test_concurrent_v1_migration_is_serialized_and_idempotent(tmp_path) -> None:
+    path = tmp_path / "concurrent-migration.db"
+    SQLiteStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE series_matches")
+        connection.execute("DROP TABLE series_archives")
+        connection.execute("PRAGMA user_version = 1")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        stores = list(executor.map(lambda _: SQLiteStore(path), range(8)))
+
+    assert all(store.path == path.resolve() for store in stores)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"series_archives", "series_matches"} <= tables
 
 
 def test_database_path_environment_override(monkeypatch, tmp_path) -> None:

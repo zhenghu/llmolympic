@@ -126,6 +126,107 @@ def test_gomoku_play_persists_match_and_updates_project_elo(tmp_path) -> None:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
 
 
+def test_gomoku_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) -> None:
+    path = tmp_path / "gomoku-series.db"
+    result = runner.invoke(
+        app,
+        [
+            "series",
+            "--game",
+            "gomoku",
+            "--players",
+            "mock:fixed,mock:illegal",
+            "--seed",
+            "5",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "第 1/2 局" in result.output
+    assert "第 2/2 局" in result.output
+    assert "双局赛结果" in result.output
+    assert "两局已原子存档" in result.output
+    assert "系列赛 ELO 净变化" in result.output
+
+    store = SQLiteStore(path)
+    matches = store.list_matches(game="gomoku")
+    assert len(matches) == 2
+    archives = [store.get_match(row.match_id) for row in matches]
+    assert all(archive is not None for archive in archives)
+    assert {tuple(player["name"] for player in archive.players) for archive in archives} == {
+        ("mock:fixed", "mock:illegal"),
+        ("mock:illegal", "mock:fixed"),
+    }
+    assert {archive.seed for archive in archives} == {5}
+
+    board = {entry.player: entry for entry in store.leaderboard(game="gomoku")}
+    assert board["mock:fixed"].rating == pytest.approx(1532.0)
+    assert board["mock:illegal"].rating == pytest.approx(1468.0)
+    assert board["mock:fixed"].games_played == 2
+    assert (board["mock:fixed"].wins, board["mock:fixed"].losses) == (2, 0)
+
+    with sqlite3.connect(path) as connection:
+        series_id = connection.execute("SELECT series_id FROM series_archives").fetchone()[0]
+        assert connection.execute("SELECT count(*) FROM series_matches").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+    series_archive = store.get_series(series_id)
+    assert series_archive is not None
+    assert series_archive.points == {"mock:fixed": 2.0, "mock:illegal": 0.0}
+
+    history = runner.invoke(app, ["history", "--game", "gomoku", "--db", str(path)])
+    assert history.exit_code == 0
+    assert all(row.match_id in history.output for row in matches)
+    assert series_id in history.output
+
+    archive_result = runner.invoke(app, ["archive", series_id, "--db", str(path)])
+    assert archive_result.exit_code == 0
+    assert series_id in archive_result.output
+    assert '"legs"' in archive_result.output
+
+
+@pytest.mark.parametrize(
+    "players,error",
+    [
+        ("mock:fixed", "恰好 2"),
+        ("mock:fixed,mock:random,mock:illegal", "恰好 2"),
+        ("human:我,mock:fixed", "LLM/mock"),
+    ],
+)
+def test_series_rejects_unsafe_or_invalid_players_before_database_creation(
+    tmp_path, players: str, error: str
+) -> None:
+    path = tmp_path / "invalid-series.db"
+
+    result = runner.invoke(
+        app,
+        ["series", "--game", "gomoku", "--players", players, "--db", str(path)],
+    )
+
+    assert result.exit_code == 2
+    assert error in result.output
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--game", "gomoku", "--rounds", "2"],
+        ["--seed", str(2**63)],
+        ["--llm-timeout", "1", "--no-llm-timeout"],
+        ["--timeout", "1"],
+    ],
+)
+def test_series_rejects_invalid_options_before_database_creation(tmp_path, args) -> None:
+    path = tmp_path / "invalid-series-option.db"
+
+    result = runner.invoke(app, ["series", *args, "--db", str(path)])
+
+    assert result.exit_code == 2
+    assert not path.exists()
+
+
 def test_provider_failure_is_persisted_and_updates_elo(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

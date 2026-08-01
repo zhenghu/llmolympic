@@ -23,11 +23,12 @@ echo "  2) 五子棋      观看 mock 对战"
 echo "  3) 数学问答    你 vs mock"
 echo "  4) 知识竞答    你 vs mock"
 echo "  5) 知识竞答    观看 mock 对战"
+echo "  6) 五子棋      双局换先手 mock 对战"
 if [ -n "$HAS_LLM" ]; then
     label=${LLM_MODEL:-未设默认模型}
-    echo "  6) 五子棋      你（黑）vs LLM ($label)"
-    echo "  7) 知识竞答    你 vs LLM ($label)"
-    echo "  8) 数学问答    你 vs LLM ($label)"
+    echo "  7) 五子棋      你（黑）vs LLM ($label)"
+    echo "  8) 知识竞答    你 vs LLM ($label)"
+    echo "  9) 数学问答    你 vs LLM ($label)"
 fi
 echo "=============================="
 read -r -p "请选择: " choice
@@ -38,9 +39,10 @@ case "$choice" in
     3) llmolympic play --game math_quiz      --players human:我,mock:random --rounds 5 ;;
     4) llmolympic play --game knowledge_quiz --players human:我,mock:random --rounds 5 ;;
     5) llmolympic play --game knowledge_quiz --players mock:random,mock:fixed --rounds 5 ;;
-    6) [ -n "$HAS_LLM" ] && llmolympic play --game gomoku         --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
-    7) [ -n "$HAS_LLM" ] && llmolympic play --game knowledge_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
-    8) [ -n "$HAS_LLM" ] && llmolympic play --game math_quiz      --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+    6) llmolympic series --game gomoku       --players mock:random,mock:fixed ;;
+    7) [ -n "$HAS_LLM" ] && llmolympic play --game gomoku         --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
+    8) [ -n "$HAS_LLM" ] && llmolympic play --game knowledge_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+    9) [ -n "$HAS_LLM" ] && llmolympic play --game math_quiz      --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
     *) echo "无效选择" ;;
 esac
 

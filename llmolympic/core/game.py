@@ -38,7 +38,12 @@ class Game(Protocol):
 
     name: str
     def new_state(self, players: list[str], seed: int) -> GameState:
-        """创建初始状态。同一 seed 必须生成完全相同的局面（可复现）。"""
+        """创建初始状态。相同 seed 与相同有序选手输入必须可复现。
+
+        同一个 Game 实例可能在系列赛中多次调用本方法；单局可变数据必须放进
+        新返回的 GameState，不能残留在 Game 实例上。交换选手顺序时，除席位
+        归属外，题目或随机开局条件必须保持一致。
+        """
         ...
 
     def current_players(self, state: GameState) -> list[str]:
@@ -68,6 +73,21 @@ class Game(Protocol):
     def score(self, state: GameState) -> dict[str, float]:
         """终局计分：1.0 胜 / 0.5 平 / 0.0 负，或按比例得分。"""
         ...
+
+
+def describe_game_config(game: Game) -> dict[str, object]:
+    """返回会影响公平对比的可序列化项目配置。
+
+    可配置项目应实现 ``describe_config()``；无配置的旧插件回退为空对象。
+    """
+
+    describe = getattr(game, "describe_config", None)
+    if describe is None:
+        return {}
+    config = describe()
+    if not isinstance(config, dict):
+        raise TypeError("game.describe_config() 必须返回字典")
+    return dict(config)
 
 
 def validate_player_count(game: Game, count: int) -> None:
