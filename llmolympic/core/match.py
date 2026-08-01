@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from llmolympic.core.archive import MatchArchive, archive_from_events
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import FORFEIT_MOVE, Game, IllegalMoveError, validate_players
-from llmolympic.core.player import Player, PlayerTimeoutError
+from llmolympic.core.player import Player, PlayerActionError
 
 _FEEDBACK_PREVIEW_LIMIT = 200
 
@@ -28,6 +28,11 @@ def _feedback_preview(text: str) -> str:
     if len(text) <= _FEEDBACK_PREVIEW_LIMIT:
         return text
     return f"{text[: _FEEDBACK_PREVIEW_LIMIT - 3]}..."
+
+
+def _technical_loss_scores(players: dict[str, Player], forfeited_by: str) -> dict[str, float]:
+    """技术负统一记为责任方 0 分，其余选手 1 分。"""
+    return {name: 0.0 if name == forfeited_by else 1.0 for name in players}
 
 
 class Match:
@@ -48,6 +53,9 @@ class Match:
         self.players = {p.name: p for p in players}
         self.seed = seed
         self.max_attempts = max_attempts
+        self.forfeit_scope = getattr(game, "forfeit_scope", "turn")
+        if self.forfeit_scope not in ("turn", "match"):
+            raise ValueError("game.forfeit_scope 必须是 'turn' 或 'match'")
 
     async def run(self) -> AsyncIterator[MatchEvent]:
         seq = 0
@@ -66,7 +74,10 @@ class Match:
             players=[p.describe() for p in self.players.values()],
         )
 
-        while not self.game.is_over(state):
+        termination: dict[str, object] | None = None
+        override_scores = False
+
+        while not self.game.is_over(state) and termination is None:
             for name in self.game.current_players(state):
                 player = self.players[name]
                 original_prompt = self.game.prompt_for(state, name)
@@ -77,12 +88,34 @@ class Match:
                 while True:
                     try:
                         move = await player.get_move(prompt)
-                    except PlayerTimeoutError:
+                    except PlayerActionError as exc:
                         self.game.apply_move(state, name, FORFEIT_MOVE)
-                        yield emit(
-                            EventType.MOVE_REJECTED, player=name, move=None,
-                            reason="超时未作答，判放弃",
+                        forfeit_scope = "match" if exc.technical_loss else self.forfeit_scope
+                        reason = str(exc)
+                        if exc.reason_code == "timeout" and not exc.technical_loss:
+                            reason = "超时未作答，判放弃"
+                        rejected = emit(
+                            EventType.MOVE_REJECTED,
+                            player=name,
+                            move=None,
+                            reason=reason,
+                            reason_code=exc.reason_code,
+                            forfeit=True,
+                            forfeit_scope=forfeit_scope,
+                            technical_loss=forfeit_scope == "match",
+                            failure_details=exc.details,
                         )
+                        yield rejected
+                        if forfeit_scope == "match":
+                            termination = {
+                                "termination": "technical_loss",
+                                "reason_code": exc.reason_code,
+                                "reason": reason,
+                                "forfeited_by": name,
+                                "cause_event_seq": rejected.seq,
+                                "failure_details": exc.details,
+                            }
+                            override_scores = exc.technical_loss
                         break
                     try:
                         self.game.apply_move(state, name, move)
@@ -92,14 +125,40 @@ class Match:
                         attempts += 1
                         if attempts >= self.max_attempts:
                             self.game.apply_move(state, name, FORFEIT_MOVE)
-                            yield emit(
-                                EventType.MOVE_REJECTED, player=name, move=move,
-                                reason=f"{exc}；已达最大重试次数，判放弃",
+                            rejection_reason = f"{exc}；已达最大重试次数，判放弃"
+                            rejected = emit(
+                                EventType.MOVE_REJECTED,
+                                player=name,
+                                move=move,
+                                reason=rejection_reason,
+                                reason_code="illegal_move_limit",
+                                attempt=attempts,
+                                max_attempts=self.max_attempts,
+                                forfeit=True,
+                                forfeit_scope=self.forfeit_scope,
+                                technical_loss=self.forfeit_scope == "match",
                             )
+                            yield rejected
+                            if self.forfeit_scope == "match":
+                                termination = {
+                                    "termination": "technical_loss",
+                                    "reason_code": "illegal_move_limit",
+                                    "reason": rejection_reason,
+                                    "forfeited_by": name,
+                                    "cause_event_seq": rejected.seq,
+                                }
                             break
                         reason = str(exc)
                         yield emit(
-                            EventType.MOVE_REJECTED, player=name, move=move, reason=reason
+                            EventType.MOVE_REJECTED,
+                            player=name,
+                            move=move,
+                            reason=reason,
+                            reason_code="illegal_move",
+                            attempt=attempts,
+                            max_attempts=self.max_attempts,
+                            forfeit=False,
+                            technical_loss=False,
                         )
                         move_preview = _feedback_preview(repr(move))
                         reason_preview = _feedback_preview(reason)
@@ -112,7 +171,20 @@ class Match:
                         )
                         yield emit(EventType.TURN_PROMPT, player=name, prompt=prompt)
 
-        yield emit(EventType.MATCH_FINISHED, scores=self.game.score(state))
+                if termination is not None:
+                    break
+
+        if termination is not None and override_scores:
+            scores = _technical_loss_scores(self.players, str(termination["forfeited_by"]))
+        else:
+            scores = self.game.score(state)
+        finished_data: dict[str, object] = {
+            "scores": scores,
+            "termination": "completed",
+        }
+        if termination is not None:
+            finished_data.update(termination)
+        yield emit(EventType.MATCH_FINISHED, **finished_data)
 
 
 async def play_match(

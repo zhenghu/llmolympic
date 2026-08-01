@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 from pathlib import Path
 from typing import Annotated
@@ -17,7 +18,12 @@ from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import Game, validate_player_count, validate_players
 from llmolympic.core.match import play_match
-from llmolympic.core.player import HumanPlayer, LLMPlayer, Player
+from llmolympic.core.player import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    HumanPlayer,
+    LLMPlayer,
+    Player,
+)
 from llmolympic.core.storage import (
     SQLITE_INT_MAX,
     SQLITE_INT_MIN,
@@ -42,7 +48,53 @@ def _split_player_specs(spec: str) -> list[str]:
     return tokens
 
 
-def _parse_players(spec: str, human_timeout: float) -> list[Player]:
+def _resolve_llm_timeout(
+    explicit: float | None,
+    *,
+    disabled: bool = False,
+) -> float | None:
+    """解析 CLI > 环境变量 > config.toml > 默认值的 LLM 单步限时。"""
+    if disabled:
+        if explicit is not None:
+            raise typer.BadParameter(
+                "--llm-timeout 不能与 --no-llm-timeout 同时使用",
+                param_hint="--llm-timeout",
+            )
+        return None
+    raw = explicit
+    if raw is None:
+        raw = cfg_get(
+            "match",
+            "llm_timeout_seconds",
+            str(DEFAULT_LLM_TIMEOUT_SECONDS),
+            env="LLMOLYMPIC_LLM_TIMEOUT",
+        )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter("LLM 单步超时必须是数字", param_hint="--llm-timeout") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise typer.BadParameter(
+            "LLM 单步超时必须是大于 0 的有限秒数",
+            param_hint="--llm-timeout",
+        )
+    return value
+
+
+def _validate_human_timeout(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        raise typer.BadParameter(
+            "人类行动超时必须是大于 0 的有限秒数",
+            param_hint="--timeout",
+        )
+    return value
+
+
+def _parse_players(
+    spec: str,
+    human_timeout: float,
+    llm_timeout: float | None = None,
+) -> list[Player]:
     """把 ``openai:gpt-4o-mini,human:小明`` 这样的规格解析成选手列表。
 
     模型名可省略（如 ``openai``），此时回退到 config.toml 里的
@@ -64,7 +116,14 @@ def _parse_players(spec: str, human_timeout: float) -> list[Player]:
                     f"选手 {kind!r} 未指定模型名，且 config.toml 的 [{kind}] 段里也没有 default_model"
                 )
         provider = create_provider(kind, ident)
-        players.append(LLMPlayer(name=f"{kind}:{ident}", provider=provider, model=ident))
+        players.append(
+            LLMPlayer(
+                name=f"{kind}:{ident}",
+                provider=provider,
+                model=ident,
+                move_timeout_seconds=llm_timeout,
+            )
+        )
     names = [player.name for player in players]
     if len(set(names)) != len(names):
         raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
@@ -87,6 +146,11 @@ def _render(ev: MatchEvent) -> None:
     elif ev.type == EventType.MOVE_REJECTED:
         console.print(f"  [yellow]✗ {ev.player}: {ev.data.get('reason')}[/]")
     elif ev.type == EventType.MATCH_FINISHED:
+        if ev.data.get("termination") == "technical_loss":
+            console.print(
+                f"[bold red]技术负[/] {ev.data.get('forfeited_by')} · "
+                f"{ev.data.get('reason_code')}"
+            )
         scores = ev.data["scores"]
         table = Table(title="最终比分")
         table.add_column("排名", justify="right")
@@ -171,6 +235,23 @@ def play(
     timeout: float = typer.Option(
         60.0, "--timeout", "-t", min=0.001, help="人类选手每次行动限时（秒）"
     ),
+    llm_timeout: float | None = typer.Option(
+        None,
+        "--llm-timeout",
+        min=0.001,
+        help=(
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / "
+            "match.llm_timeout_seconds / 120"
+        ),
+    ),
+    no_llm_timeout: bool = typer.Option(
+        False,
+        "--no-llm-timeout",
+        help=(
+            "禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，"
+            "仅建议用于旧同步适配器"
+        ),
+    ),
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
@@ -184,13 +265,25 @@ def play(
         param_hint = "--rounds" if rounds is not None and game in list_games() else "--game"
         raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
     try:
-        validate_player_count(selected_game, len(_split_player_specs(players)))
+        player_specs = _split_player_specs(players)
+        validate_player_count(selected_game, len(player_specs))
     except typer.BadParameter:
         raise
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--players") from exc
     try:
-        selected_players = _parse_players(players, timeout)
+        has_human_player = any(spec.partition(":")[0] == "human" for spec in player_specs)
+        human_timeout = _validate_human_timeout(timeout) if has_human_player else timeout
+        has_llm_player = any(spec.partition(":")[0] != "human" for spec in player_specs)
+        effective_llm_timeout = None
+        if llm_timeout is not None or no_llm_timeout:
+            effective_llm_timeout = _resolve_llm_timeout(
+                llm_timeout,
+                disabled=no_llm_timeout,
+            )
+        elif has_llm_player:
+            effective_llm_timeout = _resolve_llm_timeout(None)
+        selected_players = _parse_players(players, human_timeout, effective_llm_timeout)
     except typer.BadParameter:
         raise
     except ValueError as exc:

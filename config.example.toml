@@ -16,3 +16,7 @@
 # SQLite 对局档案与 ELO（对应环境变量 LLMOLYMPIC_DB）
 [storage]
 # database = "~/.llmolympic/llmolympic.db"
+
+# 对局稳定性（对应环境变量 LLMOLYMPIC_LLM_TIMEOUT）
+[match]
+# llm_timeout_seconds = 120.0

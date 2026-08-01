@@ -44,7 +44,14 @@ class MockProvider(Provider):
         self.strategy = strategy
         self._rng = random.Random(seed)
 
-    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        **params,
+    ) -> str:
         prompt = messages[-1]["content"]
         if self.strategy == "illegal":
             return "Z"
@@ -59,3 +66,18 @@ class MockProvider(Provider):
         if self.strategy == "fixed":
             return "A" if is_choice else "42"
         return self._rng.choice("ABCD") if is_choice else str(self._rng.randint(0, 99))
+
+    async def achat(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        **params,
+    ) -> str:
+        return self.chat(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            **params,
+        )

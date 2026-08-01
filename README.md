@@ -33,6 +33,9 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 
 [storage]
 # database = "~/.llmolympic/llmolympic.db"
+
+[match]
+# llm_timeout_seconds = 120.0 # 对应环境变量 LLMOLYMPIC_LLM_TIMEOUT
 ```
 
 取值优先级：环境变量 > `config.toml` > 默认值。
@@ -52,6 +55,9 @@ llmolympic play --game knowledge_quiz --players human:我,openai:gpt-4o-mini
 
 # 两个模型对战（同 seed 同题，公平对比）
 llmolympic play --game math_quiz --players openai:gpt-4o-mini,ollama:llama3.1 --seed 42
+
+# 覆盖默认的 LLM 单步限时
+llmolympic play --players openai:gpt-4o-mini,mock:fixed --llm-timeout 90
 
 # 五子棋：第一个选手执黑先行，第二个选手执白
 llmolympic play --game gomoku --players human:我,openai:gpt-4o-mini
@@ -76,10 +82,24 @@ llmolympic archive <MATCH_ID>
 中心是 `H8`。选手连续 3 次非法落子，或人类选手超时未落子，会立即判负。
 `--rounds` 只用于数学和知识问答，不适用于单局五子棋。
 
+LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
+`LLMOLYMPIC_LLM_TIMEOUT` 或 `[match] llm_timeout_seconds` 调整。OpenAI、Ollama
+和 mock 都使用可取消的原生异步调用；模型超时或 Provider 运行期异常会立即判
+技术负，不会让整场程序崩溃。人类限时仍由独立的 `--timeout` 控制。
+只实现同步 `chat()` 的旧第三方 Provider 可用 `--no-llm-timeout` 兼容运行，
+但该选项只禁用比赛层截止时间，Provider 自身的网络超时仍可能生效；同时程序
+无法强制终止卡住的同步请求，建议尽快实现原生异步 `achat()`。
+
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
 `~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
 或各命令的 `--db` 覆盖。
+
+技术负也会生成完整档案并正常更新双人 ELO。事件中的 `reason_code`、
+`forfeit_scope`、`termination`、`forfeited_by` 等字段可供程序稳定统计；CLI
+显示中文原因，但不会把 Provider 的原始异常文本或凭据写入档案。
+这些机器字段从本版本的新档案开始写入；旧档案没有相应字段时应按
+`termination=unknown` 处理，不能反推为正常结束。
 
 ELO 目前适用于双人对局：比较双方最终比分后按胜 / 平 / 负更新。单人或多人
 对局仍会完整存档，但不会计入 ELO。榜单身份目前使用档案中的选手名称。

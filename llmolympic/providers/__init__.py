@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from llmolympic.providers.base import Provider
+from llmolympic.providers.base import ProviderTimeoutError as ProviderTimeoutError
 from llmolympic.providers.mock import MockProvider
 from llmolympic.providers.ollama_provider import OllamaProvider
 from llmolympic.providers.openai_provider import OpenAIProvider

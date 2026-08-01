@@ -52,6 +52,7 @@ class MathQuiz:
     """单轮问答项目：每位选手依次回答同样的 rounds 道题。"""
 
     name = "math_quiz"
+    forfeit_scope = "turn"
     min_players = 1
     max_players = None
 
