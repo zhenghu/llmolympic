@@ -27,3 +27,16 @@ def test_launcher_exposes_reasoning_and_riddle_modes() -> None:
     assert "--game riddle_quiz    --players mock:random,mock:fixed --rounds 5" in launcher
     assert "--game reasoning_quiz --players \"human:我,openai" in launcher
     assert "--game riddle_quiz    --players \"human:我,openai" in launcher
+
+
+def test_launcher_exposes_chess_human_demo_series_and_llm_modes() -> None:
+    launcher = (Path(__file__).parent.parent / "play.command").read_text()
+
+    assert "11) 国际象棋    你（白）vs mock" in launcher
+    assert "12) 国际象棋    观看 mock 对战" in launcher
+    assert "13) 国际象棋    双局换先手 mock 对战" in launcher
+    assert "--game chess          --players human:我,mock:random" in launcher
+    assert "--game chess          --players mock:random,mock:fixed" in launcher
+    assert "llmolympic series --game chess" in launcher
+    assert "19) 国际象棋    你（白）vs LLM" in launcher
+    assert "--game chess          --players \"human:我,openai" in launcher
