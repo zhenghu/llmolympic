@@ -41,8 +41,8 @@ jobs:
 
       - name: Install
         run: |
-          # The Python 3.11 image can bundle an older pip with known CVEs.
-          python -m pip install "pip==26.1.2"
+          # Runner images can bundle older packaging tools with known CVEs.
+          python -m pip install "pip==26.1.2" "setuptools==83.0.0"
           python -m pip install -e ".[dev,security]"
 
       - name: Audit dependencies
