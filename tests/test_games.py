@@ -9,6 +9,8 @@ from llmolympic.games import GAME_REGISTRY, create_game, list_games
 from llmolympic.games.gomoku import Gomoku
 from llmolympic.games.knowledge_quiz import KnowledgeQuiz
 from llmolympic.games.math_quiz import MathQuiz
+from llmolympic.games.reasoning_quiz import ReasoningQuiz
+from llmolympic.games.riddle_quiz import RiddleQuiz
 
 PLAYERS = ["甲", "乙"]
 
@@ -99,6 +101,14 @@ def test_gomoku_is_registered_without_international_chess() -> None:
     assert "chess" not in list_games()
 
 
+def test_reasoning_and_riddle_are_registered_with_round_options() -> None:
+    assert isinstance(create_game("reasoning_quiz", rounds=3), ReasoningQuiz)
+    assert isinstance(create_game("riddle_quiz", rounds=3), RiddleQuiz)
+    assert GAME_REGISTRY["reasoning_quiz"] is ReasoningQuiz
+    assert GAME_REGISTRY["riddle_quiz"] is RiddleQuiz
+    assert {"reasoning_quiz", "riddle_quiz"} <= set(list_games())
+
+
 def test_gomoku_rejects_question_round_option() -> None:
     with pytest.raises(ValueError, match="不支持参数: rounds"):
         create_game("gomoku", rounds=3)
@@ -120,7 +130,9 @@ def test_legacy_game_without_player_metadata_remains_compatible() -> None:
         del GAME_REGISTRY[LegacyGame.name]
 
 
-@pytest.mark.parametrize("game", ["math_quiz", "knowledge_quiz"])
+@pytest.mark.parametrize(
+    "game", ["math_quiz", "knowledge_quiz", "reasoning_quiz", "riddle_quiz"]
+)
 def test_create_game_rejects_zero_rounds(game: str) -> None:
     with pytest.raises(ValueError, match="至少为 1"):
         create_game(game, rounds=0)
