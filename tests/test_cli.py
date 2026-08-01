@@ -126,6 +126,40 @@ def test_gomoku_play_persists_match_and_updates_project_elo(tmp_path) -> None:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
 
 
+def test_chess_play_persists_match_and_updates_project_elo(tmp_path) -> None:
+    path = tmp_path / "chess.db"
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "chess",
+            "--players",
+            "mock:fixed,mock:illegal",
+            "--seed",
+            "7",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "对局已存档" in result.output
+    store = SQLiteStore(path)
+    matches = store.list_matches(game="chess")
+    assert len(matches) == 1
+    archive = store.get_match(matches[0].match_id)
+    assert archive is not None
+    assert archive.game == "chess"
+    assert archive.scores == {"mock:fixed": 1.0, "mock:illegal": 0.0}
+    assert [move.move for move in archive.moves if move.accepted] == ["e2e4"]
+    assert len([move for move in archive.moves if not move.accepted]) == 3
+
+    leaderboard = store.leaderboard(game="chess")
+    assert [entry.player for entry in leaderboard] == ["mock:fixed", "mock:illegal"]
+    assert [entry.rating for entry in leaderboard] == [1516.0, 1484.0]
+
+
 def test_gomoku_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) -> None:
     path = tmp_path / "gomoku-series.db"
     result = runner.invoke(
@@ -186,6 +220,49 @@ def test_gomoku_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) ->
     assert '"legs"' in archive_result.output
 
 
+def test_chess_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) -> None:
+    path = tmp_path / "chess-series.db"
+    result = runner.invoke(
+        app,
+        [
+            "series",
+            "--game",
+            "chess",
+            "--players",
+            "mock:fixed,mock:illegal",
+            "--seed",
+            "11",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "mock:fixed（白） vs mock:illegal（黑）" in result.output
+    assert "mock:illegal（白） vs mock:fixed（黑）" in result.output
+    assert "两局已原子存档" in result.output
+
+    store = SQLiteStore(path)
+    matches = store.list_matches(game="chess")
+    assert len(matches) == 2
+    assert {tuple(row.players) for row in matches} == {
+        ("mock:fixed", "mock:illegal"),
+        ("mock:illegal", "mock:fixed"),
+    }
+    series_ids = {row.series_id for row in matches}
+    assert None not in series_ids
+    assert len(series_ids) == 1
+    series_archive = store.get_series(next(iter(series_ids)))
+    assert series_archive is not None
+    assert series_archive.game == "chess"
+    assert series_archive.points == {"mock:fixed": 2.0, "mock:illegal": 0.0}
+
+    board = {entry.player: entry for entry in store.leaderboard(game="chess")}
+    assert board["mock:fixed"].rating == pytest.approx(1532.0)
+    assert board["mock:illegal"].rating == pytest.approx(1468.0)
+    assert (board["mock:fixed"].wins, board["mock:fixed"].losses) == (2, 0)
+
+
 @pytest.mark.parametrize(
     "players,error",
     [
@@ -213,6 +290,7 @@ def test_series_rejects_unsafe_or_invalid_players_before_database_creation(
     "args",
     [
         ["--game", "gomoku", "--rounds", "2"],
+        ["--game", "chess", "--rounds", "2"],
         ["--seed", str(2**63)],
         ["--llm-timeout", "1", "--no-llm-timeout"],
         ["--timeout", "1"],
@@ -572,17 +650,18 @@ def test_non_finite_human_timeout_is_rejected_before_database_creation(
     assert not path.exists()
 
 
+@pytest.mark.parametrize("game", ["gomoku", "chess"])
 @pytest.mark.parametrize(
     "players",
     ["mock:fixed", "mock:fixed,mock:random,mock:illegal"],
 )
-def test_gomoku_rejects_non_two_player_match_before_creating_database(
-    tmp_path, players: str
+def test_board_games_reject_non_two_player_match_before_creating_database(
+    tmp_path, game: str, players: str
 ) -> None:
-    path = tmp_path / "wrong-player-count.db"
+    path = tmp_path / f"{game}-wrong-player-count.db"
     result = runner.invoke(
         app,
-        ["play", "--game", "gomoku", "--players", players, "--db", str(path)],
+        ["play", "--game", game, "--players", players, "--db", str(path)],
     )
 
     assert result.exit_code == 2
@@ -590,10 +669,11 @@ def test_gomoku_rejects_non_two_player_match_before_creating_database(
     assert not path.exists()
 
 
-def test_gomoku_player_count_is_checked_before_provider_creation(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("game", ["gomoku", "chess"])
+def test_board_game_player_count_is_checked_before_provider_creation(
+    tmp_path, monkeypatch, game: str
 ) -> None:
-    path = tmp_path / "provider-must-not-open.db"
+    path = tmp_path / f"{game}-provider-must-not-open.db"
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("provider should not be created")
@@ -601,7 +681,7 @@ def test_gomoku_player_count_is_checked_before_provider_creation(
     monkeypatch.setattr("llmolympic.cli.main.create_provider", fail_if_called)
     result = runner.invoke(
         app,
-        ["play", "--game", "gomoku", "--players", "openai:gpt", "--db", str(path)],
+        ["play", "--game", game, "--players", "openai:gpt", "--db", str(path)],
     )
 
     assert result.exit_code == 2
@@ -609,11 +689,12 @@ def test_gomoku_player_count_is_checked_before_provider_creation(
     assert not path.exists()
 
 
-def test_gomoku_rejects_rounds_before_creating_database(tmp_path) -> None:
-    path = tmp_path / "gomoku-rounds.db"
+@pytest.mark.parametrize("game", ["gomoku", "chess"])
+def test_board_games_reject_rounds_before_creating_database(tmp_path, game: str) -> None:
+    path = tmp_path / f"{game}-rounds.db"
     result = runner.invoke(
         app,
-        ["play", "--game", "gomoku", "--rounds", "3", "--db", str(path)],
+        ["play", "--game", game, "--rounds", "3", "--db", str(path)],
     )
 
     assert result.exit_code == 2
@@ -621,12 +702,12 @@ def test_gomoku_rejects_rounds_before_creating_database(tmp_path) -> None:
     assert not path.exists()
 
 
-def test_games_lists_gomoku_but_not_chess() -> None:
+def test_games_lists_both_board_games() -> None:
     result = runner.invoke(app, ["games"])
 
     assert result.exit_code == 0
     assert "gomoku" in result.output
-    assert "chess" not in result.output
+    assert "chess" in result.output
 
 
 def test_play_rejects_zero_rounds_without_creating_database(tmp_path) -> None:
@@ -639,7 +720,7 @@ def test_play_rejects_zero_rounds_without_creating_database(tmp_path) -> None:
 
 def test_play_rejects_unknown_game_before_creating_database(tmp_path) -> None:
     path = tmp_path / "invalid-game.db"
-    result = runner.invoke(app, ["play", "--game", "chess", "--db", str(path)])
+    result = runner.invoke(app, ["play", "--game", "not-a-game", "--db", str(path)])
 
     assert result.exit_code == 2
     assert "未知项目" in result.output

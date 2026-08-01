@@ -43,8 +43,8 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 
 ## 运行
 
-macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、数学、知识、
-逻辑推理和猜谜竞答，并提供人类对战或两个 mock 自动演示。
+macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、国际象棋、
+数学、知识、逻辑推理和猜谜竞答，并提供人类对战或两个 mock 自动演示。
 
 ```bash
 # 两个 mock 选手演示（离线，无需 key）
@@ -74,6 +74,12 @@ llmolympic play --game gomoku --players mock:random,mock:fixed
 # 公平双局赛：同一 seed，各执黑一次，两局一起存档并批量更新 ELO
 llmolympic series --game gomoku --players mock:random,mock:fixed --seed 42
 
+# 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
+llmolympic play --game chess --players human:我,mock:random
+
+# 国际象棋离线双局赛：交换颜色后一起存档并批量更新 ELO
+llmolympic series --game chess --players mock:fixed,mock:illegal --seed 42
+
 # 列出所有比赛项目
 llmolympic games
 
@@ -89,7 +95,14 @@ llmolympic archive <MATCH_OR_SERIES_ID>
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
 中心是 `H8`。选手连续 3 次非法落子，或人类选手超时未落子，会立即判负。
-`--rounds` 用于数学、知识、逻辑推理和猜谜项目，不适用于五子棋（包括双局赛）。
+`--rounds` 用于数学、知识、逻辑推理和猜谜项目，不适用于棋类（包括双局赛）。
+
+国际象棋采用标准初始局面，玩家列表第一位执白、第二位执黑。规则引擎完整校验
+将军、将死、王车易位、吃过路兵与升变；输入严格接受一个 SAN 或 UCI 走法。
+局面保存规范 UCI 历史，因此三次/五次重复仍可准确复核。当前终端交互没有单独
+的“申请和棋”动作，所以有权按三次重复或五十回合申请和棋时，竞技场会自动申请；
+逼和、子力不足、五次重复和七十五回合仍按标准自动终局。连续 3 次非法走法、
+超时或 Provider 故障立即判负。
 
 `reasoning_quiz` 的题目由本地程序动态生成，目前包含排序约束和三位密码推理；
 生成器会枚举完整候选空间，只有唯一解的题目才会进入比赛，最多 50 题。
@@ -104,7 +117,8 @@ llmolympic archive <MATCH_OR_SERIES_ID>
 固定把人类放在第一位；多人类盲答需等待后续 Web/独立客户端的批量收答能力。
 
 `series` 固定进行两局：第一局按命令中的选手顺序，第二局完整交换顺序；两局
-使用相同 seed。五子棋中这表示双方各执黑一次。两局会在一个 SQLite 事务中
+使用相同 seed。五子棋中这表示双方各执黑一次，国际象棋中表示双方各执白一次。
+两局会在一个 SQLite 事务中
 原子存档，并基于系列赛开始前的同一 ELO 期望值批量计分，所以各胜一局不会
 因保存顺序产生积分漂移。榜单场次和胜平负仍按两局分别累计。
 问答项目也可使用 `series`：两局题目条件相同，但模型各自重新采样，用于观察

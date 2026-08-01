@@ -334,6 +334,8 @@ async def _run_series(
             first, second = (descriptor["name"] for descriptor in event.data["players"])
             if game.name == "gomoku":
                 seats = f"{first}（黑） vs {second}（白）"
+            elif game.name == "chess":
+                seats = f"{first}（白） vs {second}（黑）"
             else:
                 seats = f"{first}（第一席） vs {second}（第二席）"
             console.rule(f"第 {leg_number}/2 局 · {seats}")
@@ -364,7 +366,7 @@ def play(
         "--rounds",
         "-n",
         min=1,
-        help="题目型项目的每人题数（五子棋不适用；默认 5）",
+        help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
     seed: int = typer.Option(
         0,
@@ -435,7 +437,7 @@ def series(
         "--rounds",
         "-n",
         min=1,
-        help="题目型项目的每人题数（五子棋不适用；默认 5）",
+        help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
     seed: int = typer.Option(
         0,

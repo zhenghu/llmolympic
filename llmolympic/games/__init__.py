@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from llmolympic.core.game import Game
+from llmolympic.games.chess import Chess
 from llmolympic.games.gomoku import Gomoku
 from llmolympic.games.knowledge_quiz import KnowledgeQuiz
 from llmolympic.games.math_quiz import MathQuiz
@@ -19,6 +20,7 @@ GAME_REGISTRY: dict[str, type] = {
     ReasoningQuiz.name: ReasoningQuiz,
     RiddleQuiz.name: RiddleQuiz,
     Gomoku.name: Gomoku,
+    Chess.name: Chess,
 }
 
 _GAME_OPTIONS: dict[str, frozenset[str]] = {
@@ -27,6 +29,7 @@ _GAME_OPTIONS: dict[str, frozenset[str]] = {
     ReasoningQuiz.name: frozenset({"rounds"}),
     RiddleQuiz.name: frozenset({"rounds"}),
     Gomoku.name: frozenset(),
+    Chess.name: frozenset(),
 }
 
 
