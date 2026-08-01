@@ -19,10 +19,11 @@ from pathlib import Path
 
 from llmolympic.config import get as cfg_get
 from llmolympic.core.archive import ARCHIVE_SCHEMA_VERSION, MatchArchive
-from llmolympic.core.elo import DEFAULT_RATING, update_ratings
+from llmolympic.core.elo import DEFAULT_RATING, K_FACTOR, expected_score, update_ratings
 from llmolympic.core.events import EventType
+from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, head_to_head_point
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
 
@@ -67,6 +68,19 @@ _REQUIRED_COLUMNS = {
         "rating_after",
         "created_at",
     },
+    "series_archives": {
+        "series_id",
+        "schema_version",
+        "game",
+        "seed",
+        "players_json",
+        "points_json",
+        "rating_policy",
+        "started_at",
+        "finished_at",
+        "series_json",
+    },
+    "series_matches": {"series_id", "leg_number", "match_id"},
 }
 
 
@@ -76,6 +90,10 @@ class StorageError(RuntimeError):
 
 class MatchIdCollisionError(StorageError):
     """A match id is already attached to a different archive."""
+
+
+class SeriesIdCollisionError(StorageError):
+    """A series id is already attached to a different archive."""
 
 
 class UnsupportedSchemaError(StorageError):
@@ -123,6 +141,8 @@ class MatchSummary:
     scores: dict[str, float]
     started_at: datetime
     finished_at: datetime
+    series_id: str | None = None
+    leg_number: int | None = None
 
 
 def database_path(path: str | Path | None = None) -> Path:
@@ -177,76 +197,156 @@ class SQLiteStore:
                 raise UnsupportedSchemaError(
                     f"数据库版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}"
                 )
-            if version == 0:
-                if not create:
-                    raise StorageError(f"数据库尚未初始化：{self.path}")
-                connection.executescript(
-                    """
-                    BEGIN IMMEDIATE;
+            if version == 0 and not create:
+                raise StorageError(f"数据库尚未初始化：{self.path}")
+            if version == SCHEMA_VERSION:
+                self._verify_schema(connection)
+                return
 
-                    CREATE TABLE IF NOT EXISTS matches (
-                        match_id TEXT PRIMARY KEY,
-                        schema_version INTEGER NOT NULL,
-                        game TEXT NOT NULL,
-                        seed INTEGER NOT NULL,
-                        players_json TEXT NOT NULL,
-                        scores_json TEXT NOT NULL,
-                        started_at TEXT NOT NULL,
-                        finished_at TEXT NOT NULL,
-                        archive_json TEXT NOT NULL
-                    );
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                locked_version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if locked_version > SCHEMA_VERSION:
+                    raise UnsupportedSchemaError(
+                        f"数据库版本 {locked_version} 高于当前支持的版本 {SCHEMA_VERSION}"
+                    )
+                if locked_version == 0:
+                    self._create_base_schema(connection)
+                if locked_version in (0, 1):
+                    self._create_series_schema(connection)
+                self._verify_schema(connection)
+                if locked_version < SCHEMA_VERSION:
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
-                    CREATE INDEX IF NOT EXISTS matches_finished_at_idx
-                        ON matches(finished_at DESC);
-                    CREATE INDEX IF NOT EXISTS matches_game_finished_at_idx
-                        ON matches(game, finished_at DESC);
+    @staticmethod
+    def _create_base_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS matches (
+                match_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                scores_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                archive_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS matches_finished_at_idx ON matches(finished_at DESC)"
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS matches_game_finished_at_idx
+            ON matches(game, finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_players (
+                match_id TEXT NOT NULL REFERENCES matches(match_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                player TEXT NOT NULL,
+                descriptor_json TEXT NOT NULL,
+                score REAL NOT NULL,
+                PRIMARY KEY (match_id, position)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS match_players_player_idx
+            ON match_players(player, match_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ratings (
+                rating_scope TEXT NOT NULL CHECK (rating_scope IN ('overall', 'game')),
+                game TEXT NOT NULL,
+                player TEXT NOT NULL,
+                rating REAL NOT NULL,
+                games_played INTEGER NOT NULL,
+                wins INTEGER NOT NULL,
+                draws INTEGER NOT NULL,
+                losses INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (rating_scope, game, player)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ratings_leaderboard_idx
+            ON ratings(rating_scope, game, rating DESC, games_played DESC, player)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rating_history (
+                match_id TEXT NOT NULL REFERENCES matches(match_id) ON DELETE CASCADE,
+                rating_scope TEXT NOT NULL CHECK (rating_scope IN ('overall', 'game')),
+                game TEXT NOT NULL,
+                player TEXT NOT NULL,
+                opponent TEXT NOT NULL,
+                outcome REAL NOT NULL CHECK (outcome IN (0.0, 0.5, 1.0)),
+                rating_before REAL NOT NULL,
+                rating_after REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (match_id, rating_scope, game, player)
+            )
+            """
+        )
 
-                    CREATE TABLE IF NOT EXISTS match_players (
-                        match_id TEXT NOT NULL REFERENCES matches(match_id) ON DELETE CASCADE,
-                        position INTEGER NOT NULL,
-                        player TEXT NOT NULL,
-                        descriptor_json TEXT NOT NULL,
-                        score REAL NOT NULL,
-                        PRIMARY KEY (match_id, position)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS match_players_player_idx
-                        ON match_players(player, match_id);
-
-                    CREATE TABLE IF NOT EXISTS ratings (
-                        rating_scope TEXT NOT NULL CHECK (rating_scope IN ('overall', 'game')),
-                        game TEXT NOT NULL,
-                        player TEXT NOT NULL,
-                        rating REAL NOT NULL,
-                        games_played INTEGER NOT NULL,
-                        wins INTEGER NOT NULL,
-                        draws INTEGER NOT NULL,
-                        losses INTEGER NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        PRIMARY KEY (rating_scope, game, player)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS ratings_leaderboard_idx
-                        ON ratings(rating_scope, game, rating DESC, games_played DESC, player);
-
-                    CREATE TABLE IF NOT EXISTS rating_history (
-                        match_id TEXT NOT NULL REFERENCES matches(match_id) ON DELETE CASCADE,
-                        rating_scope TEXT NOT NULL CHECK (rating_scope IN ('overall', 'game')),
-                        game TEXT NOT NULL,
-                        player TEXT NOT NULL,
-                        opponent TEXT NOT NULL,
-                        outcome REAL NOT NULL CHECK (outcome IN (0.0, 0.5, 1.0)),
-                        rating_before REAL NOT NULL,
-                        rating_after REAL NOT NULL,
-                        created_at TEXT NOT NULL,
-                        PRIMARY KEY (match_id, rating_scope, game, player)
-                    );
-
-                    PRAGMA user_version = 1;
-                    COMMIT;
-                    """
-                )
-            self._verify_schema(connection)
+    @staticmethod
+    def _create_series_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_archives (
+                series_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                points_json TEXT NOT NULL,
+                rating_policy TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                series_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS series_archives_finished_at_idx
+            ON series_archives(finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS series_archives_game_finished_at_idx
+            ON series_archives(game, finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_matches (
+                series_id TEXT NOT NULL
+                    REFERENCES series_archives(series_id) ON DELETE CASCADE,
+                leg_number INTEGER NOT NULL CHECK (leg_number IN (1, 2)),
+                match_id TEXT NOT NULL UNIQUE
+                    REFERENCES matches(match_id) ON DELETE RESTRICT,
+                PRIMARY KEY (series_id, leg_number)
+            )
+            """
+        )
 
     @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
@@ -268,12 +368,7 @@ class SQLiteStore:
         """
 
         player_names = self._validate_archive(archive)
-        archive_payload = archive.model_dump(mode="json")
-        archive_json = _canonical_json(archive_payload)
-        players_json = _canonical_json(archive_payload["players"])
-        scores_json = _canonical_json(archive_payload["scores"])
-        started_at = archive.started_at.astimezone(UTC).isoformat()
-        finished_at = archive.finished_at.astimezone(UTC).isoformat()
+        archive_payload, archive_json = self._serialize_archive(archive)
 
         connection = self._connect()
         try:
@@ -295,42 +390,13 @@ class SQLiteStore:
                 connection.commit()
                 return SaveResult(inserted=False, rated=len(player_names) == 2)
 
-            connection.execute(
-                """
-                INSERT INTO matches (
-                    match_id, schema_version, game, seed, players_json, scores_json,
-                    started_at, finished_at, archive_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    archive.match_id,
-                    archive.schema_version,
-                    archive.game,
-                    archive.seed,
-                    players_json,
-                    scores_json,
-                    started_at,
-                    finished_at,
-                    archive_json,
-                ),
+            self._insert_match(
+                connection,
+                archive,
+                player_names,
+                archive_payload,
+                archive_json,
             )
-            for position, (player, descriptor) in enumerate(
-                zip(player_names, archive_payload["players"])
-            ):
-                connection.execute(
-                    """
-                    INSERT INTO match_players (
-                        match_id, position, player, descriptor_json, score
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        archive.match_id,
-                        position,
-                        player,
-                        _canonical_json(descriptor),
-                        archive.scores[player],
-                    ),
-                )
 
             changes: list[RatingChange] = []
             if len(player_names) == 2:
@@ -364,6 +430,286 @@ class SQLiteStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _serialize_archive(archive: MatchArchive) -> tuple[dict, str]:
+        archive_payload = archive.model_dump(mode="json")
+        return archive_payload, _canonical_json(archive_payload)
+
+    @staticmethod
+    def _insert_match(
+        connection: sqlite3.Connection,
+        archive: MatchArchive,
+        player_names: list[str],
+        archive_payload: dict,
+        archive_json: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO matches (
+                match_id, schema_version, game, seed, players_json, scores_json,
+                started_at, finished_at, archive_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                archive.match_id,
+                archive.schema_version,
+                archive.game,
+                archive.seed,
+                _canonical_json(archive_payload["players"]),
+                _canonical_json(archive_payload["scores"]),
+                archive.started_at.astimezone(UTC).isoformat(),
+                archive.finished_at.astimezone(UTC).isoformat(),
+                archive_json,
+            ),
+        )
+        for position, (player, descriptor) in enumerate(
+            zip(player_names, archive_payload["players"])
+        ):
+            connection.execute(
+                """
+                INSERT INTO match_players (
+                    match_id, position, player, descriptor_json, score
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    archive.match_id,
+                    position,
+                    player,
+                    _canonical_json(descriptor),
+                    archive.scores[player],
+                ),
+            )
+
+    def save_series(self, series: SeriesArchive) -> SaveResult:
+        """原子保存交换顺序的两局档案，并按总局分更新一次 ELO。
+
+        两局都会出现在普通对局历史中。每局都基于系列开始前的同一 ELO
+        期望值计算贡献，最后一次写入榜单，因此各胜一局时双方积分不漂移。
+        """
+
+        series, player_names = self._validate_series(series)
+        series_payload = series.model_dump(mode="json")
+        series_json = _canonical_json(series_payload)
+        serialized_legs = [self._serialize_archive(leg) for leg in series.legs]
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT series_json, rating_policy FROM series_archives WHERE series_id = ?",
+                (series.series_id,),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    existing_json = _canonical_json(json.loads(existing["series_json"]))
+                except (json.JSONDecodeError, StorageError) as exc:
+                    raise StorageError(
+                        f"数据库中 series_id {series.series_id!r} 的档案 JSON 已损坏"
+                    ) from exc
+                if existing_json != series_json:
+                    raise SeriesIdCollisionError(
+                        f"series_id {series.series_id!r} 已对应另一份系列赛档案"
+                    )
+                self._verify_existing_series(connection, series, existing["rating_policy"])
+                connection.commit()
+                return SaveResult(inserted=False, rated=True)
+
+            for leg in series.legs:
+                if connection.execute(
+                    "SELECT 1 FROM matches WHERE match_id = ?", (leg.match_id,)
+                ).fetchone():
+                    raise MatchIdCollisionError(
+                        f"match_id {leg.match_id!r} 已存档，不能重复归入新的系列赛"
+                    )
+
+            connection.execute(
+                """
+                INSERT INTO series_archives (
+                    series_id, schema_version, game, seed, players_json, points_json,
+                    rating_policy, started_at, finished_at, series_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    series.series_id,
+                    series.schema_version,
+                    series.game,
+                    series.seed,
+                    _canonical_json(series_payload["players"]),
+                    _canonical_json(series_payload["points"]),
+                    "elo_batch_v1",
+                    series.started_at.astimezone(UTC).isoformat(),
+                    series.finished_at.astimezone(UTC).isoformat(),
+                    series_json,
+                ),
+            )
+            for leg_number, (leg, serialized) in enumerate(
+                zip(series.legs, serialized_legs), start=1
+            ):
+                archive_payload, archive_json = serialized
+                leg_names = [descriptor["name"] for descriptor in leg.players]
+                self._insert_match(
+                    connection,
+                    leg,
+                    leg_names,
+                    archive_payload,
+                    archive_json,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO series_matches (series_id, leg_number, match_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (series.series_id, leg_number, leg.match_id),
+                )
+
+            outcomes_a = tuple(
+                head_to_head_point(leg, player_names[0]) for leg in series.legs
+            )
+            changes: list[RatingChange] = []
+            changes.extend(
+                self._record_series_ratings(
+                    connection,
+                    series,
+                    player_names[0],
+                    player_names[1],
+                    outcomes_a,
+                    None,
+                )
+            )
+            changes.extend(
+                self._record_series_ratings(
+                    connection,
+                    series,
+                    player_names[0],
+                    player_names[1],
+                    outcomes_a,
+                    series.game,
+                )
+            )
+
+            connection.commit()
+            return SaveResult(inserted=True, rated=True, rating_changes=tuple(changes))
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _verify_existing_series(
+        connection: sqlite3.Connection,
+        series: SeriesArchive,
+        rating_policy: str,
+    ) -> None:
+        if rating_policy != "elo_batch_v1":
+            raise StorageError(
+                f"数据库中 series_id {series.series_id!r} 的 ELO 策略已损坏"
+            )
+        rows = connection.execute(
+            """
+            SELECT sm.leg_number, sm.match_id, m.archive_json
+            FROM series_matches AS sm
+            JOIN matches AS m ON m.match_id = sm.match_id
+            WHERE sm.series_id = ?
+            ORDER BY sm.leg_number
+            """,
+            (series.series_id,),
+        ).fetchall()
+        expected_ids = [leg.match_id for leg in series.legs]
+        if [row["leg_number"] for row in rows] != [1, 2] or [
+            row["match_id"] for row in rows
+        ] != expected_ids:
+            raise StorageError(
+                f"数据库中 series_id {series.series_id!r} 的对局映射已损坏"
+            )
+        for row, leg in zip(rows, series.legs):
+            try:
+                stored_json = _canonical_json(json.loads(row["archive_json"]))
+            except (json.JSONDecodeError, StorageError) as exc:
+                raise StorageError(
+                    f"数据库中 match_id {leg.match_id!r} 的档案 JSON 已损坏"
+                ) from exc
+            expected_json = _canonical_json(leg.model_dump(mode="json"))
+            if stored_json != expected_json:
+                raise StorageError(
+                    f"数据库中 series_id {series.series_id!r} 的对局档案已损坏"
+                )
+        placeholders = ", ".join("?" for _ in expected_ids)
+        history_rows = connection.execute(
+            f"""
+            SELECT match_id, rating_scope, game, player, opponent, outcome,
+                   rating_before, rating_after, created_at
+            FROM rating_history
+            WHERE match_id IN ({placeholders})
+            """,
+            expected_ids,
+        ).fetchall()
+        if len(history_rows) != 8:
+            raise StorageError(
+                f"数据库中 series_id {series.series_id!r} 的 ELO 历史已损坏"
+            )
+        history = {
+            (row["match_id"], row["rating_scope"], row["game"], row["player"]): row
+            for row in history_rows
+        }
+        player_a, player_b = (descriptor["name"] for descriptor in series.players)
+        outcomes_a = tuple(head_to_head_point(leg, player_a) for leg in series.legs)
+        for rating_scope, game_key in (("overall", ""), ("game", series.game)):
+            first_a_key = (expected_ids[0], rating_scope, game_key, player_a)
+            first_b_key = (expected_ids[0], rating_scope, game_key, player_b)
+            if first_a_key not in history or first_b_key not in history:
+                raise StorageError(
+                    f"数据库中 series_id {series.series_id!r} 的 ELO 历史已损坏"
+                )
+            running_a = float(history[first_a_key]["rating_before"])
+            running_b = float(history[first_b_key]["rating_before"])
+            frozen_expectation = expected_score(running_a, running_b)
+            for leg, outcome_a in zip(series.legs, outcomes_a):
+                row_a = history.get((leg.match_id, rating_scope, game_key, player_a))
+                row_b = history.get((leg.match_id, rating_scope, game_key, player_b))
+                if row_a is None or row_b is None:
+                    raise StorageError(
+                        f"数据库中 series_id {series.series_id!r} 的 ELO 历史已损坏"
+                    )
+                delta_a = K_FACTOR * (outcome_a - frozen_expectation)
+                next_a = running_a + delta_a
+                next_b = running_b - delta_a
+                expected_created_at = leg.finished_at.astimezone(UTC).isoformat()
+                if (
+                    row_a["opponent"] != player_b
+                    or float(row_a["outcome"]) != outcome_a
+                    or float(row_a["rating_before"]) != running_a
+                    or float(row_a["rating_after"]) != next_a
+                    or row_a["created_at"] != expected_created_at
+                    or row_b["opponent"] != player_a
+                    or float(row_b["outcome"]) != 1.0 - outcome_a
+                    or float(row_b["rating_before"]) != running_b
+                    or float(row_b["rating_after"]) != next_b
+                    or row_b["created_at"] != expected_created_at
+                ):
+                    raise StorageError(
+                        f"数据库中 series_id {series.series_id!r} 的 ELO 历史已损坏"
+                    )
+                running_a = next_a
+                running_b = next_b
+
+    def _validate_series(
+        self, series: SeriesArchive
+    ) -> tuple[SeriesArchive, tuple[str, str]]:
+        if series.schema_version != SERIES_SCHEMA_VERSION:
+            raise StorageError(
+                f"不支持系列赛档案版本 {series.schema_version}；"
+                f"当前仅支持 {SERIES_SCHEMA_VERSION}"
+            )
+        try:
+            validated = SeriesArchive.model_validate(series.model_dump(mode="python"))
+        except (TypeError, ValueError) as exc:
+            raise StorageError(f"系列赛档案无效：{exc}") from exc
+        names = tuple(descriptor["name"] for descriptor in validated.players)
+        for leg in validated.legs:
+            self._validate_archive(leg)
+        return validated, names
 
     @staticmethod
     def _validate_archive(archive: MatchArchive) -> list[str]:
@@ -411,6 +757,10 @@ class SQLiteStore:
         started_data = started_events[0].data
         if started_data.get("game") != archive.game or started_data.get("seed") != archive.seed:
             raise StorageError("match_started 的项目或 seed 与档案不一致")
+        if "game_config" in started_data and not isinstance(
+            started_data["game_config"], dict
+        ):
+            raise StorageError("match_started 的 game_config 必须是对象")
         if started_data.get("players") != archive.players:
             raise StorageError("match_started 的选手描述与档案不一致")
         finished_scores = finished_events[0].data.get("scores")
@@ -516,33 +866,14 @@ class SQLiteStore:
             RatingChange(player_b, player_a, game, 1.0 - outcome_a, before_b, after_b),
         ]
         for change in changes:
-            win = int(change.outcome == 1.0)
-            draw = int(change.outcome == 0.5)
-            loss = int(change.outcome == 0.0)
-            connection.execute(
-                """
-                INSERT INTO ratings (
-                    rating_scope, game, player, rating, games_played,
-                    wins, draws, losses, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
-                ON CONFLICT (rating_scope, game, player) DO UPDATE SET
-                    rating = excluded.rating,
-                    games_played = ratings.games_played + 1,
-                    wins = ratings.wins + excluded.wins,
-                    draws = ratings.draws + excluded.draws,
-                    losses = ratings.losses + excluded.losses,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    rating_scope,
-                    game_key,
-                    change.player,
-                    change.after,
-                    win,
-                    draw,
-                    loss,
-                    archive.finished_at.astimezone(UTC).isoformat(),
-                ),
+            self._upsert_rating(
+                connection,
+                rating_scope=rating_scope,
+                game_key=game_key,
+                player=change.player,
+                rating=change.after,
+                outcomes=(change.outcome,),
+                updated_at=archive.finished_at,
             )
             connection.execute(
                 """
@@ -564,6 +895,129 @@ class SQLiteStore:
                 ),
             )
         return changes
+
+    def _record_series_ratings(
+        self,
+        connection: sqlite3.Connection,
+        series: SeriesArchive,
+        player_a: str,
+        player_b: str,
+        outcomes_a: tuple[float, ...],
+        game: str | None,
+    ) -> list[RatingChange]:
+        """按系列开始前的同一 ELO 期望值累计各局变化。"""
+
+        if len(outcomes_a) != len(series.legs):
+            raise StorageError("系列赛 ELO 局分数量与对局数量不一致")
+        rating_scope = "overall" if game is None else "game"
+        game_key = "" if game is None else game
+        before_a = self._current_rating(connection, rating_scope, game_key, player_a)
+        before_b = self._current_rating(connection, rating_scope, game_key, player_b)
+        expected_a = expected_score(before_a, before_b)
+        deltas_a = tuple(K_FACTOR * (outcome - expected_a) for outcome in outcomes_a)
+        outcomes_b = tuple(1.0 - outcome for outcome in outcomes_a)
+        running_a = before_a
+        running_b = before_b
+        history_rows: list[tuple[MatchArchive, str, str, float, float, float]] = []
+        for leg, outcome_a, delta_a in zip(series.legs, outcomes_a, deltas_a):
+            next_a = running_a + delta_a
+            next_b = running_b - delta_a
+            history_rows.extend(
+                (
+                    (leg, player_a, player_b, outcome_a, running_a, next_a),
+                    (leg, player_b, player_a, 1.0 - outcome_a, running_b, next_b),
+                )
+            )
+            running_a = next_a
+            running_b = next_b
+        after_a = running_a
+        after_b = running_b
+
+        self._upsert_rating(
+            connection,
+            rating_scope=rating_scope,
+            game_key=game_key,
+            player=player_a,
+            rating=after_a,
+            outcomes=outcomes_a,
+            updated_at=series.finished_at,
+        )
+        self._upsert_rating(
+            connection,
+            rating_scope=rating_scope,
+            game_key=game_key,
+            player=player_b,
+            rating=after_b,
+            outcomes=outcomes_b,
+            updated_at=series.finished_at,
+        )
+        for leg, player, opponent, outcome, before, after in history_rows:
+            connection.execute(
+                """
+                INSERT INTO rating_history (
+                    match_id, rating_scope, game, player, opponent, outcome,
+                    rating_before, rating_after, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    leg.match_id,
+                    rating_scope,
+                    game_key,
+                    player,
+                    opponent,
+                    outcome,
+                    before,
+                    after,
+                    leg.finished_at.astimezone(UTC).isoformat(),
+                ),
+            )
+
+        average_a = sum(outcomes_a) / len(outcomes_a)
+        return [
+            RatingChange(player_a, player_b, game, average_a, before_a, after_a),
+            RatingChange(player_b, player_a, game, 1.0 - average_a, before_b, after_b),
+        ]
+
+    @staticmethod
+    def _upsert_rating(
+        connection: sqlite3.Connection,
+        *,
+        rating_scope: str,
+        game_key: str,
+        player: str,
+        rating: float,
+        outcomes: tuple[float, ...],
+        updated_at: datetime,
+    ) -> None:
+        wins = sum(outcome == 1.0 for outcome in outcomes)
+        draws = sum(outcome == 0.5 for outcome in outcomes)
+        losses = sum(outcome == 0.0 for outcome in outcomes)
+        connection.execute(
+            """
+            INSERT INTO ratings (
+                rating_scope, game, player, rating, games_played,
+                wins, draws, losses, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (rating_scope, game, player) DO UPDATE SET
+                rating = excluded.rating,
+                games_played = ratings.games_played + excluded.games_played,
+                wins = ratings.wins + excluded.wins,
+                draws = ratings.draws + excluded.draws,
+                losses = ratings.losses + excluded.losses,
+                updated_at = excluded.updated_at
+            """,
+            (
+                rating_scope,
+                game_key,
+                player,
+                rating,
+                len(outcomes),
+                wins,
+                draws,
+                losses,
+                updated_at.astimezone(UTC).isoformat(),
+            ),
+        )
 
     @staticmethod
     def _current_rating(
@@ -587,20 +1041,32 @@ class SQLiteStore:
             ).fetchone()
         return None if row is None else MatchArchive.model_validate_json(row["archive_json"])
 
+    def get_series(self, series_id: str) -> SeriesArchive | None:
+        """Load the complete two-leg archive for ``series_id``."""
+
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT series_json FROM series_archives WHERE series_id = ?",
+                (series_id,),
+            ).fetchone()
+        return None if row is None else SeriesArchive.model_validate_json(row["series_json"])
+
     def list_matches(self, *, limit: int = 20, game: str | None = None) -> list[MatchSummary]:
         """Return recent persisted matches, newest first."""
 
         if limit < 1:
             raise ValueError("limit 必须至少为 1")
         sql = """
-            SELECT match_id, game, seed, players_json, scores_json, started_at, finished_at
-            FROM matches
+            SELECT m.match_id, m.game, m.seed, m.players_json, m.scores_json,
+                   m.started_at, m.finished_at, sm.series_id, sm.leg_number
+            FROM matches AS m
+            LEFT JOIN series_matches AS sm ON sm.match_id = m.match_id
         """
         params: list[object] = []
         if game is not None:
-            sql += " WHERE game = ?"
+            sql += " WHERE m.game = ?"
             params.append(game)
-        sql += " ORDER BY finished_at DESC, match_id DESC LIMIT ?"
+        sql += " ORDER BY m.finished_at DESC, m.match_id DESC LIMIT ?"
         params.append(limit)
         with closing(self._connect()) as connection:
             rows = connection.execute(sql, params).fetchall()
@@ -613,6 +1079,8 @@ class SQLiteStore:
                 scores={name: float(score) for name, score in json.loads(row["scores_json"]).items()},
                 started_at=datetime.fromisoformat(row["started_at"]),
                 finished_at=datetime.fromisoformat(row["finished_at"]),
+                series_id=row["series_id"],
+                leg_number=row["leg_number"],
             )
             for row in rows
         ]

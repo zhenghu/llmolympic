@@ -24,6 +24,7 @@ from llmolympic.core.player import (
     LLMPlayer,
     Player,
 )
+from llmolympic.core.series import SeriesArchive, play_two_leg_series
 from llmolympic.core.storage import (
     SQLITE_INT_MAX,
     SQLITE_INT_MIN,
@@ -181,7 +182,13 @@ def _render_saved(archive: MatchArchive, store: SQLiteStore, result: SaveResult)
         console.print("[yellow]本场不是双人对局，未计入 ELO。[/]")
         return
 
-    table = Table(title="ELO 更新")
+    _render_rating_changes(result)
+
+
+def _render_rating_changes(result: SaveResult, *, title: str = "ELO 更新") -> None:
+    """显示单场或系列赛最终写入榜单的净变化。"""
+
+    table = Table(title=title)
     table.add_column("榜单")
     table.add_column("选手")
     table.add_column("原分", justify="right")
@@ -200,12 +207,147 @@ def _render_saved(archive: MatchArchive, store: SQLiteStore, result: SaveResult)
     console.print(table)
 
 
+def _prepare_contest(
+    *,
+    game_name: str,
+    player_spec: str,
+    rounds: int | None,
+    timeout: float,
+    llm_timeout: float | None,
+    no_llm_timeout: bool,
+    require_two: bool = False,
+    allow_human: bool = True,
+) -> tuple[Game, list[Player]]:
+    """按固定顺序完成项目、人数、超时与 Provider 校验。"""
+
+    try:
+        game_options = {} if rounds is None else {"rounds": rounds}
+        selected_game = create_game(game_name, **game_options)
+    except ValueError as exc:
+        param_hint = "--rounds" if rounds is not None and game_name in list_games() else "--game"
+        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
+
+    try:
+        player_specs = _split_player_specs(player_spec)
+        if require_two and len(player_specs) != 2:
+            raise typer.BadParameter(
+                "交换先后手的双局赛需要恰好 2 名选手",
+                param_hint="--players",
+            )
+        validate_player_count(selected_game, len(player_specs))
+    except typer.BadParameter:
+        raise
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+
+    has_human_player = any(spec.partition(":")[0] == "human" for spec in player_specs)
+    if has_human_player and not allow_human:
+        raise typer.BadParameter(
+            "双局赛暂只支持 LLM/mock；终端人类输入超时后无法安全取消，暂未开放",
+            param_hint="--players",
+        )
+    try:
+        human_timeout = _validate_human_timeout(timeout) if has_human_player else timeout
+        has_llm_player = any(spec.partition(":")[0] != "human" for spec in player_specs)
+        effective_llm_timeout = None
+        if llm_timeout is not None or no_llm_timeout:
+            effective_llm_timeout = _resolve_llm_timeout(
+                llm_timeout,
+                disabled=no_llm_timeout,
+            )
+        elif has_llm_player:
+            effective_llm_timeout = _resolve_llm_timeout(None)
+        selected_players = _parse_players(player_spec, human_timeout, effective_llm_timeout)
+    except typer.BadParameter:
+        raise
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    try:
+        validate_players(selected_game, [player.name for player in selected_players])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    return selected_game, selected_players
+
+
 async def _run(
     game: Game, players: list[Player], seed: int, store: SQLiteStore
 ) -> None:
     archive = await play_match(game, players, seed=seed, on_event=_render)
     result = store.save_match(archive)
     _render_saved(archive, store, result)
+
+
+def _render_series_summary(series_archive: SeriesArchive) -> None:
+    table = Table(title="双局赛结果")
+    table.add_column("选手")
+    table.add_column("胜-平-负", justify="right")
+    table.add_column("局分", justify="right")
+    table.add_column("技术负", justify="right")
+    for descriptor in series_archive.players:
+        player = descriptor["name"]
+        standing = series_archive.standings[player]
+        table.add_row(
+            player,
+            f"{standing.wins}-{standing.draws}-{standing.losses}",
+            f"{standing.points:.1f}",
+            str(standing.technical_losses),
+        )
+    console.print(table)
+
+
+def _render_series_saved(
+    series_archive: SeriesArchive,
+    store: SQLiteStore,
+    result: SaveResult,
+) -> None:
+    if not result.inserted:
+        console.print(
+            f"[yellow]系列赛 {series_archive.series_id} 已存在，未重复更新 ELO。[/]"
+        )
+        return
+    first, second = series_archive.legs
+    console.print(
+        f"[green]✓ 两局已原子存档[/]  {series_archive.series_id}\n"
+        f"  第 1 局 {first.match_id}\n"
+        f"  第 2 局 {second.match_id}\n"
+        f"  {store.path}"
+    )
+    _render_rating_changes(result, title="系列赛 ELO 净变化")
+
+
+async def _run_series(
+    game: Game,
+    players: list[Player],
+    seed: int,
+    store: SQLiteStore,
+) -> None:
+    console.print(
+        Panel(
+            f"项目 [bold]{game.name}[/] · seed={seed}\n"
+            "两局使用同一局面条件，第二局交换选手顺序",
+            title="双局赛开始",
+        )
+    )
+
+    def render_leg(leg_number: int, event: MatchEvent) -> None:
+        if event.type == EventType.MATCH_STARTED:
+            first, second = (descriptor["name"] for descriptor in event.data["players"])
+            if game.name == "gomoku":
+                seats = f"{first}（黑） vs {second}（白）"
+            else:
+                seats = f"{first}（第一席） vs {second}（第二席）"
+            console.rule(f"第 {leg_number}/2 局 · {seats}")
+        _render(event)
+
+    series_archive = await play_two_leg_series(
+        game,
+        players,
+        seed=seed,
+        on_event=render_leg,
+    )
+    _render_series_summary(series_archive)
+    result = store.save_series(series_archive)
+    _render_series_saved(series_archive, store, result)
 
 
 @app.command()
@@ -258,45 +400,90 @@ def play(
     ] = None,
 ) -> None:
     """开始一场对局，结束后自动存档并更新 ELO。"""
-    try:
-        game_options = {} if rounds is None else {"rounds": rounds}
-        selected_game = create_game(game, **game_options)
-    except ValueError as exc:
-        param_hint = "--rounds" if rounds is not None and game in list_games() else "--game"
-        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
-    try:
-        player_specs = _split_player_specs(players)
-        validate_player_count(selected_game, len(player_specs))
-    except typer.BadParameter:
-        raise
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--players") from exc
-    try:
-        has_human_player = any(spec.partition(":")[0] == "human" for spec in player_specs)
-        human_timeout = _validate_human_timeout(timeout) if has_human_player else timeout
-        has_llm_player = any(spec.partition(":")[0] != "human" for spec in player_specs)
-        effective_llm_timeout = None
-        if llm_timeout is not None or no_llm_timeout:
-            effective_llm_timeout = _resolve_llm_timeout(
-                llm_timeout,
-                disabled=no_llm_timeout,
-            )
-        elif has_llm_player:
-            effective_llm_timeout = _resolve_llm_timeout(None)
-        selected_players = _parse_players(players, human_timeout, effective_llm_timeout)
-    except typer.BadParameter:
-        raise
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--players") from exc
-    try:
-        validate_players(selected_game, [player.name for player in selected_players])
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    selected_game, selected_players = _prepare_contest(
+        game_name=game,
+        player_spec=players,
+        rounds=rounds,
+        timeout=timeout,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+    )
     store = _open_store(database)
     try:
         asyncio.run(_run(selected_game, selected_players, seed, store))
     except (OSError, sqlite3.Error, StorageError) as exc:
         console.print(f"[red]对局已完成，但 SQLite 存档失败：{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def series(
+    game: str = typer.Option(
+        "gomoku",
+        "--game",
+        "-g",
+        help=f"比赛项目: {', '.join(list_games())}",
+    ),
+    players: str = typer.Option(
+        "mock:random,mock:fixed",
+        "--players",
+        "-p",
+        help="恰好两个非人类选手，如 openai:gpt-4o-mini,ollama:llama3.1",
+    ),
+    rounds: int | None = typer.Option(
+        None,
+        "--rounds",
+        "-n",
+        min=1,
+        help="问答项目的每人题数（五子棋不适用；默认 5）",
+    ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        "-s",
+        min=SQLITE_INT_MIN,
+        max=SQLITE_INT_MAX,
+        help="两局共用的随机种子（用于复现题目或初始局面）",
+    ),
+    llm_timeout: float | None = typer.Option(
+        None,
+        "--llm-timeout",
+        min=0.001,
+        help=(
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / "
+            "match.llm_timeout_seconds / 120"
+        ),
+    ),
+    no_llm_timeout: bool = typer.Option(
+        False,
+        "--no-llm-timeout",
+        help=(
+            "禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，"
+            "仅建议用于旧同步适配器"
+        ),
+    ),
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
+) -> None:
+    """两名选手交换顺序各赛一局，并以公平批次更新 ELO。"""
+
+    selected_game, selected_players = _prepare_contest(
+        game_name=game,
+        player_spec=players,
+        rounds=rounds,
+        timeout=60.0,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+        require_two=True,
+        allow_human=False,
+    )
+    store = _open_store(database)
+    try:
+        asyncio.run(_run_series(selected_game, selected_players, seed, store))
+    except (OSError, sqlite3.Error, StorageError) as exc:
+        console.print(f"[red]双局赛已完成，但 SQLite 原子存档失败：{exc}[/]")
         raise typer.Exit(code=1) from exc
 
 
@@ -326,9 +513,13 @@ def history(
     console.print("[bold]对局历史[/]")
     for row in rows:
         score_text = " · ".join(f"{name} {row.scores[name]:.2f}" for name in row.players)
+        series_text = ""
+        if row.series_id is not None:
+            series_text = f"  系列 {row.series_id} 第 {row.leg_number}/2 局\n"
         console.print(
             f"[bold cyan]{row.match_id}[/]  {row.game}  "
             f"{row.finished_at.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
+            f"{series_text}"
             f"  {score_text}"
         )
 
@@ -368,16 +559,19 @@ def leaderboard(
 
 @app.command(name="archive")
 def show_archive(
-    match_id: str = typer.Argument(..., help="对局 ID"),
+    match_id: str = typer.Argument(..., help="对局或系列赛 ID"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
-    """输出一场对局的完整 JSON 档案。"""
+    """输出一场对局或一个双局赛的完整 JSON 档案。"""
     try:
-        archive = _open_store(database, create=False).get_match(match_id)
+        store = _open_store(database, create=False)
+        archive = store.get_match(match_id)
+        if archive is None:
+            archive = store.get_series(match_id)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
         console.print(f"[red]无法读取 SQLite 对局档案：{exc}[/]")
         raise typer.Exit(code=1) from exc
     if archive is None:
-        console.print(f"[red]未找到对局 {match_id!r}。[/]")
+        console.print(f"[red]未找到对局或系列赛 {match_id!r}。[/]")
         raise typer.Exit(code=1)
     console.print_json(archive.to_json())

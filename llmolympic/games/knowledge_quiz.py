@@ -111,6 +111,9 @@ class KnowledgeQuiz:
             raise ValueError("rounds 必须至少为 1")
         self.rounds = rounds
 
+    def describe_config(self) -> dict[str, object]:
+        return {"rounds": self.rounds}
+
     def new_state(self, players: list[str], seed: int) -> KnowledgeQuizState:
         rng = random.Random(seed)  # 同一 seed 抽出完全相同的题目（可复现）
         k = min(self.rounds, len(QUESTION_BANK))

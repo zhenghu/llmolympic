@@ -65,6 +65,9 @@ llmolympic play --game gomoku --players human:我,openai:gpt-4o-mini
 # 五子棋离线演示（mock 会读取棋盘并选择空位）
 llmolympic play --game gomoku --players mock:random,mock:fixed
 
+# 公平双局赛：同一 seed，各执黑一次，两局一起存档并批量更新 ELO
+llmolympic series --game gomoku --players mock:random,mock:fixed --seed 42
+
 # 列出所有比赛项目
 llmolympic games
 
@@ -74,13 +77,24 @@ llmolympic leaderboard --game math_quiz
 
 # 查看对局历史与完整档案
 llmolympic history
-llmolympic archive <MATCH_ID>
+llmolympic archive <MATCH_OR_SERIES_ID>
 ```
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
 中心是 `H8`。选手连续 3 次非法落子，或人类选手超时未落子，会立即判负。
-`--rounds` 只用于数学和知识问答，不适用于单局五子棋。
+`--rounds` 只用于数学和知识问答，不适用于五子棋（包括双局赛）。
+
+`series` 固定进行两局：第一局按命令中的选手顺序，第二局完整交换顺序；两局
+使用相同 seed。五子棋中这表示双方各执黑一次。两局会在一个 SQLite 事务中
+原子存档，并基于系列赛开始前的同一 ELO 期望值批量计分，所以各胜一局不会
+因保存顺序产生积分漂移。榜单场次和胜平负仍按两局分别累计。
+问答项目也可使用 `series`：两局题目条件相同，但模型各自重新采样，用于观察
+输出波动；它不代表问答项目存在先后手优势。
+
+当前终端版 `series` 只接受 LLM/mock。`HumanPlayer` 的终端输入超时后，底层
+输入线程无法可靠取消，贸然开始第二局可能抢占输入；待可取消输入链路完成后
+再开放人类双局赛。单局 `play` 的人类对战不受影响。
 
 LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 `LLMOLYMPIC_LLM_TIMEOUT` 或 `[match] llm_timeout_seconds` 调整。OpenAI、Ollama
@@ -90,7 +104,10 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 但该选项只禁用比赛层截止时间，Provider 自身的网络超时仍可能生效；同时程序
 无法强制终止卡住的同步请求，建议尽快实现原生异步 `achat()`。
 
-每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO。
+每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO；
+`series` 则把两局和批量 ELO 作为一个原子事务保存。
+`history` 会标出系列赛 ID 与局号；`archive` 既可读取单局 ID，也可用系列赛 ID
+读取包含两局的完整档案。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
 `~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
 或各命令的 `--db` 覆盖。

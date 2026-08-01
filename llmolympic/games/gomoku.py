@@ -70,6 +70,9 @@ class Gomoku:
     min_players = 2
     max_players = 2
 
+    def describe_config(self) -> dict[str, object]:
+        return {"board_size": BOARD_SIZE, "rules": "freestyle", "win_length": 5}
+
     def new_state(self, players: list[str], seed: int) -> GomokuState:
         if len(players) != 2:
             raise ValueError("五子棋必须恰好有 2 名选手")
