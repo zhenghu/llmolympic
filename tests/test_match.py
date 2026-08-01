@@ -6,13 +6,33 @@ import asyncio
 
 from llmolympic.core.events import EventType
 from llmolympic.core.match import play_match
-from llmolympic.core.player import LLMPlayer
+from llmolympic.core.player import LLMPlayer, Player, PlayerTimeoutError
 from llmolympic.games import create_game
 from llmolympic.providers.mock import MockProvider
 
 
 def _llm(name: str, strategy: str, seed: int | None = None) -> LLMPlayer:
     return LLMPlayer(name=name, provider=MockProvider(strategy=strategy, seed=seed), model=strategy)
+
+
+class _SequencePlayer(Player):
+    kind = "scripted"
+
+    def __init__(self, name: str, moves: list[str]) -> None:
+        super().__init__(name)
+        self.moves = iter(moves)
+        self.prompts: list[str] = []
+
+    async def get_move(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return next(self.moves)
+
+
+class _TimeoutPlayer(Player):
+    kind = "scripted"
+
+    async def get_move(self, prompt: str) -> str:
+        raise PlayerTimeoutError(f"{self.name} timed out")
 
 
 def test_mock_match_completes_with_archive() -> None:
@@ -63,6 +83,88 @@ def test_illegal_moves_retried_then_forfeited() -> None:
     # 每题 2 次非法尝试均被拒（第 2 次达到上限，同时判放弃）
     assert len(rejected) == 3 * 2
     assert any("判放弃" in (m.reason or "") for m in rejected)
+
+
+def test_retry_prompt_includes_rejected_move_and_reason() -> None:
+    player = _SequencePlayer("scripted", ["Z", "A"])
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=1), [player], max_attempts=2)
+    )
+
+    assert len(player.prompts) == 2
+    assert "上次输出 'Z' 未被接受" in player.prompts[1]
+    assert "无效选项" in player.prompts[1]
+    assert "还可重试 1 次" in player.prompts[1]
+    prompts = [event for event in archive.events if event.type == EventType.TURN_PROMPT]
+    assert len(prompts) == 2
+    assert archive.moves[-1].prompt == player.prompts[1]
+
+
+def test_retry_feedback_truncates_a_very_long_rejected_output() -> None:
+    long_move = "Z" * 5000
+    player = _SequencePlayer("scripted", [long_move, "A"])
+
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=1), [player], max_attempts=2)
+    )
+
+    assert archive.moves[0].move == long_move
+    assert len(player.prompts[1]) < 1000
+    assert "Z" * 500 not in player.prompts[1]
+
+
+def test_scripted_gomoku_match_completes_with_nine_archived_moves() -> None:
+    black = _SequencePlayer("black", ["A1", "B1", "C1", "D1", "E1"])
+    white = _SequencePlayer("white", ["A2", "B2", "C2", "D2"])
+
+    archive = asyncio.run(play_match(create_game("gomoku"), [black, white], seed=11))
+
+    assert archive.game == "gomoku"
+    assert archive.seed == 11
+    assert archive.scores == {"black": 1.0, "white": 0.0}
+    assert [move.move for move in archive.moves] == [
+        "A1",
+        "A2",
+        "B1",
+        "B2",
+        "C1",
+        "C2",
+        "D1",
+        "D2",
+        "E1",
+    ]
+    assert all(move.accepted for move in archive.moves)
+    assert archive.events[-1].type == EventType.MATCH_FINISHED
+
+    replay_game = create_game("gomoku")
+    replay_state = replay_game.new_state(["black", "white"], archive.seed)
+    for move in archive.moves:
+        replay_game.apply_move(replay_state, move.player, move.move or "")
+    assert replay_game.score(replay_state) == archive.scores
+
+
+def test_two_legal_mock_players_complete_a_gomoku_match() -> None:
+    players = [_llm("random", "random", seed=1), _llm("fixed", "fixed")]
+
+    archive = asyncio.run(play_match(create_game("gomoku"), players, seed=42))
+
+    assert 9 <= len(archive.moves) <= 225
+    assert all(move.accepted for move in archive.moves)
+    assert set(archive.scores) == {"random", "fixed"}
+    assert sum(archive.scores.values()) == 1.0
+
+
+def test_gomoku_timeout_is_an_immediate_technical_loss() -> None:
+    black = _TimeoutPlayer("black")
+    white = _SequencePlayer("white", [])
+
+    archive = asyncio.run(play_match(create_game("gomoku"), [black, white]))
+
+    assert archive.scores == {"black": 0.0, "white": 1.0}
+    assert len(archive.moves) == 1
+    assert archive.moves[0].player == "black"
+    assert not archive.moves[0].accepted
+    assert "超时未作答" in (archive.moves[0].reason or "")
 
 
 def test_duplicate_player_names_rejected() -> None:

@@ -15,7 +15,7 @@ from rich.table import Table
 from llmolympic.config import get as cfg_get
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
-from llmolympic.core.game import Game
+from llmolympic.core.game import Game, validate_player_count, validate_players
 from llmolympic.core.match import play_match
 from llmolympic.core.player import HumanPlayer, LLMPlayer, Player
 from llmolympic.core.storage import (
@@ -35,6 +35,13 @@ app = typer.Typer(
 console = Console()
 
 
+def _split_player_specs(spec: str) -> list[str]:
+    tokens = [token.strip() for token in spec.split(",")]
+    if any(not token for token in tokens):
+        raise typer.BadParameter("选手规格不能为空", param_hint="--players")
+    return tokens
+
+
 def _parse_players(spec: str, human_timeout: float) -> list[Player]:
     """把 ``openai:gpt-4o-mini,human:小明`` 这样的规格解析成选手列表。
 
@@ -43,8 +50,8 @@ def _parse_players(spec: str, human_timeout: float) -> list[Player]:
     ``human`` 省略名字时默认为"人类"。
     """
     players: list[Player] = []
-    for token in spec.split(","):
-        kind, _, ident = token.strip().partition(":")
+    for token in _split_player_specs(spec):
+        kind, _, ident = token.partition(":")
         if kind == "human":
             players.append(HumanPlayer(name=ident or "人类", timeout=human_timeout))
             continue
@@ -146,17 +153,23 @@ def play(
         "-p",
         help="逗号分隔的选手规格，如 openai:gpt-4o-mini,human:小明,ollama:llama3.1",
     ),
-    rounds: int = typer.Option(5, "--rounds", "-n", min=1, help="每人题数"),
+    rounds: int | None = typer.Option(
+        None,
+        "--rounds",
+        "-n",
+        min=1,
+        help="问答项目的每人题数（五子棋不适用；默认 5）",
+    ),
     seed: int = typer.Option(
         0,
         "--seed",
         "-s",
         min=SQLITE_INT_MIN,
         max=SQLITE_INT_MAX,
-        help="随机种子（同 seed 同题）",
+        help="随机种子（用于复现题目或初始局面）",
     ),
     timeout: float = typer.Option(
-        60.0, "--timeout", "-t", min=0.001, help="人类选手每题限时（秒）"
+        60.0, "--timeout", "-t", min=0.001, help="人类选手每次行动限时（秒）"
     ),
     database: Annotated[
         Path | None,
@@ -165,13 +178,25 @@ def play(
 ) -> None:
     """开始一场对局，结束后自动存档并更新 ELO。"""
     try:
-        selected_game = create_game(game, rounds=rounds)
+        game_options = {} if rounds is None else {"rounds": rounds}
+        selected_game = create_game(game, **game_options)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--game") from exc
+        param_hint = "--rounds" if rounds is not None and game in list_games() else "--game"
+        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
+    try:
+        validate_player_count(selected_game, len(_split_player_specs(players)))
+    except typer.BadParameter:
+        raise
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
     try:
         selected_players = _parse_players(players, timeout)
     except typer.BadParameter:
         raise
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    try:
+        validate_players(selected_game, [player.name for player in selected_players])
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--players") from exc
     store = _open_store(database)

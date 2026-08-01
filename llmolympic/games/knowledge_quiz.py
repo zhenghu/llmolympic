@@ -102,6 +102,8 @@ class KnowledgeQuiz:
     """单轮选择题项目：每位选手依次回答同样的 rounds 道题。"""
 
     name = "knowledge_quiz"
+    min_players = 1
+    max_players = None
 
     def __init__(self, rounds: int = 5) -> None:
         if rounds < 1:

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError
-from llmolympic.games import create_game
+from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError, validate_players
+from llmolympic.games import GAME_REGISTRY, create_game, list_games
+from llmolympic.games.gomoku import Gomoku
 from llmolympic.games.knowledge_quiz import KnowledgeQuiz
 from llmolympic.games.math_quiz import MathQuiz
 
@@ -89,6 +90,34 @@ class TestKnowledgeQuiz:
 def test_create_game_unknown_name() -> None:
     with pytest.raises(ValueError, match="未知项目"):
         create_game("chess")
+
+
+def test_gomoku_is_registered_without_international_chess() -> None:
+    assert isinstance(create_game("gomoku"), Gomoku)
+    assert GAME_REGISTRY["gomoku"] is Gomoku
+    assert "gomoku" in list_games()
+    assert "chess" not in list_games()
+
+
+def test_gomoku_rejects_question_round_option() -> None:
+    with pytest.raises(ValueError, match="不支持参数: rounds"):
+        create_game("gomoku", rounds=3)
+
+
+def test_legacy_game_without_player_metadata_remains_compatible() -> None:
+    class LegacyGame:
+        name = "legacy"
+
+        def __init__(self, custom_option: int = 0) -> None:
+            self.custom_option = custom_option
+
+    validate_players(LegacyGame(), ["甲"])
+    GAME_REGISTRY[LegacyGame.name] = LegacyGame
+    try:
+        created = create_game("legacy", custom_option=7)
+        assert created.custom_option == 7
+    finally:
+        del GAME_REGISTRY[LegacyGame.name]
 
 
 @pytest.mark.parametrize("game", ["math_quiz", "knowledge_quiz"])
