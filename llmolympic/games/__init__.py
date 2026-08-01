@@ -10,16 +10,22 @@ from llmolympic.core.game import Game
 from llmolympic.games.gomoku import Gomoku
 from llmolympic.games.knowledge_quiz import KnowledgeQuiz
 from llmolympic.games.math_quiz import MathQuiz
+from llmolympic.games.reasoning_quiz import ReasoningQuiz
+from llmolympic.games.riddle_quiz import RiddleQuiz
 
 GAME_REGISTRY: dict[str, type] = {
     MathQuiz.name: MathQuiz,
     KnowledgeQuiz.name: KnowledgeQuiz,
+    ReasoningQuiz.name: ReasoningQuiz,
+    RiddleQuiz.name: RiddleQuiz,
     Gomoku.name: Gomoku,
 }
 
 _GAME_OPTIONS: dict[str, frozenset[str]] = {
     MathQuiz.name: frozenset({"rounds"}),
     KnowledgeQuiz.name: frozenset({"rounds"}),
+    ReasoningQuiz.name: frozenset({"rounds"}),
+    RiddleQuiz.name: frozenset({"rounds"}),
     Gomoku.name: frozenset(),
 }
 

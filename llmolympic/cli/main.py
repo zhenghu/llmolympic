@@ -364,7 +364,7 @@ def play(
         "--rounds",
         "-n",
         min=1,
-        help="问答项目的每人题数（五子棋不适用；默认 5）",
+        help="题目型项目的每人题数（五子棋不适用；默认 5）",
     ),
     seed: int = typer.Option(
         0,
@@ -435,7 +435,7 @@ def series(
         "--rounds",
         "-n",
         min=1,
-        help="问答项目的每人题数（五子棋不适用；默认 5）",
+        help="题目型项目的每人题数（五子棋不适用；默认 5）",
     ),
     seed: int = typer.Option(
         0,
