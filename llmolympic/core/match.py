@@ -77,6 +77,9 @@ class Match:
     ) -> None:
         names = [p.name for p in players]
         validate_players(game, names)
+        entrant_ids = [player.entrant_id for player in players]
+        if len(set(entrant_ids)) != len(entrant_ids):
+            raise ValueError("对局中的 entrant_id 必须唯一")
         if max_attempts < 1:
             raise ValueError("max_attempts 必须至少为 1")
         if max_attempts > MAX_MOVE_ATTEMPTS:

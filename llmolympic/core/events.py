@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EventType(str, Enum):
@@ -21,6 +21,8 @@ class EventType(str, Enum):
 
 class MatchEvent(BaseModel):
     """一条对局事件。``data`` 载荷随类型不同而变化（prompt、move、scores 等）。"""
+
+    model_config = ConfigDict(extra="forbid")
 
     seq: int
     type: EventType

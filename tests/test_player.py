@@ -83,6 +83,11 @@ class _ResponseAsyncProvider(Provider):
         return self.response  # type: ignore[return-value]
 
 
+class _ProfileAsyncProvider(_ResponseAsyncProvider):
+    name = "profile-provider"
+    profile_id = "stable-profile"
+
+
 def test_native_async_provider_is_cancelled_at_llm_move_timeout() -> None:
     provider = _SlowAsyncProvider()
     player = LLMPlayer(
@@ -271,6 +276,93 @@ def test_sampling_params_are_recursively_redacted_only_in_archive_description() 
         "jwt": "[REDACTED]",
         "metadata": "[REDACTED]",
     }
+
+
+def test_direct_llm_identity_is_stable_order_independent_and_disambiguates_name() -> None:
+    first = LLMPlayer(
+        "first",
+        _ResponseAsyncProvider("A"),
+        "model",
+        seed=7,
+        temperature=0.2,
+    )
+    reordered = LLMPlayer(
+        "first",
+        _ResponseAsyncProvider("A"),
+        "model",
+        temperature=0.2,
+        seed=7,
+    )
+    renamed = LLMPlayer(
+        "second",
+        _ResponseAsyncProvider("A"),
+        "model",
+        seed=7,
+        temperature=0.2,
+    )
+    resampled = LLMPlayer(
+        "first",
+        _ResponseAsyncProvider("A"),
+        "model",
+        seed=8,
+        temperature=0.2,
+    )
+
+    assert first.entrant_id == reordered.entrant_id
+    assert first.entrant_id != renamed.entrant_id
+    assert first.entrant_id != resampled.entrant_id
+
+
+def test_profile_llm_identity_uses_documented_profile_and_model_key() -> None:
+    first = LLMPlayer(
+        "old display",
+        _ProfileAsyncProvider("A"),
+        "model",
+        seed=7,
+        temperature=0.2,
+    )
+    renamed = LLMPlayer(
+        "new display",
+        _ProfileAsyncProvider("A"),
+        "model",
+        temperature=0.2,
+        seed=7,
+    )
+    resampled = LLMPlayer(
+        "old display",
+        _ProfileAsyncProvider("A"),
+        "model",
+        seed=8,
+        temperature=0.2,
+    )
+
+    assert first.entrant_id == renamed.entrant_id == resampled.entrant_id
+    assert first.entrant_id == "profile:stable-profile:model"
+    assert first.describe()["profile_id"] == "stable-profile"
+
+
+def test_explicit_entrant_identity_and_readonly_display_compatibility() -> None:
+    player = HumanPlayer("Display", entrant_id="profile:human")
+
+    assert player.entrant_id == "profile:human"
+    assert player.display_name == player.name == "Display"
+    assert player.describe() == {
+        "name": "Display",
+        "display_name": "Display",
+        "entrant_id": "profile:human",
+        "kind": "human",
+    }
+    with pytest.raises(AttributeError):
+        player.display_name = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "entrant_id",
+    ["", "x" * 257, "bad\nvalue", "bad\u0085value", "bad\u202evalue"],
+)
+def test_entrant_id_rejects_length_control_and_bidi_hazards(entrant_id: str) -> None:
+    with pytest.raises(ValueError, match="entrant_id"):
+        HumanPlayer("human", entrant_id=entrant_id)
 
 
 @pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf")])

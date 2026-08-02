@@ -3,9 +3,46 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from abc import ABC, abstractmethod
+from urllib.parse import urlsplit
 
 DEFAULT_MAX_OUTPUT_TOKENS = 1024
+
+
+class ProviderConfigurationError(ValueError):
+    """Provider 配置缺失或不安全，可直接转换为 CLI 参数错误。"""
+
+
+def validate_base_url(
+    value: str,
+    *,
+    source: str,
+    require_https_for_remote: bool = False,
+) -> str:
+    """校验 Provider HTTP(S) 端点，禁止把凭据嵌入 URL。"""
+
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ProviderConfigurationError(f"{source} 必须是完整的 http:// 或 https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ProviderConfigurationError(f"{source} 不能在 URL 中嵌入用户名或密码")
+    if parsed.query or parsed.fragment:
+        raise ProviderConfigurationError(f"{source} 不能包含查询参数或 URL 片段")
+    if require_https_for_remote and parsed.scheme == "http":
+        hostname = parsed.hostname
+        is_loopback = hostname == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise ProviderConfigurationError(
+                f"{source} 携带 API Key 时远程端点必须使用 https://；"
+                "http:// 仅允许 localhost、127.0.0.0/8 或 ::1"
+            )
+    return value.rstrip("/")
 
 
 class ProviderTimeoutError(TimeoutError):
@@ -20,6 +57,9 @@ class Provider(ABC):
     """
 
     name: str = "abstract"
+    # 命名 Profile 实例会设置这个安全标识；永远不在 Provider
+    # 对象上暴露 Profile 解析出的 API Key。
+    profile_id: str | None = None
 
     @abstractmethod
     def chat(

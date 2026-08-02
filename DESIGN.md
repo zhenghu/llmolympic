@@ -13,6 +13,42 @@
 | **Judge**（裁判） | 规则判分内嵌在各 Game 的 `score()`；`LLMJudgePanel` 接口预留给创意类 |
 | **Rating**（评分） | 标准 ELO（K=32），分项目 + 总榜，SQLite 持久化 |
 
+### 1.1 选手身份与 Provider Profile
+
+- `name` 是 Game、事件和比分映射沿用的对局内键；`display_name` 是展示名快照，
+  新档案要求二者一致；是否为同一竞技身份只由 `entrant_id` 决定。
+- `entrant_id` 是跨对局稳定的选手主键，ELO、榜单和评分历史都按它关联；同一
+  对局中 `name` 与 `entrant_id` 均须唯一，避免同一身份以两个名字与自己比赛。
+- 命名 Provider Profile 使用 `profile:<id>[:model]`；省略模型时读取 Profile 的
+  `default_model`，稳定身份为 `profile:<id>:<model>`。Profile 只保存 provider、
+  端点、模型、展示名和 API Key 环境变量名，不把凭据值写入选手描述或档案。
+- 没有 Profile 或显式 `entrant_id` 的兼容 Provider 调用，会以 provider、模型、
+  展示名和安全采样参数生成确定性摘要；这种兼容身份重命名后会变化，需要跨名称
+  延续身份时应使用命名 Profile 或显式 ID。
+- SQLite 的 `entrants.identity_json` 保存身份元数据（当前为 `kind`、安全采样参数及
+  可用的 `profile_id`、`provider`、`model`）。第一次可信本地引擎观察会取代此前仅由
+  外部导入占用的同 ID 元数据与展示名；一旦出现可信观察，身份元数据即不可变，冲突
+  会拒绝整次事务。后续只有时间更新的可信本地对局可改展示名，导入档案不能改写它。
+
+### 1.2 档案来源、兼容迁移与计分信任边界
+
+- 新对局与双局赛分别使用 archive/series schema v2，并记录 `source`：引擎生成
+  为 `local_engine`，外部构造为 `external`；schema v1（包括历史上省略版本号的
+  JSON）读入时标为 `legacy`。
+- SQLite 使用 `PRAGMA user_version = 3`，以 `entrants`、`entrant_id` 和展示名快照
+  持久化对局、榜单及评分历史。v1/v2 数据库升级在单一事务内完成，失败时回滚且
+  不提升版本号。
+- 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
+  **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
+  Profile 身份隔离，不能根据旧显示名猜测为新的模型身份。
+- 迁移只补齐关系表、来源和身份索引，已有 `archive_json` / `series_json` 原样保留；
+  兼容字段只在读取时于内存中补齐。历史对局是否已计分由现有
+  `rating_history` 反推，不能重算或重复计分。
+- `SQLiteStore.save_match()` / `save_series()` 默认 `rating_source="imported"`，只
+  存档、不计 ELO。`rating_source="engine"` 仅供本进程完成对局后的可信调用路径，
+  双人对局才计分；它是调用方信任声明，不是认证、签名或对来源的密码学证明。
+  同一 match/series ID 也不能通过重新保存从 imported 升级为 engine。
+
 ## 2. 统一 Game 接口（核心设计）
 
 ```python
@@ -135,7 +171,7 @@ CLI（今天）          WebSocket（将来）
 2. **阶段二（进行中）**：ELO + SQLite 持久化 ✅；五子棋多轮状态机 ✅；
    LLM 超时、Provider 异常技术判负与失败档案 ✅；交换先手双局赛与公平批量
    ELO ✅；逻辑推理与结构化猜谜项目 ✅；标准国际象棋与换色双局赛 ✅；
-   后续增加循环赛。
+   稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；后续增加循环赛。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜；循环赛与锦标赛模式。
    之后新增项目继续保持纯插件接入。

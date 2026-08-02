@@ -15,6 +15,29 @@
 # base_url = "http://localhost:11434"       # 对应环境变量 OLLAMA_BASE_URL
 # default_model = "llama3.1"                # 选手写 ollama（不带模型名）时用它
 
+# 命名 Provider Profiles：同一场可使用多个 OpenAI 兼容端点。
+# Profile 只保存 Key 所在的环境变量名，绝不在此填写真实 Key。
+# CLI 写法：profile:<id> 使用 default_model；profile:<id>:<model> 覆盖模型。
+[profiles.kimi]
+provider = "openai"
+default_model = "moonshot-v1-128k"
+base_url = "https://api.moonshot.cn/v1"       # 携带 Key 的远程端点必须使用 HTTPS
+api_key_env = "KIMI_API_KEY"
+display_name = "Kimi"
+
+[profiles.deepseek]
+provider = "openai"
+default_model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+display_name = "DeepSeek"
+
+[profiles.local]
+provider = "ollama"
+default_model = "llama3.1:8b"
+base_url = "http://localhost:11434"
+display_name = "Local Llama"
+
 # SQLite 对局档案与 ELO（对应环境变量 LLMOLYMPIC_DB）
 [storage]
 # database = "~/.llmolympic/llmolympic.db"

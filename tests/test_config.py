@@ -14,6 +14,8 @@ def _clear_cache(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.delenv("LLMOLYMPIC_CONFIG", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("LLMOLYMPIC_DB", raising=False)
     monkeypatch.setattr(config, "_PROJECT_CONFIG", tmp_path / "project" / "config.toml")
     load_config_cache_clear()
@@ -139,3 +141,86 @@ def test_database_path_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path) -> 
     monkeypatch.setenv("LLMOLYMPIC_DB", str(environment))
     assert database_path() == environment.resolve()
     assert database_path(explicit) == explicit.resolve()
+
+
+def test_named_provider_profiles_are_strict_and_credential_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.kimi]
+provider = "openai"
+default_model = "moonshot-v1"
+base_url = "https://kimi.example/v1"
+api_key_env = "KIMI_API_KEY"
+display_name = "Kimi"
+
+[profiles.local]
+provider = "ollama"
+default_model = "llama3.1:8b"
+""",
+    )
+    monkeypatch.setenv("KIMI_API_KEY", "profile-secret-must-not-be-loaded")
+
+    profiles = config.load_profiles()
+
+    assert set(profiles) == {"kimi", "local"}
+    assert profiles["kimi"] == config.ProviderProfile(
+        profile_id="kimi",
+        provider="openai",
+        default_model="moonshot-v1",
+        base_url="https://kimi.example/v1",
+        api_key_env="KIMI_API_KEY",
+        display_name="Kimi",
+    )
+    assert "profile-secret" not in repr(profiles)
+    assert config.get_profile("local").default_model == "llama3.1:8b"
+
+
+@pytest.mark.parametrize(
+    ("profile_toml", "error"),
+    [
+        ('[profiles."bad:id"]\nprovider = "ollama"\n', "Profile ID"),
+        ('[profiles.bad]\nprovider = "unknown"\n', "provider"),
+        ('[profiles.bad]\nprovider = "openai"\n', "api_key_env"),
+        (
+            '[profiles.bad]\nprovider = "openai"\napi_key_env = "NOT-VALID!"\n',
+            "环境变量名",
+        ),
+        (
+            '[profiles.bad]\nprovider = "ollama"\napi_key_env = "UNUSED_KEY"\n',
+            "不应声明",
+        ),
+        (
+            '[profiles.bad]\nprovider = "openai"\napi_key_env = "KEY"\napi_key = "secret"\n',
+            "未知字段",
+        ),
+    ],
+)
+def test_invalid_provider_profile_is_rejected(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_toml: str,
+    error: str,
+) -> None:
+    _use_config(monkeypatch, tmp_path, profile_toml)
+
+    with pytest.raises(ValueError, match=error):
+        config.load_profiles()
+
+
+def test_unknown_profile_error_lists_safe_available_ids(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        '[profiles.local]\nprovider = "ollama"\ndefault_model = "model"\n',
+    )
+
+    with pytest.raises(ValueError, match="local") as raised:
+        config.get_profile("missing")
+
+    assert "model" not in str(raised.value)

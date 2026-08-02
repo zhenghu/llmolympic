@@ -31,6 +31,28 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 [ollama]
 # base_url = "http://localhost:11434"
 
+# 命名 Profile 可让多个 OpenAI 兼容端点同场对战。
+# 只填环境变量名，不要把 Key 写到 Profile 中。
+[profiles.kimi]
+provider = "openai"
+default_model = "moonshot-v1-128k"
+base_url = "https://api.moonshot.cn/v1"
+api_key_env = "KIMI_API_KEY"
+display_name = "Kimi"
+
+[profiles.deepseek]
+provider = "openai"
+default_model = "deepseek-chat"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+display_name = "DeepSeek"
+
+[profiles.local]
+provider = "ollama"
+default_model = "llama3.1:8b"
+base_url = "http://localhost:11434"
+display_name = "Local Llama"
+
 [storage]
 # database = "~/.llmolympic/llmolympic.db"
 
@@ -54,6 +76,29 @@ chmod 600 config.toml
 # 使用显式配置路径时：chmod 600 "$LLMOLYMPIC_CONFIG"
 ```
 
+Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
+目前支持 `openai` 和 `ollama`。OpenAI 兼容 Profile 必须声明
+`api_key_env`，程序只在创建该 Provider 时读取对应环境变量；
+不会隐式复用另一个端点的 Key，也不会继承全局 OpenAI SDK 的组织、项目或
+自定义请求头，更不会把 Key 写入对局档案。
+所有携带 API Key 的远程 OpenAI 兼容端点都必须使用 HTTPS；明文 HTTP
+只允许 `localhost`、`127.0.0.0/8` 或 `::1` 回环地址。
+
+```bash
+export KIMI_API_KEY="..."
+export DEEPSEEK_API_KEY="..."
+
+# 使用各 Profile 的 default_model
+llmolympic play --game math_quiz --players profile:kimi,profile:deepseek --seed 42
+
+# 只覆盖某个 Profile 的模型（模型名中可继续包含冒号）
+llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
+```
+
+命名 Profile 选手的稳定身份为 `profile:<id>:<model>`；`display_name`
+作为对局内 `name` 和界面展示使用，但不参与身份或 ELO 关联。更改显示名不会
+创建新的 ELO 身份，更换 Profile ID 或模型则会。
+同场出现重复展示名时，CLI 会附加 Profile 和模型进行消歧。
 
 ## 运行
 
@@ -69,6 +114,9 @@ llmolympic play --game knowledge_quiz --players human:我,openai:gpt-4o-mini
 
 # 两个模型对战（同 seed 同题，公平对比）
 llmolympic play --game math_quiz --players openai:gpt-4o-mini,ollama:llama3.1 --seed 42
+
+# 两个命名兼容端点对战（推荐）
+llmolympic play --game math_quiz --players profile:kimi,profile:deepseek --seed 42
 
 # 动态逻辑推理：排序约束与三位密码题都会先由程序穷举确认唯一解
 llmolympic play --game reasoning_quiz --players mock:random,mock:fixed --rounds 5 --seed 42
@@ -162,6 +210,9 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO；
 `series` 则把两局和批量 ELO 作为一个原子事务保存。
+直接使用 Python 存储 API 时，`SQLiteStore.save_match()` / `save_series()` 默认按
+外部导入处理，只存档、不计分；只有本地比赛引擎应显式传入
+`rating_source="engine"`，该参数是本进程内的信任声明，并非来源认证或数字签名。
 `history` 会标出系列赛 ID 与局号；`archive` 既可读取单局 ID，也可用系列赛 ID
 读取包含两局的完整档案。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
@@ -181,7 +232,9 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 
 ELO 目前适用于双人对局：比较双方最终比分后按胜 / 平 / 负更新。单人或多人
 对局仍会完整存档，但不会计入 ELO。正确率差距不改变单场 ELO 调整幅度；
-榜单身份目前使用档案中的选手名称。
+榜单使用档案中的稳定 `entrant_id`，显示名只是对局时快照。
+旧的 `openai:model` / `ollama:model` / `mock:strategy` 语法仍会生成确定性身份；
+新建多端点比赛建议使用命名 Profile。
 
 ## 测试
 

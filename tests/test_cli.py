@@ -7,6 +7,8 @@ import os
 import sqlite3
 
 import pytest
+import typer
+from rich.text import Text
 from typer.testing import CliRunner
 
 from llmolympic import config
@@ -17,6 +19,15 @@ from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
 
 runner = CliRunner()
+
+
+def _configure_profiles(monkeypatch, tmp_path, content: str) -> None:
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(content, encoding="utf-8")
+    if os.name == "posix":
+        config_path.chmod(0o600)
+    monkeypatch.setenv("LLMOLYMPIC_CONFIG", str(config_path))
+    config.load_config.cache_clear()
 
 
 class _FailingProvider(Provider):
@@ -432,7 +443,7 @@ def test_llm_timeout_environment_default_is_recorded(tmp_path, monkeypatch) -> N
 def test_llm_timeout_config_default_is_recorded(tmp_path, monkeypatch) -> None:
     path = tmp_path / "config-timeout.db"
     config_path = tmp_path / "config.toml"
-    config_path.write_text('[match]\nllm_timeout_seconds = 0.6\n', encoding="utf-8")
+    config_path.write_text("[match]\nllm_timeout_seconds = 0.6\n", encoding="utf-8")
     if os.name == "posix":
         config_path.chmod(0o600)
     monkeypatch.setenv("LLMOLYMPIC_CONFIG", str(config_path))
@@ -484,6 +495,302 @@ def test_explicit_llm_timeout_overrides_environment(tmp_path, monkeypatch) -> No
     archive = store.get_match(store.list_matches()[0].match_id)
     assert archive is not None
     assert all(player["move_timeout_seconds"] == 0.2 for player in archive.players)
+
+
+def test_named_profiles_support_two_compatible_endpoints_and_stable_entrant_ids(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "profiles.db"
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.kimi]
+provider = "openai"
+default_model = "moonshot-v1"
+base_url = "https://kimi.example/v1"
+api_key_env = "KIMI_TEST_KEY"
+display_name = "Kimi"
+
+[profiles.deepseek]
+provider = "openai"
+default_model = "deepseek-chat"
+base_url = "https://deepseek.example/v1"
+api_key_env = "DEEPSEEK_TEST_KEY"
+display_name = "DeepSeek"
+""",
+    )
+    profiles_seen: list[config.ProviderProfile] = []
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        profiles_seen.append(profile)
+        strategy = "fixed" if profile.profile_id == "kimi" else "random"
+        provider = MockProvider(strategy=strategy)
+        provider.profile_id = profile.profile_id
+        return provider
+
+    monkeypatch.setattr("llmolympic.cli.main.create_profile_provider", create_test_profile_provider)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "play",
+                "--players",
+                "profile:kimi,profile:deepseek:deepseek-reasoner",
+                "--rounds",
+                "1",
+                "--db",
+                str(path),
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert [profile.base_url for profile in profiles_seen] == [
+            "https://kimi.example/v1",
+            "https://deepseek.example/v1",
+        ]
+        store = SQLiteStore(path)
+        archive = store.get_match(store.list_matches()[0].match_id)
+        assert archive is not None
+        assert [player["name"] for player in archive.players] == ["Kimi", "DeepSeek"]
+        assert [player["entrant_id"] for player in archive.players] == [
+            "profile:kimi:moonshot-v1",
+            "profile:deepseek:deepseek-reasoner",
+        ]
+        assert "KIMI_TEST_KEY" not in archive.to_json()
+        assert "DEEPSEEK_TEST_KEY" not in archive.to_json()
+    finally:
+        config.load_config.cache_clear()
+
+
+def test_profile_model_override_preserves_additional_colons(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.local]
+provider = "ollama"
+default_model = "fallback"
+""",
+    )
+    models: list[str] = []
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        provider = MockProvider(strategy="fixed")
+        provider.profile_id = profile.profile_id
+        return provider
+
+    monkeypatch.setattr("llmolympic.cli.main.create_profile_provider", create_test_profile_provider)
+    monkeypatch.setattr(
+        "llmolympic.cli.main.create_provider",
+        lambda kind, model="": MockProvider(strategy="random"),
+    )
+    from llmolympic.cli.main import _parse_players
+
+    try:
+        players = _parse_players(
+            "profile:local:llama3.1:8b,mock:random",
+            human_timeout=60.0,
+            llm_timeout=1.0,
+        )
+        models.extend(player.model for player in players if hasattr(player, "model"))
+    finally:
+        config.load_config.cache_clear()
+
+    assert models == ["llama3.1:8b", "random"]
+    assert players[0].entrant_id == "profile:local:llama3.1:8b"
+
+
+def test_profile_models_with_the_same_display_name_are_disambiguated(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.shared]
+provider = "ollama"
+default_model = "model-a"
+display_name = "Same"
+""",
+    )
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        provider = MockProvider(strategy="fixed")
+        provider.profile_id = profile.profile_id
+        return provider
+
+    monkeypatch.setattr("llmolympic.cli.main.create_profile_provider", create_test_profile_provider)
+    from llmolympic.cli.main import _parse_players
+
+    try:
+        players = _parse_players(
+            "profile:shared:model-a,profile:shared:model-b",
+            human_timeout=60.0,
+            llm_timeout=1.0,
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    assert [player.name for player in players] == [
+        "Same [shared:model-a]",
+        "Same [shared:model-b]",
+    ]
+    assert len({player.entrant_id for player in players}) == 2
+
+
+def test_profile_disambiguation_avoids_an_existing_player_name(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.shared]
+provider = "ollama"
+default_model = "model-a"
+display_name = "Same"
+""",
+    )
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        provider = MockProvider(strategy="fixed")
+        provider.profile_id = profile.profile_id
+        return provider
+
+    monkeypatch.setattr("llmolympic.cli.main.create_profile_provider", create_test_profile_provider)
+    from llmolympic.cli.main import _parse_players
+
+    try:
+        players = _parse_players(
+            "profile:shared:model-a,profile:shared:model-b,human:Same [shared:model-a]",
+            human_timeout=60.0,
+            llm_timeout=1.0,
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    assert [player.name for player in players] == [
+        "Same [shared:model-a] #2",
+        "Same [shared:model-b]",
+        "Same [shared:model-a]",
+    ]
+    assert len({player.name for player in players}) == 3
+
+
+def test_profile_rejects_the_same_stable_entrant_twice(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        '[profiles.local]\nprovider = "ollama"\ndefault_model = "model"\n',
+    )
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        provider = MockProvider(strategy="fixed")
+        provider.profile_id = profile.profile_id
+        return provider
+
+    monkeypatch.setattr("llmolympic.cli.main.create_profile_provider", create_test_profile_provider)
+    from llmolympic.cli.main import _parse_players
+
+    try:
+        with pytest.raises(typer.BadParameter, match="稳定身份必须唯一"):
+            _parse_players(
+                "profile:local,profile:local",
+                human_timeout=60.0,
+                llm_timeout=1.0,
+            )
+    finally:
+        config.load_config.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("players", "error"),
+    [
+        ("profile:missing,mock:fixed", "未找到 Provider Profile"),
+        ("profile:,mock:fixed", "profile:<id>"),
+        ("profile:local:,mock:fixed", "模型名不能为空"),
+    ],
+)
+def test_invalid_profile_player_is_reported_before_database_creation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    players: str,
+    error: str,
+) -> None:
+    path = tmp_path / "invalid-profile.db"
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        '[profiles.local]\nprovider = "ollama"\ndefault_model = "model"\n',
+    )
+    try:
+        result = runner.invoke(app, ["play", "--players", players, "--db", str(path)])
+    finally:
+        config.load_config.cache_clear()
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 2
+    assert error in output
+    assert "Traceback" not in output
+    assert not path.exists()
+
+
+def test_profile_missing_key_environment_is_a_clean_cli_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "missing-profile-key.db"
+    monkeypatch.delenv("MISSING_PROFILE_KEY", raising=False)
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.remote]
+provider = "openai"
+default_model = "model"
+base_url = "https://remote.example/v1"
+api_key_env = "MISSING_PROFILE_KEY"
+""",
+    )
+    try:
+        result = runner.invoke(
+            app,
+            ["play", "--players", "profile:remote,mock:fixed", "--db", str(path)],
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    assert result.exit_code == 2
+    assert "MISSING_PROFILE_KEY" in result.output
+    assert "Traceback" not in result.output
+    assert not path.exists()
+
+
+def test_malformed_profile_table_is_a_clean_cli_error(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "malformed-profile.db"
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        '[profiles]\nbroken = "not-a-table"\n',
+    )
+    try:
+        result = runner.invoke(
+            app,
+            ["play", "--players", "profile:broken,mock:fixed", "--db", str(path)],
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    assert result.exit_code == 2
+    assert "必须是 TOML 表" in result.output
+    assert "Traceback" not in result.output
+    assert not path.exists()
 
 
 def test_no_llm_timeout_keeps_legacy_sync_provider_usable(

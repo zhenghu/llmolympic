@@ -6,10 +6,16 @@ import asyncio
 
 import pytest
 
+from llmolympic.core.archive import legacy_entrant_id
 from llmolympic.core.events import EventType
 from llmolympic.core.match import play_match
 from llmolympic.core.player import Player, PlayerProviderError
-from llmolympic.core.series import head_to_head_point, play_two_leg_series, series_from_legs
+from llmolympic.core.series import (
+    SeriesArchive,
+    head_to_head_point,
+    play_two_leg_series,
+    series_from_legs,
+)
 from llmolympic.games import create_game
 
 
@@ -268,3 +274,78 @@ def test_series_event_callback_receives_prompt_before_player_move() -> None:
 
     assert prompts_seen == 4
     assert moves_started == 4
+
+
+def test_series_archive_rejects_unknown_top_level_field() -> None:
+    series = asyncio.run(
+        play_two_leg_series(
+            create_game("knowledge_quiz", rounds=1),
+            [_SequencePlayer("甲", ["A", "A"]), _SequencePlayer("乙", ["A", "A"])],
+        )
+    )
+    payload = series.model_dump(mode="python")
+    payload["unexpected"] = True
+
+    with pytest.raises(ValueError, match="unexpected"):
+        SeriesArchive.model_validate(payload)
+
+
+def test_series_missing_schema_version_uses_legacy_compatibility() -> None:
+    series = asyncio.run(
+        play_two_leg_series(
+            create_game("knowledge_quiz", rounds=1),
+            [_SequencePlayer("甲", ["A", "A"]), _SequencePlayer("乙", ["A", "A"])],
+        )
+    )
+    payload = series.model_dump(mode="python")
+    payload.pop("schema_version")
+    payload.pop("source")
+    for descriptor in payload["players"]:
+        descriptor.pop("entrant_id")
+        descriptor.pop("display_name")
+    for leg in payload["legs"]:
+        leg.pop("schema_version")
+        leg.pop("source")
+        for descriptor in leg["players"]:
+            descriptor.pop("entrant_id")
+            descriptor.pop("display_name")
+        for descriptor in leg["events"][0]["data"]["players"]:
+            descriptor.pop("entrant_id")
+            descriptor.pop("display_name")
+
+    loaded = SeriesArchive.model_validate(payload)
+
+    assert loaded.schema_version == 1
+    assert loaded.source == "legacy"
+    assert [descriptor["entrant_id"] for descriptor in loaded.players] == [
+        legacy_entrant_id("甲"),
+        legacy_entrant_id("乙"),
+    ]
+    assert all(leg.schema_version == 1 and leg.source == "legacy" for leg in loaded.legs)
+
+
+def test_schema_v1_series_rejects_an_explicit_nonlegacy_source() -> None:
+    series = asyncio.run(
+        play_two_leg_series(
+            create_game("knowledge_quiz", rounds=1),
+            [_SequencePlayer("甲", ["A", "A"]), _SequencePlayer("乙", ["A", "A"])],
+        )
+    )
+    payload = series.model_dump(mode="python")
+    payload["schema_version"] = 1
+    payload["source"] = "external"
+    for descriptor in payload["players"]:
+        descriptor.pop("entrant_id")
+        descriptor.pop("display_name")
+    for leg in payload["legs"]:
+        leg["schema_version"] = 1
+        leg.pop("source")
+        for descriptor in leg["players"]:
+            descriptor.pop("entrant_id")
+            descriptor.pop("display_name")
+        for descriptor in leg["events"][0]["data"]["players"]:
+            descriptor.pop("entrant_id")
+            descriptor.pop("display_name")
+
+    with pytest.raises(ValueError, match="schema v1 .*legacy"):
+        SeriesArchive.model_validate(payload)
