@@ -15,13 +15,13 @@ pip install -e ".[dev]"
 
 ## 配置模型
 
-复制模板生成自己的配置（`config.toml` 含密钥，已被 git 忽略）：
+在源码项目根目录复制模板生成自己的配置（`config.toml` 含密钥，已被 git 忽略）：
 
 ```bash
 cp config.example.toml config.toml
 ```
 
-编辑项目根目录的 `config.toml`，启动时自动加载：
+编辑这个固定的项目配置，启动时会自动加载：
 
 ```toml
 [openai]
@@ -38,7 +38,21 @@ api_key = "sk-..."                        # 对应环境变量 OPENAI_API_KEY
 # llm_timeout_seconds = 120.0 # 对应环境变量 LLMOLYMPIC_LLM_TIMEOUT
 ```
 
-取值优先级：环境变量 > `config.toml` > 默认值。
+也可以显式指定其他位置的配置文件，适合在项目目录外运行已安装的命令：
+
+```bash
+export LLMOLYMPIC_CONFIG="$HOME/.config/llmolympic/config.toml"
+```
+
+查找顺序为：`LLMOLYMPIC_CONFIG` 指定的文件 > 源码项目根目录的
+`config.toml`。程序不会扫描任意当前工作目录中的 `config.toml`，避免环境中的
+API Key 被意外发送到不可信配置指定的兼容端点。配置项取值优先级仍为：
+环境变量 > 选中的配置文件 > 默认值。含密钥的配置文件建议设置为仅本人可读：
+
+```bash
+chmod 600 config.toml
+# 使用显式配置路径时：chmod 600 "$LLMOLYMPIC_CONFIG"
+```
 
 
 ## 运行
@@ -136,6 +150,16 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 但该选项只禁用比赛层截止时间，Provider 自身的网络超时仍可能生效；同时程序
 无法强制终止卡住的同步请求，建议尽快实现原生异步 `achat()`。
 
+为限制失控模型或极端参数对终端、内存和数据库的影响，平台统一限制：单场最多
+16 名选手，题目型项目最多 100 轮，单回合最多重试 10 次，单次模型/选手输出
+最多 4096 字符，历史与榜单查询最多返回 1000 条。逻辑推理和猜谜仍受各自更小的
+题库上限约束。超长或非文本输出会安全判技术负，原始内容不会写入档案；终端显示
+还会过滤控制字符和双向文本控制符。`archive` 命令的终端输出最多显示 100000
+字符，但 SQLite 中的合法档案不受这个显示上限影响。
+内置 OpenAI 和 Ollama Provider 默认分别请求最多 1024 个输出 Token；恶意兼容
+端点仍可能忽略请求限制，且 4096 字符检查发生在响应接收后，因此生产部署仍应
+在 Provider 账户和网关侧设置费用、响应体及整场调用预算。
+
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO；
 `series` 则把两局和批量 ELO 作为一个原子事务保存。
 `history` 会标出系列赛 ID 与局号；`archive` 既可读取单局 ID，也可用系列赛 ID
@@ -143,6 +167,9 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
 `~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
 或各命令的 `--db` 覆盖。
+在 POSIX 系统上，新建的数据目录默认为 `0700`，数据库及 SQLite sidecar 文件为
+`0600`；打开已有数据库时也会收紧文件权限。档案只记录温度、top-p、Token 上限等
+安全白名单采样参数，未知参数统一脱敏。漏洞报告方式见 [SECURITY.md](SECURITY.md)。
 推理与猜谜档案记录 seed、题面、走法以及生成器/题库版本，但不额外复制内部
 标准答案；独立复核需要用对应版本代码按 seed 重放生成器。
 

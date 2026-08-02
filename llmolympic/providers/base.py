@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 
+DEFAULT_MAX_OUTPUT_TOKENS = 1024
+
 
 class ProviderTimeoutError(TimeoutError):
     """Provider 的原生异步请求超过调用方给定的截止时间。"""

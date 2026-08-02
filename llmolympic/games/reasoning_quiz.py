@@ -210,7 +210,7 @@ class ReasoningQuiz:
         }
 
     def new_state(self, players: list[str], seed: int) -> ReasoningQuizState:
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311 - 公平复现用种子，不用于安全令牌
         questions: list[dict] = []
         seen_solutions: set[tuple[str, tuple[str, ...] | str]] = set()
         attempts = 0

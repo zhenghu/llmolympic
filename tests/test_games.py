@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError, validate_players
+from llmolympic.core.game import (
+    FORFEIT_MOVE,
+    MAX_PLATFORM_PLAYERS,
+    IllegalMoveError,
+    validate_players,
+)
 from llmolympic.games import GAME_REGISTRY, create_game, list_games
 from llmolympic.games.chess import Chess
 from llmolympic.games.gomoku import Gomoku
@@ -139,3 +144,31 @@ def test_legacy_game_without_player_metadata_remains_compatible() -> None:
 def test_create_game_rejects_zero_rounds(game: str) -> None:
     with pytest.raises(ValueError, match="至少为 1"):
         create_game(game, rounds=0)
+
+
+@pytest.mark.parametrize("game", ["math_quiz", "knowledge_quiz"])
+def test_unbounded_quiz_rounds_are_rejected(game: str) -> None:
+    with pytest.raises(ValueError, match="rounds 最多为 100"):
+        create_game(game, rounds=101)
+
+
+def test_platform_rejects_unbounded_player_count() -> None:
+    game = MathQuiz(rounds=1)
+    players = [f"player-{index}" for index in range(MAX_PLATFORM_PLAYERS + 1)]
+
+    with pytest.raises(ValueError, match=f"最多支持 {MAX_PLATFORM_PLAYERS}"):
+        validate_players(game, players)
+
+
+@pytest.mark.parametrize(
+    "name, message",
+    [
+        ("", "非空字符串"),
+        ("a" * 129, "最多允许 128"),
+        ("player\x1b[2J", "控制字符"),
+        ("safe\u202eevil", "双向文本控制符"),
+    ],
+)
+def test_unsafe_player_names_are_rejected(name: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_players(MathQuiz(rounds=1), [name])

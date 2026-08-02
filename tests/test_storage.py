@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -139,6 +141,95 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_new_database_directory_and_file_use_private_permissions(tmp_path) -> None:
+    path = tmp_path / "private-state" / "olympics.db"
+
+    SQLiteStore(path)
+
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_existing_database_permissions_are_tightened_on_open(tmp_path) -> None:
+    path = tmp_path / "existing.db"
+    SQLiteStore(path)
+    path.chmod(0o644)
+
+    SQLiteStore(path, create=False)
+
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_database_path_must_be_a_regular_file(tmp_path) -> None:
+    path = tmp_path / "not-a-database.db"
+    path.mkdir()
+
+    with pytest.raises(StorageError, match="不是普通文件"):
+        SQLiteStore(path)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_database_open_fails_closed_when_permissions_cannot_be_tightened(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "permission-denied.db"
+    SQLiteStore(path)
+    original_chmod = Path.chmod
+
+    def deny_database_chmod(candidate: Path, mode: int) -> None:
+        if candidate == path:
+            raise PermissionError("injected chmod failure")
+        original_chmod(candidate, mode)
+
+    monkeypatch.setattr(Path, "chmod", deny_database_chmod)
+
+    with pytest.raises(StorageError, match="权限收紧为 0600"):
+        SQLiteStore(path, create=False)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_sqlite_wal_sidecars_inherit_private_permissions(tmp_path) -> None:
+    path = tmp_path / "wal.db"
+    store = SQLiteStore(path)
+    connection = store._connect()
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE permission_probe (id INTEGER)")
+
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{path}{suffix}")
+            assert sidecar.is_file()
+            assert sidecar.stat().st_mode & 0o777 == 0o600
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are not portable")
+def test_existing_default_database_directory_is_tightened(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    default_directory = tmp_path / ".llmolympic"
+    default_directory.mkdir(mode=0o755)
+    default_directory.chmod(0o755)
+    path = default_directory / "llmolympic.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 2")
+        SQLiteStore._create_base_schema(connection)
+        SQLiteStore._create_series_schema(connection)
+    path.chmod(0o644)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr("llmolympic.core.storage.cfg_get", lambda *args, **kwargs: None)
+
+    SQLiteStore(create=False)
+
+    assert default_directory.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_series_is_atomic_and_split_result_has_no_elo_order_drift(tmp_path) -> None:
@@ -521,6 +612,22 @@ def test_match_history_filter_and_order(tmp_path) -> None:
 
     assert [row.match_id for row in store.list_matches()] == ["second", "first"]
     assert [row.match_id for row in store.list_matches(game="math_quiz")] == ["first"]
+
+
+@pytest.mark.parametrize("limit", [0, 1001, True, 1.5])
+def test_match_history_limit_is_bounded(limit: object, tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "history-limit.db")
+
+    with pytest.raises(ValueError, match="1 到 1000"):
+        store.list_matches(limit=limit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("limit", [0, 1001, True, 1.5])
+def test_leaderboard_limit_is_bounded(limit: object, tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "leaderboard-limit.db")
+
+    with pytest.raises(ValueError, match="1 到 1000"):
+        store.leaderboard(limit=limit)  # type: ignore[arg-type]
 
 
 def test_concurrent_writers_do_not_lose_rating_updates(tmp_path) -> None:

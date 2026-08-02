@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from llmolympic.core.events import EventType
-from llmolympic.core.match import play_match
+from llmolympic.core.match import MAX_MOVE_CHARS, Match, play_match
 from llmolympic.core.player import (
     LLMPlayer,
     Player,
@@ -131,17 +133,43 @@ def test_retry_prompt_includes_rejected_move_and_reason() -> None:
     assert archive.moves[-1].prompt == player.prompts[1]
 
 
-def test_retry_feedback_truncates_a_very_long_rejected_output() -> None:
-    long_move = "Z" * 5000
-    player = _SequencePlayer("scripted", [long_move, "A"])
+def test_overlong_output_is_not_archived_and_causes_technical_loss() -> None:
+    long_move = "Z" * (MAX_MOVE_CHARS + 1)
+    player = _SequencePlayer("scripted", [long_move])
+    other = _SequencePlayer("other", ["A"])
 
     archive = asyncio.run(
-        play_match(create_game("knowledge_quiz", rounds=1), [player], max_attempts=2)
+        play_match(create_game("knowledge_quiz", rounds=1), [player, other], max_attempts=2)
     )
 
-    assert archive.moves[0].move == long_move
-    assert len(player.prompts[1]) < 1000
-    assert "Z" * 500 not in player.prompts[1]
+    assert archive.scores == {"scripted": 0.0, "other": 1.0}
+    assert long_move not in archive.to_json()
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.data["reason_code"] == "response_limit"
+    assert rejected.data["failure_details"] == {
+        "limit_chars": MAX_MOVE_CHARS,
+        "actual_chars": MAX_MOVE_CHARS + 1,
+    }
+
+
+def test_non_string_output_is_not_archived_and_causes_technical_loss() -> None:
+    player = _SequencePlayer("scripted", ["unused"])
+    player.moves = iter([object()])
+    other = _SequencePlayer("other", ["A"])
+
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=1), [player, other])
+    )
+
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.data["reason_code"] == "response_limit"
+    assert rejected.data["failure_details"] == {"response_type": "object"}
+    assert archive.scores == {"scripted": 0.0, "other": 1.0}
+
+
+def test_match_rejects_excessive_retry_budget() -> None:
+    with pytest.raises(ValueError, match="max_attempts 最多为 10"):
+        Match(create_game("knowledge_quiz"), [_llm("one", "fixed")], max_attempts=11)
 
 
 def test_scripted_gomoku_match_completes_with_nine_archived_moves() -> None:
@@ -271,10 +299,6 @@ def test_quiz_player_timeout_keeps_existing_per_turn_forfeit_semantics() -> None
 
 
 def test_duplicate_player_names_rejected() -> None:
-    import pytest
-
-    from llmolympic.core.match import Match
-
     players = [_llm("same", "fixed"), _llm("same", "random")]
     with pytest.raises(ValueError, match="唯一"):
         Match(create_game("math_quiz"), players)

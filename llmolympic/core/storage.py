@@ -12,6 +12,7 @@ import json
 import math
 import os
 import sqlite3
+import warnings
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,10 @@ from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, head_to
 SCHEMA_VERSION = 2
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
+MAX_QUERY_LIMIT = 1000
+_PRIVATE_DIRECTORY_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+_SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 
 _REQUIRED_COLUMNS = {
     "matches": {
@@ -172,19 +177,73 @@ def _canonical_json(value: object) -> str:
         raise StorageError(f"对局档案包含无法序列化的 JSON 数据：{exc}") from exc
 
 
+def _set_private_mode(path: Path, mode: int, *, required: bool = False) -> None:
+    """Tighten POSIX permissions, failing closed for required database artifacts."""
+
+    if os.name != "posix" or not path.exists():
+        return
+    try:
+        path.chmod(mode)
+    except OSError as exc:
+        message = f"无法把 {path} 的权限收紧为 {mode:04o}"
+        if required:
+            raise StorageError(message) from exc
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+
+def _validate_query_limit(limit: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_QUERY_LIMIT:
+        raise ValueError(f"limit 必须是 1 到 {MAX_QUERY_LIMIT} 之间的整数")
+
+
 class SQLiteStore:
     """Persistent match archive and ELO repository backed by SQLite."""
 
     def __init__(self, path: str | Path | None = None, *, create: bool = True) -> None:
         self.path = database_path(path)
+        parent_created = False
         if create:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            parent_created = not self.path.parent.exists()
+            self.path.parent.mkdir(
+                mode=_PRIVATE_DIRECTORY_MODE,
+                parents=True,
+                exist_ok=True,
+            )
+            self._create_database_file()
+            if not self.path.is_file():
+                raise StorageError(f"数据库路径不是普通文件：{self.path}")
         elif not self.path.is_file():
             raise StorageError(f"数据库不存在：{self.path}")
+        default_directory = (Path.home() / ".llmolympic").resolve()
+        if parent_created or self.path.parent == default_directory:
+            _set_private_mode(self.path.parent, _PRIVATE_DIRECTORY_MODE, required=True)
+        self._secure_database_artifacts()
         self._initialize(create=create)
+        self._secure_database_artifacts()
+
+    def _create_database_file(self) -> None:
+        """Pre-create a new database without a world-readable umask window."""
+
+        try:
+            descriptor = os.open(
+                self.path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                _PRIVATE_FILE_MODE,
+            )
+        except FileExistsError:
+            return
+        else:
+            os.close(descriptor)
+
+    def _secure_database_artifacts(self) -> None:
+        _set_private_mode(self.path, _PRIVATE_FILE_MODE, required=True)
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            _set_private_mode(Path(f"{self.path}{suffix}"), _PRIVATE_FILE_MODE)
 
     def _connect(self) -> sqlite3.Connection:
+        self._secure_database_artifacts()
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        self._secure_database_artifacts()
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -635,13 +694,12 @@ class SQLiteStore:
                 raise StorageError(
                     f"数据库中 series_id {series.series_id!r} 的对局档案已损坏"
                 )
-        placeholders = ", ".join("?" for _ in expected_ids)
         history_rows = connection.execute(
-            f"""
+            """
             SELECT match_id, rating_scope, game, player, opponent, outcome,
                    rating_before, rating_after, created_at
             FROM rating_history
-            WHERE match_id IN ({placeholders})
+            WHERE match_id IN (?, ?)
             """,
             expected_ids,
         ).fetchall()
@@ -1054,8 +1112,7 @@ class SQLiteStore:
     def list_matches(self, *, limit: int = 20, game: str | None = None) -> list[MatchSummary]:
         """Return recent persisted matches, newest first."""
 
-        if limit < 1:
-            raise ValueError("limit 必须至少为 1")
+        _validate_query_limit(limit)
         sql = """
             SELECT m.match_id, m.game, m.seed, m.players_json, m.scores_json,
                    m.started_at, m.finished_at, sm.series_id, sm.leg_number
@@ -1088,8 +1145,7 @@ class SQLiteStore:
     def leaderboard(self, *, game: str | None = None, limit: int = 50) -> list[RatingEntry]:
         """Return the overall leaderboard or the leaderboard for one game."""
 
-        if limit < 1:
-            raise ValueError("limit 必须至少为 1")
+        _validate_query_limit(limit)
         rating_scope = "overall" if game is None else "game"
         game_key = "" if game is None else game
         with closing(self._connect()) as connection:

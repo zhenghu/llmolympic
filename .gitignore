@@ -1,6 +1,10 @@
 # 密钥与本地配置（绝不提交）
 config.toml
+config.toml.*
+config.local.toml
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/

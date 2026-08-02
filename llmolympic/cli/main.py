@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -12,7 +13,14 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
+from llmolympic.cli.terminal import (
+    ARCHIVE_DISPLAY_LIMIT,
+    NAME_DISPLAY_LIMIT,
+    PROMPT_DISPLAY_LIMIT,
+    literal_text,
+)
 from llmolympic.config import get as cfg_get
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
@@ -40,6 +48,42 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+
+def _render_warning() -> None:
+    """尽力报告 UI 故障；报告本身失败也不能影响比赛或存档。"""
+
+    try:
+        console.print(Text("⚠ 终端显示失败；比赛将继续并优先保存档案。", style="yellow"))
+    except Exception:  # noqa: BLE001 - UI failures must never abort persistence
+        return
+
+
+def _best_effort_render(render: Callable[..., None], *args: object) -> None:
+    """执行非关键渲染，确保显示异常不会改变比赛与持久化语义。"""
+
+    try:
+        render(*args)
+    except Exception:  # noqa: BLE001 - rendering is intentionally non-critical
+        _render_warning()
+
+
+def _guard_renderer(render: Callable[..., None]) -> Callable[..., None]:
+    """把事件回调变成只失败一次的非关键渲染器。"""
+
+    disabled = False
+
+    def guarded(*args: object) -> None:
+        nonlocal disabled
+        if disabled:
+            return
+        try:
+            render(*args)
+        except Exception:  # noqa: BLE001 - event callbacks cannot own match control flow
+            disabled = True
+            _render_warning()
+
+    return guarded
 
 
 def _split_player_specs(spec: str) -> list[str]:
@@ -133,25 +177,52 @@ def _parse_players(
 
 def _render(ev: MatchEvent) -> None:
     if ev.type == EventType.MATCH_STARTED:
-        names = " vs ".join(p["name"] for p in ev.data["players"])
+        body = Text("项目 ")
+        body.append(literal_text(ev.data["game"], style="bold", max_chars=NAME_DISPLAY_LIMIT))
+        body.append(" · seed=")
+        body.append(literal_text(ev.data["seed"], max_chars=NAME_DISPLAY_LIMIT))
+        body.append("\n选手：")
+        for index, player in enumerate(ev.data["players"]):
+            if index:
+                body.append(" vs ")
+            body.append(literal_text(player["name"], max_chars=NAME_DISPLAY_LIMIT))
+        console.print(Panel(body, title=Text("对局开始")))
+    elif ev.type == EventType.TURN_PROMPT:
+        title = literal_text(ev.player or "", style="cyan", max_chars=NAME_DISPLAY_LIMIT)
+        title.append(" 的题面")
         console.print(
             Panel(
-                f"项目 [bold]{ev.data['game']}[/] · seed={ev.data['seed']}\n选手：{names}",
-                title="对局开始",
+                literal_text(
+                    ev.data["prompt"],
+                    max_chars=PROMPT_DISPLAY_LIMIT,
+                    multiline=True,
+                ),
+                title=title,
             )
         )
-    elif ev.type == EventType.TURN_PROMPT:
-        console.print(Panel(ev.data["prompt"], title=f"[cyan]{ev.player}[/] 的题面"))
     elif ev.type == EventType.MOVE_RECEIVED:
-        console.print(f"  [green]✓[/] {ev.player}: {ev.data['move']}")
+        line = Text("  ")
+        line.append("✓", style="green")
+        line.append(" ")
+        line.append(literal_text(ev.player or "", max_chars=NAME_DISPLAY_LIMIT))
+        line.append(": ")
+        line.append(literal_text(ev.data["move"]))
+        console.print(line)
     elif ev.type == EventType.MOVE_REJECTED:
-        console.print(f"  [yellow]✗ {ev.player}: {ev.data.get('reason')}[/]")
+        line = Text("  ")
+        line.append("✗ ", style="yellow")
+        line.append(literal_text(ev.player or "", max_chars=NAME_DISPLAY_LIMIT))
+        line.append(": ")
+        line.append(literal_text(ev.data.get("reason"), style="yellow"))
+        console.print(line)
     elif ev.type == EventType.MATCH_FINISHED:
         if ev.data.get("termination") == "technical_loss":
-            console.print(
-                f"[bold red]技术负[/] {ev.data.get('forfeited_by')} · "
-                f"{ev.data.get('reason_code')}"
-            )
+            line = Text("技术负", style="bold red")
+            line.append(" ")
+            line.append(literal_text(ev.data.get("forfeited_by"), max_chars=NAME_DISPLAY_LIMIT))
+            line.append(" · ")
+            line.append(literal_text(ev.data.get("reason_code")))
+            console.print(line)
         scores = ev.data["scores"]
         table = Table(title="最终比分")
         table.add_column("排名", justify="right")
@@ -160,7 +231,11 @@ def _render(ev: MatchEvent) -> None:
         for rank, (name, s) in enumerate(
             sorted(scores.items(), key=lambda kv: kv[1], reverse=True), start=1
         ):
-            table.add_row(str(rank), name, f"{s:.2f}")
+            table.add_row(
+                Text(str(rank)),
+                literal_text(name, max_chars=NAME_DISPLAY_LIMIT),
+                Text(f"{s:.2f}"),
+            )
         console.print(table)
 
 
@@ -168,18 +243,28 @@ def _open_store(path: Path | None, *, create: bool = True) -> SQLiteStore:
     try:
         return SQLiteStore(path, create=create)
     except (OSError, sqlite3.Error, StorageError) as exc:
-        console.print(f"[red]无法打开 SQLite 数据库：{exc}[/]")
+        line = Text("无法打开 SQLite 数据库：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
 
 
 def _render_saved(archive: MatchArchive, store: SQLiteStore, result: SaveResult) -> None:
     if not result.inserted:
-        console.print(f"[yellow]档案 {archive.match_id} 已存在，未重复更新 ELO。[/]")
+        line = Text("档案 ", style="yellow")
+        line.append(literal_text(archive.match_id, max_chars=NAME_DISPLAY_LIMIT))
+        line.append(" 已存在，未重复更新 ELO。")
+        console.print(line)
         return
 
-    console.print(f"[green]✓ 对局已存档[/]  {archive.match_id}\n  {store.path}")
+    line = Text("✓ 对局已存档", style="green")
+    line.append("  ")
+    line.append(literal_text(archive.match_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append("\n  ")
+    line.append(literal_text(store.path))
+    console.print(line)
     if not result.rated:
-        console.print("[yellow]本场不是双人对局，未计入 ELO。[/]")
+        console.print(Text("本场不是双人对局，未计入 ELO。", style="yellow"))
         return
 
     _render_rating_changes(result)
@@ -198,11 +283,11 @@ def _render_rating_changes(result: SaveResult, *, title: str = "ELO 更新") -> 
         scope = "总榜" if change.game is None else change.game
         delta = change.after - change.before
         table.add_row(
-            scope,
-            change.player,
-            f"{change.before:.1f}",
-            f"{change.after:.1f}",
-            f"{delta:+.1f}",
+            literal_text(scope, max_chars=NAME_DISPLAY_LIMIT),
+            literal_text(change.player, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{change.before:.1f}"),
+            Text(f"{change.after:.1f}"),
+            Text(f"{delta:+.1f}"),
         )
     console.print(table)
 
@@ -269,12 +354,10 @@ def _prepare_contest(
     return selected_game, selected_players
 
 
-async def _run(
-    game: Game, players: list[Player], seed: int, store: SQLiteStore
-) -> None:
-    archive = await play_match(game, players, seed=seed, on_event=_render)
+async def _run(game: Game, players: list[Player], seed: int, store: SQLiteStore) -> None:
+    archive = await play_match(game, players, seed=seed, on_event=_guard_renderer(_render))
     result = store.save_match(archive)
-    _render_saved(archive, store, result)
+    _best_effort_render(_render_saved, archive, store, result)
 
 
 def _render_series_summary(series_archive: SeriesArchive) -> None:
@@ -287,10 +370,10 @@ def _render_series_summary(series_archive: SeriesArchive) -> None:
         player = descriptor["name"]
         standing = series_archive.standings[player]
         table.add_row(
-            player,
-            f"{standing.wins}-{standing.draws}-{standing.losses}",
-            f"{standing.points:.1f}",
-            str(standing.technical_losses),
+            literal_text(player, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{standing.wins}-{standing.draws}-{standing.losses}"),
+            Text(f"{standing.points:.1f}"),
+            Text(str(standing.technical_losses)),
         )
     console.print(table)
 
@@ -301,17 +384,22 @@ def _render_series_saved(
     result: SaveResult,
 ) -> None:
     if not result.inserted:
-        console.print(
-            f"[yellow]系列赛 {series_archive.series_id} 已存在，未重复更新 ELO。[/]"
-        )
+        line = Text("系列赛 ", style="yellow")
+        line.append(literal_text(series_archive.series_id, max_chars=NAME_DISPLAY_LIMIT))
+        line.append(" 已存在，未重复更新 ELO。")
+        console.print(line)
         return
     first, second = series_archive.legs
-    console.print(
-        f"[green]✓ 两局已原子存档[/]  {series_archive.series_id}\n"
-        f"  第 1 局 {first.match_id}\n"
-        f"  第 2 局 {second.match_id}\n"
-        f"  {store.path}"
-    )
+    line = Text("✓ 两局已原子存档", style="green")
+    line.append("  ")
+    line.append(literal_text(series_archive.series_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append("\n  第 1 局 ")
+    line.append(literal_text(first.match_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append("\n  第 2 局 ")
+    line.append(literal_text(second.match_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append("\n  ")
+    line.append(literal_text(store.path))
+    console.print(line)
     _render_rating_changes(result, title="系列赛 ELO 净变化")
 
 
@@ -321,40 +409,51 @@ async def _run_series(
     seed: int,
     store: SQLiteStore,
 ) -> None:
-    console.print(
-        Panel(
-            f"项目 [bold]{game.name}[/] · seed={seed}\n"
-            "两局使用同一局面条件，第二局交换选手顺序",
-            title="双局赛开始",
-        )
-    )
+    intro = Text("项目 ")
+    intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(" · seed=")
+    intro.append(literal_text(seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append("\n两局使用同一局面条件，第二局交换选手顺序")
+    _best_effort_render(console.print, Panel(intro, title=Text("双局赛开始")))
 
     def render_leg(leg_number: int, event: MatchEvent) -> None:
         if event.type == EventType.MATCH_STARTED:
             first, second = (descriptor["name"] for descriptor in event.data["players"])
+            title = Text(f"第 {leg_number}/2 局 · ")
+            title.append(literal_text(first, max_chars=NAME_DISPLAY_LIMIT))
             if game.name == "gomoku":
-                seats = f"{first}（黑） vs {second}（白）"
+                title.append("（黑） vs ")
             elif game.name == "chess":
-                seats = f"{first}（白） vs {second}（黑）"
+                title.append("（白） vs ")
             else:
-                seats = f"{first}（第一席） vs {second}（第二席）"
-            console.rule(f"第 {leg_number}/2 局 · {seats}")
+                title.append("（第一席） vs ")
+            title.append(literal_text(second, max_chars=NAME_DISPLAY_LIMIT))
+            if game.name == "gomoku":
+                title.append("（白）")
+            elif game.name == "chess":
+                title.append("（黑）")
+            else:
+                title.append("（第二席）")
+            console.rule(title)
         _render(event)
 
+    guarded_render_leg = _guard_renderer(render_leg)
     series_archive = await play_two_leg_series(
         game,
         players,
         seed=seed,
-        on_event=render_leg,
+        on_event=guarded_render_leg,
     )
-    _render_series_summary(series_archive)
     result = store.save_series(series_archive)
-    _render_series_saved(series_archive, store, result)
+    _best_effort_render(_render_series_summary, series_archive)
+    _best_effort_render(_render_series_saved, series_archive, store, result)
 
 
 @app.command()
 def play(
-    game: str = typer.Option("math_quiz", "--game", "-g", help=f"比赛项目: {', '.join(list_games())}"),
+    game: str = typer.Option(
+        "math_quiz", "--game", "-g", help=f"比赛项目: {', '.join(list_games())}"
+    ),
     players: str = typer.Option(
         "mock:random,mock:fixed",
         "--players",
@@ -366,6 +465,7 @@ def play(
         "--rounds",
         "-n",
         min=1,
+        max=100,
         help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
     seed: int = typer.Option(
@@ -384,17 +484,13 @@ def play(
         "--llm-timeout",
         min=0.001,
         help=(
-            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / "
-            "match.llm_timeout_seconds / 120"
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / match.llm_timeout_seconds / 120"
         ),
     ),
     no_llm_timeout: bool = typer.Option(
         False,
         "--no-llm-timeout",
-        help=(
-            "禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，"
-            "仅建议用于旧同步适配器"
-        ),
+        help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
     database: Annotated[
         Path | None,
@@ -414,7 +510,9 @@ def play(
     try:
         asyncio.run(_run(selected_game, selected_players, seed, store))
     except (OSError, sqlite3.Error, StorageError) as exc:
-        console.print(f"[red]对局已完成，但 SQLite 存档失败：{exc}[/]")
+        line = Text("对局已完成，但 SQLite 存档失败：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
 
 
@@ -437,6 +535,7 @@ def series(
         "--rounds",
         "-n",
         min=1,
+        max=100,
         help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
     seed: int = typer.Option(
@@ -452,17 +551,13 @@ def series(
         "--llm-timeout",
         min=0.001,
         help=(
-            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / "
-            "match.llm_timeout_seconds / 120"
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / match.llm_timeout_seconds / 120"
         ),
     ),
     no_llm_timeout: bool = typer.Option(
         False,
         "--no-llm-timeout",
-        help=(
-            "禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，"
-            "仅建议用于旧同步适配器"
-        ),
+        help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
     database: Annotated[
         Path | None,
@@ -485,7 +580,9 @@ def series(
     try:
         asyncio.run(_run_series(selected_game, selected_players, seed, store))
     except (OSError, sqlite3.Error, StorageError) as exc:
-        console.print(f"[red]双局赛已完成，但 SQLite 原子存档失败：{exc}[/]")
+        line = Text("双局赛已完成，但 SQLite 原子存档失败：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
 
 
@@ -493,56 +590,71 @@ def series(
 def list_available_games() -> None:
     """列出已注册的比赛项目。"""
     for name in list_games():
-        console.print(f"- {name}")
+        line = Text("- ")
+        line.append(literal_text(name, max_chars=NAME_DISPLAY_LIMIT))
+        console.print(line)
 
 
 @app.command()
 def history(
     game: str | None = typer.Option(None, "--game", "-g", help="只看指定比赛项目"),
-    limit: int = typer.Option(20, "--limit", "-n", min=1, help="最多显示多少场"),
+    limit: int = typer.Option(20, "--limit", "-n", min=1, max=1000, help="最多显示多少场"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
     """查看最近的对局档案。"""
     try:
         rows = _open_store(database, create=False).list_matches(limit=limit, game=game)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
-        console.print(f"[red]无法读取 SQLite 对局历史：{exc}[/]")
+        line = Text("无法读取 SQLite 对局历史：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
     if not rows:
         console.print("暂无对局档案。")
         return
 
-    console.print("[bold]对局历史[/]")
+    console.print(Text("对局历史", style="bold"))
     for row in rows:
-        score_text = " · ".join(f"{name} {row.scores[name]:.2f}" for name in row.players)
-        series_text = ""
+        line = literal_text(row.match_id, style="bold cyan", max_chars=NAME_DISPLAY_LIMIT)
+        line.append("  ")
+        line.append(literal_text(row.game, max_chars=NAME_DISPLAY_LIMIT))
+        line.append("  ")
+        line.append(Text(row.finished_at.astimezone().strftime("%Y-%m-%d %H:%M")))
+        line.append("\n")
         if row.series_id is not None:
-            series_text = f"  系列 {row.series_id} 第 {row.leg_number}/2 局\n"
-        console.print(
-            f"[bold cyan]{row.match_id}[/]  {row.game}  "
-            f"{row.finished_at.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
-            f"{series_text}"
-            f"  {score_text}"
-        )
+            line.append("  系列 ")
+            line.append(literal_text(row.series_id, max_chars=NAME_DISPLAY_LIMIT))
+            line.append(f" 第 {row.leg_number}/2 局\n")
+        line.append("  ")
+        for index, name in enumerate(row.players):
+            if index:
+                line.append(" · ")
+            line.append(literal_text(name, max_chars=NAME_DISPLAY_LIMIT))
+            line.append(f" {row.scores[name]:.2f}")
+        console.print(line)
 
 
 @app.command()
 def leaderboard(
     game: str | None = typer.Option(None, "--game", "-g", help="项目榜；省略则显示总榜"),
-    limit: int = typer.Option(50, "--limit", "-n", min=1, help="最多显示多少名"),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, max=1000, help="最多显示多少名"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
     """查看持久化 ELO 排行榜。"""
     try:
         entries = _open_store(database, create=False).leaderboard(game=game, limit=limit)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
-        console.print(f"[red]无法读取 SQLite ELO 榜：{exc}[/]")
+        line = Text("无法读取 SQLite ELO 榜：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
     if not entries:
         console.print("暂无 ELO 记录。")
         return
 
-    table = Table(title=f"ELO {'总榜' if game is None else game}")
+    title = Text("ELO ")
+    title.append(Text("总榜") if game is None else literal_text(game, max_chars=NAME_DISPLAY_LIMIT))
+    table = Table(title=title)
     table.add_column("排名", justify="right")
     table.add_column("选手")
     table.add_column("等级分", justify="right")
@@ -550,11 +662,11 @@ def leaderboard(
     table.add_column("胜-平-负", justify="right")
     for rank, entry in enumerate(entries, start=1):
         table.add_row(
-            str(rank),
-            entry.player,
-            f"{entry.rating:.1f}",
-            str(entry.games_played),
-            f"{entry.wins}-{entry.draws}-{entry.losses}",
+            Text(str(rank)),
+            literal_text(entry.player, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{entry.rating:.1f}"),
+            Text(str(entry.games_played)),
+            Text(f"{entry.wins}-{entry.draws}-{entry.losses}"),
         )
     console.print(table)
 
@@ -571,9 +683,20 @@ def show_archive(
         if archive is None:
             archive = store.get_series(match_id)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
-        console.print(f"[red]无法读取 SQLite 对局档案：{exc}[/]")
+        line = Text("无法读取 SQLite 对局档案：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
     if archive is None:
-        console.print(f"[red]未找到对局或系列赛 {match_id!r}。[/]")
+        line = Text("未找到对局或系列赛 ", style="red")
+        line.append(literal_text(repr(match_id), max_chars=NAME_DISPLAY_LIMIT))
+        line.append("。")
+        console.print(line)
         raise typer.Exit(code=1)
-    console.print_json(archive.to_json())
+    console.print(
+        literal_text(
+            archive.to_json(),
+            max_chars=ARCHIVE_DISPLAY_LIMIT,
+            multiline=True,
+        )
+    )
