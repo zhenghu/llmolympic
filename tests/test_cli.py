@@ -8,6 +8,7 @@ import sqlite3
 
 import pytest
 import typer
+from rich.text import Text
 from typer.testing import CliRunner
 
 from llmolympic import config
@@ -732,9 +733,10 @@ def test_invalid_profile_player_is_reported_before_database_creation(
     finally:
         config.load_config.cache_clear()
 
+    output = Text.from_ansi(result.output).plain
     assert result.exit_code == 2
-    assert error in result.output
-    assert "Traceback" not in result.output
+    assert error in output
+    assert "Traceback" not in output
     assert not path.exists()
 
 
