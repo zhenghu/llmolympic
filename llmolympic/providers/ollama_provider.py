@@ -9,6 +9,7 @@ from llmolympic.providers.base import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     Provider,
     ProviderTimeoutError,
+    validate_base_url,
 )
 
 _DEFAULT_BASE_URL = "http://localhost:11434"
@@ -17,9 +18,28 @@ _DEFAULT_BASE_URL = "http://localhost:11434"
 class OllamaProvider(Provider):
     name = "ollama"
 
-    def __init__(self, base_url: str | None = None) -> None:
-        url = base_url or cfg_get("ollama", "base_url", _DEFAULT_BASE_URL, env="OLLAMA_BASE_URL")
-        self.base_url = url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        profile_id: str | None = None,
+        use_legacy_config: bool = True,
+    ) -> None:
+        if use_legacy_config:
+            url = base_url or cfg_get(
+                "ollama", "base_url", _DEFAULT_BASE_URL, env="OLLAMA_BASE_URL"
+            )
+        else:
+            url = base_url or _DEFAULT_BASE_URL
+        self.base_url = validate_base_url(
+            url,
+            source=(
+                f"Provider Profile {profile_id!r} 的 base_url"
+                if profile_id is not None
+                else "Ollama base_url"
+            ),
+        )
+        self.profile_id = profile_id
 
     @staticmethod
     def _payload(messages: list[dict], model: str, params: dict) -> dict:

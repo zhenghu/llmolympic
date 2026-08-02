@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
@@ -22,15 +24,22 @@ from llmolympic.cli.terminal import (
     literal_text,
 )
 from llmolympic.config import get as cfg_get
+from llmolympic.config import get_profile
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
-from llmolympic.core.game import Game, validate_player_count, validate_players
+from llmolympic.core.game import (
+    MAX_PLAYER_NAME_CHARS,
+    Game,
+    validate_player_count,
+    validate_players,
+)
 from llmolympic.core.match import play_match
 from llmolympic.core.player import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
     HumanPlayer,
     LLMPlayer,
     Player,
+    profile_entrant_id,
 )
 from llmolympic.core.series import SeriesArchive, play_two_leg_series
 from llmolympic.core.storage import (
@@ -41,7 +50,7 @@ from llmolympic.core.storage import (
     StorageError,
 )
 from llmolympic.games import create_game, list_games
-from llmolympic.providers import create_provider
+from llmolympic.providers import create_profile_provider, create_provider
 
 app = typer.Typer(
     help="LLM Olympics —— 人类与 LLM 的多项目竞技场",
@@ -135,22 +144,82 @@ def _validate_human_timeout(value: float) -> float:
     return value
 
 
+def _disambiguate_duplicate_display_names(players: list[Player]) -> None:
+    """为同名但身份不同的选手生成稳定、可读的本场显示名。"""
+
+    counts = Counter(player.name for player in players)
+    if all(count == 1 for count in counts.values()):
+        return
+
+    occupied = {name for name, count in counts.items() if count == 1}
+    for player in players:
+        if counts[player.name] == 1:
+            continue
+        if isinstance(player, LLMPlayer) and player.profile_id is not None:
+            label = f"{player.profile_id}:{player.model}"
+        else:
+            label = player.entrant_id
+        digest = hashlib.sha256(player.entrant_id.encode("utf-8")).hexdigest()[:8]
+        if len(label) > 64:
+            label = f"{label[:54]}…{digest}"
+        suffix = f" [{label}]"
+        base = player.name[: MAX_PLAYER_NAME_CHARS - len(suffix)].rstrip()
+        canonical = f"{base or '选手'}{suffix}"
+        candidate = canonical
+        discriminator = 2
+        while candidate in occupied:
+            counter = f" #{discriminator}"
+            prefix = canonical[: MAX_PLAYER_NAME_CHARS - len(counter)].rstrip()
+            candidate = f"{prefix or '选手'}{counter}"
+            discriminator += 1
+        player.name = candidate
+        occupied.add(candidate)
+
+
 def _parse_players(
     spec: str,
     human_timeout: float,
     llm_timeout: float | None = None,
 ) -> list[Player]:
-    """把 ``openai:gpt-4o-mini,human:小明`` 这样的规格解析成选手列表。
+    """把 ``profile:kimi:moonshot-v1,human:小明`` 等规格解析成选手。
 
     模型名可省略（如 ``openai``），此时回退到 config.toml 里的
     ``[<provider>] default_model``；``mock`` 省略时默认为 random 策略；
-    ``human`` 省略名字时默认为"人类"。
+    ``human`` 省略名字时默认为"人类"。``profile:<id>[:model]``
+    使用 ``[profiles.<id>]``，并生成与显示名分离的稳定 entrant ID。
     """
     players: list[Player] = []
     for token in _split_player_specs(spec):
         kind, _, ident = token.partition(":")
         if kind == "human":
             players.append(HumanPlayer(name=ident or "人类", timeout=human_timeout))
+            continue
+        if kind == "profile":
+            profile_id, separator, explicit_model = ident.partition(":")
+            if not profile_id:
+                raise typer.BadParameter(
+                    "Profile 选手必须使用 profile:<id>[:model]",
+                    param_hint="--players",
+                )
+            if separator and not explicit_model.strip():
+                raise typer.BadParameter("Profile 模型名不能为空", param_hint="--players")
+            profile = get_profile(profile_id)
+            model = explicit_model.strip() if separator else profile.default_model
+            if not model:
+                raise typer.BadParameter(
+                    f"Provider Profile {profile_id!r} 未指定模型，且没有 default_model",
+                    param_hint="--players",
+                )
+            provider = create_profile_provider(profile)
+            entrant_id = profile_entrant_id(profile_id, model)
+            players.append(
+                LLMPlayer(
+                    name=profile.display_name or entrant_id,
+                    provider=provider,
+                    model=model,
+                    move_timeout_seconds=llm_timeout,
+                )
+            )
             continue
         if kind == "mock":
             ident = ident or "random"
@@ -169,6 +238,13 @@ def _parse_players(
                 move_timeout_seconds=llm_timeout,
             )
         )
+    entrant_ids = [player.entrant_id for player in players]
+    if len(set(entrant_ids)) != len(entrant_ids):
+        raise typer.BadParameter(
+            f"选手稳定身份必须唯一: {entrant_ids}",
+            param_hint="--players",
+        )
+    _disambiguate_duplicate_display_names(players)
     names = [player.name for player in players]
     if len(set(names)) != len(names):
         raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
@@ -322,7 +398,7 @@ def _prepare_contest(
         validate_player_count(selected_game, len(player_specs))
     except typer.BadParameter:
         raise
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--players") from exc
 
     has_human_player = any(spec.partition(":")[0] == "human" for spec in player_specs)
@@ -345,7 +421,7 @@ def _prepare_contest(
         selected_players = _parse_players(player_spec, human_timeout, effective_llm_timeout)
     except typer.BadParameter:
         raise
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--players") from exc
     try:
         validate_players(selected_game, [player.name for player in selected_players])
@@ -356,7 +432,7 @@ def _prepare_contest(
 
 async def _run(game: Game, players: list[Player], seed: int, store: SQLiteStore) -> None:
     archive = await play_match(game, players, seed=seed, on_event=_guard_renderer(_render))
-    result = store.save_match(archive)
+    result = store.save_match(archive, rating_source="engine")
     _best_effort_render(_render_saved, archive, store, result)
 
 
@@ -444,7 +520,7 @@ async def _run_series(
         seed=seed,
         on_event=guarded_render_leg,
     )
-    result = store.save_series(series_archive)
+    result = store.save_series(series_archive, rating_source="engine")
     _best_effort_render(_render_series_summary, series_archive)
     _best_effort_render(_render_series_saved, series_archive, store, result)
 
@@ -458,7 +534,7 @@ def play(
         "mock:random,mock:fixed",
         "--players",
         "-p",
-        help="逗号分隔的选手规格，如 openai:gpt-4o-mini,human:小明,ollama:llama3.1",
+        help=("逗号分隔的选手，如 profile:kimi:moonshot-v1,human:小明,openai:gpt-4o-mini"),
     ),
     rounds: int | None = typer.Option(
         None,
@@ -528,7 +604,10 @@ def series(
         "mock:random,mock:fixed",
         "--players",
         "-p",
-        help="恰好两个非人类选手，如 openai:gpt-4o-mini,ollama:llama3.1",
+        help=(
+            "恰好两个非人类选手，如 profile:kimi,profile:deepseek "
+            "或 openai:gpt-4o-mini,ollama:llama3.1"
+        ),
     ),
     rounds: int | None = typer.Option(
         None,
