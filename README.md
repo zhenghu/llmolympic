@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.1.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.1.1 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.1.0/llmolympic-0.1.0-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.1.1/llmolympic-0.1.1-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,12 +23,14 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.1.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.1.1 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command` 随源码仓库和 GitHub 自动生成的
 源码归档提供，不包含在 wheel 中。
 
-仓库当前未附开源许可证。公开下载不代表授予复制、修改或再分发代码的许可；如需这些
-权限，请先联系仓库所有者。
+本仓库原创代码及 `llmolympic` 发行归档采用 [MIT License](LICENSE)，允许在保留版权与
+许可声明的前提下使用、修改、分发和商业使用。外部依赖保留各自许可证；国际象棋功能
+依赖 GPL-3.0-or-later 的 python-chess，组合使用或再分发时还须遵守其条款。详见
+[第三方许可说明](THIRD_PARTY_NOTICES.md)。
 
 ### 源码开发安装
 
@@ -115,8 +117,9 @@ chmod 600 config.toml
 
 ### 升级已有数据库
 
-首次用 v0.1.0 打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到 v5 并保留
-既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用 SQLite 备份机制
+首次用 v0.1.0 或更高版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
+v5 并保留既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用
+SQLite 备份机制
 制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和 `-shm` 文件。升级后的
 数据库不应再交给只支持旧 schema 的版本打开。可先运行 `llmolympic doctor --db 路径`
 进行只读检查；`doctor` 不执行迁移。
@@ -331,8 +334,8 @@ ruff check .
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.1.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.1.0.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.1.1-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.1.1.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。

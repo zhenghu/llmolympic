@@ -2,6 +2,15 @@
 
 本文件记录 LLM Olympics 各正式版本的重要变化。
 
+## [0.1.1] - 2026-08-03
+
+### 许可
+
+- 本仓库原创代码及 Python 发行归档以 MIT License 开源，版权归 `zhenghu` 所有。
+- Python 发行包使用 SPDX `MIT` 许可证表达式，并包含完整 `LICENSE` 文件。
+- 新增第三方许可说明，披露国际象棋功能依赖 GPL-3.0-or-later 的 python-chess；外部依赖
+  不因本项目采用 MIT 而被重新授权。
+
 ## [0.1.0] - 2026-08-03
 
 首个公开 GitHub Release。

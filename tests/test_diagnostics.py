@@ -52,11 +52,25 @@ def _isolate_diagnostics(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    metadata = importlib.metadata.metadata("llmolympic")
 
+    assert project["build-system"]["requires"] == ["hatchling>=1.27,<2"]
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
-    assert importlib.metadata.version("llmolympic") == __version__ == "0.1.0"
+    assert metadata["Version"] == __version__ == "0.1.1"
+    assert project["project"]["license"] == "MIT"
+    assert project["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+    assert metadata["License-Expression"] == "MIT"
+    assert set(metadata.get_all("License-File", [])) == {"LICENSE", "THIRD_PARTY_NOTICES.md"}
+    assert (
+        Path("LICENSE")
+        .read_text(encoding="utf-8")
+        .startswith("MIT License\n\nCopyright (c) 2026 zhenghu\n")
+    )
+    third_party = Path("THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert "python-chess" in third_party
+    assert "GPL-3.0-or-later" in third_party
 
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
@@ -101,7 +115,7 @@ def test_doctor_missing_config_and_database_warns_without_creating_files(tmp_pat
     output = _plain(result.output)
 
     assert result.exit_code == 0
-    assert "PASS llmolympic 0.1.0" in output
+    assert "PASS llmolympic 0.1.1" in output
     assert "WARN 未找到配置文件" in output
     assert "WARN SQLite 数据库尚未创建" in output
     assert not database.exists()
