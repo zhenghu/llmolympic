@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import runpy
 import sys
 import tarfile
 import zipfile
@@ -10,8 +11,10 @@ from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
 
-from llmolympic import __version__
-
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+VERSION = runpy.run_path(PROJECT_ROOT / "llmolympic" / "__init__.py")["__version__"]
+if not isinstance(VERSION, str):
+    raise TypeError("llmolympic.__version__ must be a string")
 LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
 
 
@@ -25,7 +28,7 @@ def _verify_metadata(metadata: Message) -> None:
     metadata_version = tuple(int(part) for part in metadata["Metadata-Version"].split("."))
     if metadata_version < (2, 4):
         raise AssertionError("license metadata requires Metadata-Version 2.4 or newer")
-    if metadata["Version"] != __version__:
+    if metadata["Version"] != VERSION:
         raise AssertionError("distribution metadata version does not match llmolympic.__version__")
     if metadata["License-Expression"] != "MIT":
         raise AssertionError("distribution License-Expression is not MIT")
@@ -34,12 +37,12 @@ def _verify_metadata(metadata: Message) -> None:
 
 
 def verify_distributions(dist_dir: Path) -> None:
-    expected_legal_files = {name: Path(name).read_bytes() for name in LEGAL_FILES}
+    expected_legal_files = {name: (PROJECT_ROOT / name).read_bytes() for name in LEGAL_FILES}
     wheel = _single(list(dist_dir.glob("*.whl")), "wheel")
     sdist = _single(list(dist_dir.glob("*.tar.gz")), "sdist")
-    if not wheel.match(f"llmolympic-{__version__}-*.whl"):
+    if not wheel.match(f"llmolympic-{VERSION}-*.whl"):
         raise AssertionError("wheel filename does not match llmolympic.__version__")
-    if sdist.name != f"llmolympic-{__version__}.tar.gz":
+    if sdist.name != f"llmolympic-{VERSION}.tar.gz":
         raise AssertionError("sdist filename does not match llmolympic.__version__")
 
     with zipfile.ZipFile(wheel) as archive:
@@ -81,7 +84,7 @@ def verify_distributions(dist_dir: Path) -> None:
             if legal_file is None or legal_file.read() != expected:
                 raise AssertionError(f"sdist {filename} does not match the repository file")
 
-    print(f"MIT license metadata and payload verified for llmolympic {__version__}")
+    print(f"MIT license metadata and payload verified for llmolympic {VERSION}")
 
 
 def main() -> None:
