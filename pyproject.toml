@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llmolympic"
-version = "0.1.0"
+dynamic = ["version"]
 description = "LLM Olympics —— 人类与 LLM 的多项目竞技场"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,9 @@ security = [
 
 [project.scripts]
 llmolympic = "llmolympic.cli.main:app"
+
+[tool.hatch.version]
+path = "llmolympic/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["llmolympic"]
