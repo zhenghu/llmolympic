@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import shlex
 import sqlite3
 from collections import Counter
 from collections.abc import Callable
@@ -56,7 +57,9 @@ from llmolympic.core.tournament import (
     MAX_TOURNAMENT_PLAYERS,
     MIN_TOURNAMENT_PLAYERS,
     TournamentArchive,
-    play_round_robin,
+    TournamentCheckpoint,
+    prepare_round_robin,
+    resume_round_robin,
 )
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_profile_provider, create_provider
@@ -70,6 +73,9 @@ console = Console()
 MAX_UNCONFIRMED_TOURNAMENT_MATCHES = 30
 MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS = 5_000
 TOURNAMENT_MOVE_ATTEMPTS = 3
+DEFAULT_TOURNAMENT_GAME = "knowledge_quiz"
+DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
+DEFAULT_TOURNAMENT_SEED = 0
 
 
 def _render_warning() -> None:
@@ -497,6 +503,70 @@ def _prepare_round_robin(
     return selected_game, selected_players
 
 
+def _checkpoint_player_spec(descriptor: dict) -> str:
+    """Rebuild one credential-free CLI player spec from a checkpoint descriptor."""
+
+    if descriptor.get("kind") != LLMPlayer.kind:
+        raise ValueError("循环赛 checkpoint 只能恢复 LLM/mock/Profile 选手")
+    model = descriptor.get("model")
+    if not isinstance(model, str) or not model or "," in model:
+        raise ValueError("循环赛 checkpoint 包含无法安全恢复的模型名")
+    profile_id = descriptor.get("profile_id")
+    if profile_id is not None:
+        if not isinstance(profile_id, str) or not profile_id or "," in profile_id:
+            raise ValueError("循环赛 checkpoint 包含无效的 Profile ID")
+        return f"profile:{profile_id}:{model}"
+    provider = descriptor.get("provider")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or any(marker in provider for marker in (",", ":"))
+    ):
+        raise ValueError("循环赛 checkpoint 包含无法安全恢复的 Provider")
+    return f"{provider}:{model}"
+
+
+def _checkpoint_llm_timeout(checkpoint: TournamentCheckpoint) -> float | None:
+    """Return the one CLI-wide timeout frozen into all checkpoint entrants."""
+
+    values = [descriptor.get("move_timeout_seconds") for descriptor in checkpoint.players]
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        raise ValueError("循环赛 checkpoint 的选手超时配置不一致")
+    if first is None:
+        return None
+    if isinstance(first, bool) or not isinstance(first, (int, float)):
+        raise TypeError("循环赛 checkpoint 的 LLM 超时无效")
+    return float(first)
+
+
+def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[Player]]:
+    """Recreate providers from current config while preserving frozen tournament identity."""
+
+    player_spec = ",".join(_checkpoint_player_spec(item) for item in checkpoint.players)
+    timeout = _checkpoint_llm_timeout(checkpoint)
+    raw_rounds = checkpoint.game_config.get("rounds")
+    if raw_rounds is None:
+        rounds = None
+    elif isinstance(raw_rounds, bool) or not isinstance(raw_rounds, int):
+        raise ValueError("循环赛 checkpoint 的 rounds 配置无效")
+    else:
+        rounds = raw_rounds
+    game, players = _prepare_round_robin(
+        game_name=checkpoint.game,
+        player_spec=player_spec,
+        rounds=rounds,
+        llm_timeout=timeout,
+        no_llm_timeout=timeout is None,
+    )
+    # Profile display names are presentation metadata and may change between
+    # processes. The tournament itself must keep the original name snapshot so
+    # completed and future series have byte-for-byte identical descriptors.
+    for player, descriptor in zip(players, checkpoint.players):
+        player.name = descriptor["name"]
+    return game, players
+
+
 def _tournament_workload(
     game: Game,
     player_count: int,
@@ -678,7 +748,7 @@ def _render_tournament_saved(
         console.print(line)
         return
 
-    line = Text("✓ 循环赛已原子存档", style="green")
+    line = Text("✓ 循环赛已完成；最终档案与 ELO 已原子封存", style="green")
     line.append("  ")
     line.append(literal_text(tournament.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
     line.append(f"\n  {result.pairing_count} 组对阵 · {result.match_count} 场对局")
@@ -689,17 +759,72 @@ def _render_tournament_saved(
         _render_tournament_rating_changes(result)
 
 
+def _tournament_resume_command(checkpoint: TournamentCheckpoint, store: SQLiteStore) -> str:
+    return (
+        "llmolympic round-robin --resume "
+        f"{shlex.quote(checkpoint.tournament_id)} --db {shlex.quote(str(store.path))}"
+    )
+
+
+def _render_checkpoint_ready(
+    checkpoint: TournamentCheckpoint,
+    store: SQLiteStore,
+    resumed: bool,
+) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("循环赛检查点已就绪", style="green")
+    if resumed:
+        line = Text("循环赛检查点已加载", style="green")
+    line.append("\n  赛事 ID ")
+    line.append(literal_text(checkpoint.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append(f"\n  进度 {completed}/{total} 组")
+    line.append("\n  恢复 ")
+    line.append(
+        literal_text(
+            _tournament_resume_command(checkpoint, store),
+            multiline=False,
+        )
+    )
+    console.print(line)
+
+
+def _render_checkpoint_saved(checkpoint: TournamentCheckpoint) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("✓ 检查点已保存", style="green")
+    line.append(f"  {completed}/{total} 组  ")
+    line.append(literal_text(checkpoint.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+    console.print(line)
+
+
+def _render_tournament_interrupted(
+    checkpoint: TournamentCheckpoint,
+    store: SQLiteStore,
+) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("循环赛已中断。", style="yellow")
+    line.append(f"已保存 {completed}/{total} 组；当前未完成的一组不会保存。")
+    line.append("\n恢复：")
+    line.append(literal_text(_tournament_resume_command(checkpoint, store)))
+    console.print(line)
+
+
 async def _run_round_robin(
     game: Game,
     players: list[Player],
-    seed: int,
+    checkpoint: TournamentCheckpoint,
     store: SQLiteStore,
 ) -> None:
     pairing_count, match_count, turns, max_calls = _tournament_workload(game, len(players))
     intro = Text("项目 ")
     intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
     intro.append(" · seed=")
-    intro.append(literal_text(seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(literal_text(checkpoint.seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append("\n赛事 ID ")
+    intro.append(literal_text(checkpoint.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(f" · 已保存 {len(checkpoint.completed_series)}/{pairing_count} 组")
     intro.append(f"\n{len(players)} 名选手 · {pairing_count} 组对阵 · {match_count} 场对局")
     if turns is not None and max_calls is not None:
         intro.append(f"\n预计 {turns} 个回合 · 最多约 {max_calls} 次选手调用")
@@ -708,7 +833,8 @@ async def _run_round_robin(
         if index:
             intro.append(" · ")
         intro.append(literal_text(player.name, max_chars=NAME_DISPLAY_LIMIT))
-    _best_effort_render(console.print, Panel(intro, title=Text("循环赛开始")))
+    title = "循环赛恢复" if checkpoint.completed_series else "循环赛开始"
+    _best_effort_render(console.print, Panel(intro, title=Text(title)))
 
     def render_pairing(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
         if event.type == EventType.MATCH_STARTED:
@@ -731,13 +857,18 @@ async def _run_round_robin(
             console.rule(title)
         _render(event)
 
-    tournament = await play_round_robin(
+    def save_checkpoint(updated: TournamentCheckpoint) -> None:
+        store.save_tournament_checkpoint(updated)
+        _best_effort_render(_render_checkpoint_saved, updated)
+
+    tournament = await resume_round_robin(
         game,
         players,
-        seed=seed,
+        checkpoint,
         on_event=_guard_renderer(render_pairing),
+        on_checkpoint=save_checkpoint,
     )
-    result = store.save_tournament(tournament, rating_source="engine")
+    result = store.finalize_tournament_checkpoint(checkpoint.tournament_id)
     _best_effort_render(_render_tournament_summary, tournament)
     _best_effort_render(_render_tournament_saved, tournament, store, result)
 
@@ -884,17 +1015,19 @@ def series(
 
 @app.command(name="round-robin")
 def round_robin(
-    game: str = typer.Option(
-        "knowledge_quiz",
+    game: str | None = typer.Option(
+        None,
         "--game",
         "-g",
-        help=f"比赛项目: {', '.join(list_games())}",
+        help=f"比赛项目: {', '.join(list_games())}（新赛事默认 knowledge_quiz）",
     ),
-    players: str = typer.Option(
-        "mock:random,mock:fixed,mock:illegal",
+    players: str | None = typer.Option(
+        None,
         "--players",
         "-p",
-        help=("3–16 名非人类选手，如 profile:kimi,profile:deepseek,profile:local"),
+        help=(
+            "3–16 名非人类选手，如 profile:kimi,profile:deepseek,profile:local；新赛事默认三个 mock"
+        ),
     ),
     rounds: int | None = typer.Option(
         None,
@@ -904,8 +1037,8 @@ def round_robin(
         max=100,
         help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
-    seed: int = typer.Option(
-        0,
+    seed: int | None = typer.Option(
+        None,
         "--seed",
         "-s",
         min=SQLITE_INT_MIN,
@@ -928,36 +1061,123 @@ def round_robin(
     allow_large_tournament: bool = typer.Option(
         False,
         "--allow-large-tournament",
-        help=(
-            "显式允许超过默认对局/调用阈值的大型循环赛；请先确认 Provider 费用预算与中断不存档风险"
-        ),
+        help=("显式允许超过默认对局/调用阈值的大型循环赛；请先确认 Provider 费用预算"),
+    ),
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        help="从 SQLite 检查点恢复赛事 ID；比赛配置由检查点冻结",
     ),
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
     ] = None,
 ) -> None:
-    """让 3–16 名非人类选手两两进行交换顺序双局赛。"""
+    """新建或恢复 3–16 名非人类选手的交换顺序循环赛。"""
 
-    selected_game, selected_players = _prepare_round_robin(
-        game_name=game,
-        player_spec=players,
-        rounds=rounds,
-        llm_timeout=llm_timeout,
-        no_llm_timeout=no_llm_timeout,
-    )
-    _validate_tournament_workload(
-        selected_game,
-        len(selected_players),
-        allow_large=allow_large_tournament,
-    )
-    store = _open_store(database)
+    if resume is not None:
+        conflicts = [
+            option
+            for option, supplied in (
+                ("--game", game is not None),
+                ("--players", players is not None),
+                ("--rounds", rounds is not None),
+                ("--seed", seed is not None),
+                ("--llm-timeout", llm_timeout is not None),
+                ("--no-llm-timeout", no_llm_timeout),
+                ("--allow-large-tournament", allow_large_tournament),
+            )
+            if supplied
+        ]
+        if conflicts:
+            raise typer.BadParameter(
+                f"使用 --resume 时不能同时指定比赛配置: {', '.join(conflicts)}；"
+                "这些配置已由检查点冻结",
+                param_hint="--resume",
+            )
+        if not resume.strip():
+            raise typer.BadParameter("恢复赛事 ID 不能为空", param_hint="--resume")
+        store = _open_store(database, create=False)
+        try:
+            completed = store.get_tournament(resume)
+            if completed is not None:
+                _best_effort_render(_render_tournament_summary, completed)
+                line = Text("循环赛 ", style="yellow")
+                line.append(literal_text(resume, max_chars=NAME_DISPLAY_LIMIT))
+                line.append(" 已完成，无需恢复，也不会重复更新 ELO。")
+                console.print(line)
+                return
+            checkpoint = store.get_tournament_checkpoint(resume)
+            if checkpoint is None:
+                line = Text("未找到可恢复的循环赛 ", style="red")
+                line.append(literal_text(repr(resume), max_chars=NAME_DISPLAY_LIMIT))
+                line.append("。请确认赛事 ID 与 --db。")
+                console.print(line)
+                raise typer.Exit(code=1)
+        except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+            line = Text("无法读取循环赛检查点：", style="red")
+            line.append(literal_text(exc))
+            console.print(line)
+            raise typer.Exit(code=1) from exc
+        try:
+            selected_game, selected_players = _restore_round_robin(checkpoint)
+        except typer.BadParameter:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(
+                f"无法从检查点恢复比赛配置: {exc}",
+                param_hint="--resume",
+            ) from exc
+        _best_effort_render(_render_checkpoint_ready, checkpoint, store, True)
+    else:
+        selected_game, selected_players = _prepare_round_robin(
+            game_name=DEFAULT_TOURNAMENT_GAME if game is None else game,
+            player_spec=DEFAULT_TOURNAMENT_PLAYERS if players is None else players,
+            rounds=rounds,
+            llm_timeout=llm_timeout,
+            no_llm_timeout=no_llm_timeout,
+        )
+        effective_seed = DEFAULT_TOURNAMENT_SEED if seed is None else seed
+        _validate_tournament_workload(
+            selected_game,
+            len(selected_players),
+            allow_large=allow_large_tournament,
+        )
+        checkpoint = prepare_round_robin(
+            selected_game,
+            selected_players,
+            seed=effective_seed,
+            max_attempts=TOURNAMENT_MOVE_ATTEMPTS,
+        )
+        store = _open_store(database)
+        try:
+            store.save_tournament_checkpoint(checkpoint)
+        except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+            line = Text("无法创建循环赛检查点：", style="red")
+            line.append(literal_text(exc))
+            console.print(line)
+            raise typer.Exit(code=1) from exc
+        _best_effort_render(_render_checkpoint_ready, checkpoint, store, False)
+
     try:
-        asyncio.run(_run_round_robin(selected_game, selected_players, seed, store))
-    except (OSError, sqlite3.Error, StorageError) as exc:
-        line = Text("循环赛已完成，但 SQLite 原子存档失败：", style="red")
+        asyncio.run(_run_round_robin(selected_game, selected_players, checkpoint, store))
+    except KeyboardInterrupt as exc:
+        try:
+            latest = store.get_tournament_checkpoint(checkpoint.tournament_id) or checkpoint
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = checkpoint
+        _best_effort_render(_render_tournament_interrupted, latest, store)
+        raise typer.Exit(code=130) from exc
+    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+        line = Text("循环赛未完成：", style="red")
         line.append(literal_text(exc))
         console.print(line)
+        try:
+            latest = store.get_tournament_checkpoint(checkpoint.tournament_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_tournament_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
 
 

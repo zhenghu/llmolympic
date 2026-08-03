@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sqlite3
 
 import pytest
@@ -29,6 +30,13 @@ def _configure_profiles(monkeypatch, tmp_path, content: str) -> None:
         config_path.chmod(0o600)
     monkeypatch.setenv("LLMOLYMPIC_CONFIG", str(config_path))
     config.load_config.cache_clear()
+
+
+def _tournament_id_from_output(output: str) -> str:
+    plain = Text.from_ansi(output).plain
+    match = re.search(r"赛事 ID ([0-9a-f]{32})", plain)
+    assert match is not None, plain
+    return match.group(1)
 
 
 class _FailingProvider(Provider):
@@ -298,11 +306,14 @@ def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) ->
     )
 
     assert result.exit_code == 0, result.output
+    assert "循环赛检查点已就绪" in result.output
+    assert "赛事 ID" in result.output
+    assert "检查点已保存" in result.output
     assert "循环赛开始" in result.output
     assert "第 1/3 组 · 第 1/2 局" in result.output
     assert "第 3/3 组 · 第 2/2 局" in result.output
     assert "循环赛结果" in result.output
-    assert "循环赛已原子存档" in result.output
+    assert "最终档案与 ELO 已原子封存" in result.output
     assert "3 组对阵 · 6 场对局" in result.output
     assert "循环赛 ELO 净变化" in result.output
 
@@ -335,6 +346,254 @@ def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) ->
     assert tournament_id in archive.output
     assert '"format": "round_robin_two_leg"' in archive.output
     assert '"pairings"' in archive.output
+
+
+def test_round_robin_ctrl_c_saves_complete_prefix_and_resume_skips_it(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "resume-round-robin.db"
+    original_save = SQLiteStore.save_tournament_checkpoint
+    interrupted = False
+
+    def save_then_interrupt(self, checkpoint):
+        nonlocal interrupted
+        result = original_save(self, checkpoint)
+        if len(checkpoint.completed_series) == 1 and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(SQLiteStore, "save_tournament_checkpoint", save_then_interrupt)
+        first = runner.invoke(
+            app,
+            [
+                "round-robin",
+                "--game",
+                "knowledge_quiz",
+                "--players",
+                "mock:fixed,mock:random,mock:illegal",
+                "--rounds",
+                "1",
+                "--seed",
+                "17",
+                "--llm-timeout",
+                "1",
+                "--db",
+                str(path),
+            ],
+        )
+
+    assert first.exit_code == 130, first.output
+    assert "循环赛已中断" in first.output
+    assert "已保存 1/3 组" in first.output
+    assert "Traceback" not in first.output
+    tournament_id = _tournament_id_from_output(first.output)
+    store = SQLiteStore(path)
+    checkpoint = store.get_tournament_checkpoint(tournament_id)
+    assert checkpoint is not None
+    assert len(checkpoint.completed_series) == 1
+    assert store.list_matches() == []
+    assert store.leaderboard() == []
+
+    resumed = runner.invoke(
+        app,
+        ["round-robin", "--resume", tournament_id, "--db", str(path)],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "循环赛检查点已加载" in resumed.output
+    assert "已保存 1/3 组" in resumed.output
+    assert "第 1/3 组" not in resumed.output
+    assert "第 2/3 组" in resumed.output
+    assert "第 3/3 组" in resumed.output
+    tournament = store.get_tournament(tournament_id)
+    assert tournament is not None
+    assert len(tournament.pairings) == 3
+    assert all(entry.games_played == 4 for entry in store.leaderboard())
+
+    repeated = runner.invoke(
+        app,
+        ["round-robin", "--resume", tournament_id, "--db", str(path)],
+    )
+    assert repeated.exit_code == 0, repeated.output
+    assert "已完成，无需恢复" in repeated.output
+    assert all(entry.games_played == 4 for entry in store.leaderboard())
+
+
+def test_round_robin_resume_rebuilds_frozen_profile_model_game_and_timeout(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "resume-profile.db"
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.local]
+provider = "ollama"
+default_model = "model-a"
+display_name = "Original name"
+""",
+    )
+
+    def create_test_profile_provider(profile: config.ProviderProfile) -> Provider:
+        provider = MockProvider(strategy="fixed")
+        provider.profile_id = profile.profile_id
+        return provider
+
+    async def interrupt_before_first_pairing(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "llmolympic.cli.main.create_profile_provider",
+        create_test_profile_provider,
+    )
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            "llmolympic.cli.main.resume_round_robin",
+            interrupt_before_first_pairing,
+        )
+        first = runner.invoke(
+            app,
+            [
+                "round-robin",
+                "--game",
+                "knowledge_quiz",
+                "--players",
+                "profile:local,mock:random,mock:illegal",
+                "--rounds",
+                "1",
+                "--llm-timeout",
+                "0.5",
+                "--db",
+                str(path),
+            ],
+        )
+    assert first.exit_code == 130, first.output
+    tournament_id = _tournament_id_from_output(first.output)
+
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        """
+[profiles.local]
+provider = "ollama"
+default_model = "model-b"
+display_name = "Renamed"
+""",
+        encoding="utf-8",
+    )
+    if os.name == "posix":
+        config_path.chmod(0o600)
+    monkeypatch.setenv("LLMOLYMPIC_LLM_TIMEOUT", "9")
+    config.load_config.cache_clear()
+    try:
+        resumed = runner.invoke(
+            app,
+            ["round-robin", "--resume", tournament_id, "--db", str(path)],
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    assert resumed.exit_code == 0, resumed.output
+    tournament = SQLiteStore(path).get_tournament(tournament_id)
+    assert tournament is not None
+    assert tournament.game == "knowledge_quiz"
+    assert tournament.players[0]["name"] == "Original name"
+    assert tournament.players[0]["model"] == "model-a"
+    assert tournament.players[0]["move_timeout_seconds"] == 0.5
+    first_event = tournament.pairings[0].series.legs[0].events[0]
+    assert first_event.data["game_config"]["rounds"] == 1
+
+
+def test_round_robin_checkpoint_never_persists_profile_api_key(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "checkpoint-secret.db"
+    sentinel = "checkpoint-sensitive-sentinel-6e5d1f"
+    monkeypatch.setenv("CHECKPOINT_REMOTE_KEY", sentinel)
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.remote]
+provider = "openai"
+default_model = "remote-model"
+base_url = "https://remote.example/v1"
+api_key_env = "CHECKPOINT_REMOTE_KEY"
+display_name = "Remote"
+""",
+    )
+
+    async def interrupt_before_first_pairing(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            "llmolympic.cli.main.resume_round_robin",
+            interrupt_before_first_pairing,
+        )
+        try:
+            result = runner.invoke(
+                app,
+                [
+                    "round-robin",
+                    "--players",
+                    "profile:remote,mock:fixed,mock:illegal",
+                    "--rounds",
+                    "1",
+                    "--llm-timeout",
+                    "1",
+                    "--db",
+                    str(path),
+                ],
+            )
+        finally:
+            config.load_config.cache_clear()
+
+    assert result.exit_code == 130, result.output
+    tournament_id = _tournament_id_from_output(result.output)
+    checkpoint = SQLiteStore(path).get_tournament_checkpoint(tournament_id)
+    assert checkpoint is not None
+    assert checkpoint.players[0]["profile_id"] == "remote"
+    assert checkpoint.players[0]["model"] == "remote-model"
+    assert sentinel not in checkpoint.model_dump_json()
+    database_files = path.parent.glob(f"{path.name}*")
+    assert all(
+        sentinel.encode() not in database_file.read_bytes() for database_file in database_files
+    )
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        ["--game", "gomoku"],
+        ["--players", "mock:fixed,mock:random,mock:illegal"],
+        ["--rounds", "1"],
+        ["--seed", "1"],
+        ["--llm-timeout", "1"],
+        ["--no-llm-timeout"],
+        ["--allow-large-tournament"],
+    ],
+)
+def test_round_robin_resume_rejects_new_tournament_configuration_before_opening_database(
+    tmp_path,
+    conflict: list[str],
+) -> None:
+    path = tmp_path / "resume-conflict.db"
+
+    result = runner.invoke(
+        app,
+        ["round-robin", "--resume", "checkpoint-id", *conflict, "--db", str(path)],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 2
+    assert "配置已由检查点冻结" in output
+    assert "Traceback" not in output
+    assert not path.exists()
 
 
 def test_round_robin_board_game_roster_is_validated_as_two_player_pairs() -> None:

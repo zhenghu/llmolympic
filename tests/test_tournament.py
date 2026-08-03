@@ -11,7 +11,11 @@ from llmolympic.core.events import EventType
 from llmolympic.core.player import HumanPlayer, Player, PlayerProviderError
 from llmolympic.core.tournament import (
     TournamentArchive,
+    TournamentCheckpoint,
+    checkpoint_with_series,
     play_round_robin,
+    prepare_round_robin,
+    resume_round_robin,
     round_robin_pair_seed,
     tournament_from_series,
 )
@@ -424,3 +428,219 @@ def test_archive_rejects_unknown_field_and_legacy_source(
     legacy["source"] = "legacy"
     with pytest.raises(ValueError, match="local_engine|external"):
         TournamentArchive.model_validate(legacy)
+
+
+def test_prepare_round_robin_freezes_identity_config_and_schedule() -> None:
+    players = _players()
+    checkpoint = prepare_round_robin(
+        create_game("knowledge_quiz", rounds=1),
+        players,
+        seed=42,
+        max_attempts=2,
+        tournament_id="prepared-tournament",
+    )
+
+    assert checkpoint.tournament_id == "prepared-tournament"
+    assert checkpoint.game == "knowledge_quiz"
+    assert checkpoint.game_config == {"rounds": 1}
+    assert checkpoint.max_attempts == 2
+    assert checkpoint.players == tuple(player.describe() for player in players)
+    assert [spec.player_indices for spec in checkpoint.schedule] == [
+        (0, 1),
+        (0, 2),
+        (1, 2),
+    ]
+    assert [spec.pairing_number for spec in checkpoint.schedule] == [1, 2, 3]
+    assert [spec.seed for spec in checkpoint.schedule] == [
+        round_robin_pair_seed(42, *entrant_ids)
+        for entrant_ids in (
+            (players[0].entrant_id, players[1].entrant_id),
+            (players[0].entrant_id, players[2].entrant_id),
+            (players[1].entrant_id, players[2].entrant_id),
+        )
+    ]
+    assert checkpoint.completed_series == ()
+    assert checkpoint.points == {"甲": 0.0, "乙": 0.0, "丙": 0.0}
+    assert all(standing.series_played == 0 for standing in checkpoint.standings)
+    assert checkpoint.next_pairing_number == 1
+    assert not checkpoint.is_complete
+    assert TournamentCheckpoint.model_validate_json(checkpoint.model_dump_json()) == checkpoint
+
+
+def test_play_round_robin_checkpoints_before_events_and_after_each_series() -> None:
+    timeline = []
+    checkpoints = []
+
+    def save_checkpoint(checkpoint: TournamentCheckpoint) -> None:
+        checkpoints.append(checkpoint)
+        timeline.append(("checkpoint", len(checkpoint.completed_series)))
+
+    archive = asyncio.run(
+        play_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            _players(),
+            tournament_id="callback-tournament",
+            on_event=lambda pairing, leg, event: timeline.append(
+                ("event", pairing, leg, event.type)
+            ),
+            on_checkpoint=save_checkpoint,
+        )
+    )
+
+    assert timeline[0] == ("checkpoint", 0)
+    assert [len(checkpoint.completed_series) for checkpoint in checkpoints] == [0, 1, 2, 3]
+    assert {checkpoint.tournament_id for checkpoint in checkpoints} == {"callback-tournament"}
+    assert checkpoints[-1].is_complete
+    assert checkpoints[-1].next_pairing_number is None
+    assert checkpoints[-1].points == archive.points
+    assert checkpoints[-1].standings == archive.standings
+    assert archive.tournament_id == "callback-tournament"
+
+
+def test_resume_round_robin_skips_checkpointed_prefix_without_replaying_events() -> None:
+    class StopAfterFirstSeries(Exception):
+        pass
+
+    persisted_json: str | None = None
+    original_events = []
+
+    def interrupt_after_first(checkpoint: TournamentCheckpoint) -> None:
+        nonlocal persisted_json
+        persisted_json = checkpoint.model_dump_json()
+        if len(checkpoint.completed_series) == 1:
+            raise StopAfterFirstSeries
+
+    with pytest.raises(StopAfterFirstSeries):
+        asyncio.run(
+            play_round_robin(
+                create_game("knowledge_quiz", rounds=1),
+                _players(),
+                seed=42,
+                tournament_id="resumed-tournament",
+                on_event=lambda pairing, leg, event: original_events.append((pairing, leg, event)),
+                on_checkpoint=interrupt_after_first,
+            )
+        )
+
+    assert persisted_json is not None
+    assert {pairing for pairing, _, _ in original_events} == {1}
+    checkpoint = TournamentCheckpoint.model_validate_json(persisted_json)
+    assert len(checkpoint.completed_series) == 1
+    preserved_series_id = checkpoint.completed_series[0].series_id
+
+    resumed_events = []
+    resumed_checkpoints = []
+    resumed = asyncio.run(
+        resume_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            _players(),
+            checkpoint,
+            on_event=lambda pairing, leg, event: resumed_events.append((pairing, leg, event)),
+            on_checkpoint=resumed_checkpoints.append,
+        )
+    )
+    baseline = asyncio.run(
+        play_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            _players(),
+            seed=42,
+        )
+    )
+
+    assert {pairing for pairing, _, _ in resumed_events} == {2, 3}
+    assert [len(item.completed_series) for item in resumed_checkpoints] == [2, 3]
+    assert resumed.tournament_id == "resumed-tournament"
+    assert resumed.pairings[0].series.series_id == preserved_series_id
+    assert resumed.points == baseline.points
+    assert resumed.standings == baseline.standings
+
+
+def test_complete_checkpoint_resumes_without_events_or_checkpoint_callbacks() -> None:
+    checkpoints = []
+    asyncio.run(
+        play_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            _players(),
+            on_checkpoint=checkpoints.append,
+        )
+    )
+    complete = TournamentCheckpoint.model_validate_json(checkpoints[-1].model_dump_json())
+    events = []
+    repeated_checkpoints = []
+
+    archive = asyncio.run(
+        resume_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            _players(),
+            complete,
+            on_event=lambda pairing, leg, event: events.append((pairing, leg, event)),
+            on_checkpoint=repeated_checkpoints.append,
+        )
+    )
+
+    assert events == []
+    assert repeated_checkpoints == []
+    assert archive.tournament_id == complete.tournament_id
+    assert [pairing.series.series_id for pairing in archive.pairings] == [
+        series.series_id for series in complete.completed_series
+    ]
+
+
+def test_checkpoint_rejects_non_prefix_series_and_tampered_schedule() -> None:
+    players = _players()
+    empty = prepare_round_robin(
+        create_game("knowledge_quiz", rounds=1),
+        players,
+        seed=42,
+    )
+    completed = asyncio.run(
+        play_round_robin(
+            create_game("knowledge_quiz", rounds=1),
+            players,
+            seed=42,
+        )
+    )
+
+    with pytest.raises(ValueError, match="seed|选手"):
+        checkpoint_with_series(empty, completed.pairings[1].series)
+
+    first = checkpoint_with_series(empty, completed.pairings[0].series)
+    assert first.next_pairing_number == 2
+    assert first.points == completed.pairings[0].series.points | {"丙": 0.0}
+
+    tampered = empty.model_dump(mode="python")
+    tampered["schedule"][0]["seed"] += 1
+    with pytest.raises(ValueError, match="seed 与稳定身份"):
+        TournamentCheckpoint.model_validate(tampered)
+
+
+def test_resume_rejects_game_config_and_player_descriptor_changes_before_events() -> None:
+    checkpoint = prepare_round_robin(
+        create_game("knowledge_quiz", rounds=1),
+        _players(),
+    )
+    rendered = []
+
+    with pytest.raises(ValueError, match="项目配置"):
+        asyncio.run(
+            resume_round_robin(
+                create_game("knowledge_quiz", rounds=2),
+                _players(),
+                checkpoint,
+                on_event=lambda pairing, leg, event: rendered.append((pairing, leg, event)),
+            )
+        )
+    assert rendered == []
+
+    changed_players = _players()
+    changed_players[0].name = "甲改名"
+    with pytest.raises(ValueError, match="选手描述"):
+        asyncio.run(
+            resume_round_robin(
+                create_game("knowledge_quiz", rounds=1),
+                changed_players,
+                checkpoint,
+                on_event=lambda pairing, leg, event: rendered.append((pairing, leg, event)),
+            )
+        )
+    assert rendered == []
