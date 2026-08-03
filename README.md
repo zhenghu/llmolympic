@@ -141,6 +141,9 @@ llmolympic series --game gomoku --players mock:random,mock:fixed --seed 42
 llmolympic round-robin --game knowledge_quiz \
   --players profile:kimi,profile:deepseek,profile:local --rounds 5 --seed 42
 
+# 从开赛时显示的赛事 ID 恢复中断的循环赛（自定义数据库需再次指定）
+llmolympic round-robin --resume <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
+
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
 llmolympic play --game chess --players human:我,mock:random
 
@@ -202,11 +205,22 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 技术负和 ELO 净变化。排名依次按总局分、胜局数、较少技术负排序；完全同绩时
 仅用稳定 `entrant_id` 生成确定的展示顺序。
 
-循环赛当前串行执行并在全部完成后才原子存档，尚无中途检查点；`Ctrl-C`、进程或
-机器中断时，已跑的部分不会存档或计分。问答赛估算为
+循环赛会在首次 Provider 调用前创建 SQLite 检查点并显示赛事 ID、当前进度和
+完整恢复命令。每完成一组交换顺序双局赛就立即追加一个检查点；`Ctrl-C`、
+进程或机器中断后，使用 `round-robin --resume <TOURNAMENT_ID>` 会跳过已保存的完整
+对阵，从下一组继续。中断时尚未完成的当前一组不会保存，恢复时会整组重跑。
+
+恢复时不能重新指定 `--game`、`--players`、`--rounds`、`--seed` 或超时选项：
+项目配置、顺序敏感的选手身份和模型、seed、超时及赛程已由检查点冻结。Profile
+恢复规格会使用开赛时已解析的显式模型，因此之后修改 `default_model` 不会偷换参赛
+模型。检查点只保存无密钥的选手描述，不保存 API Key、Key 哈希或 Provider 客户端；
+恢复进程会从当前的环境变量和 Profile 配置重建 Provider，所需 Key 必须仍可用。如果新赛事
+使用了自定义 `--db`，恢复时也必须指向同一数据库。
+
+问答赛估算为
 `2*N*(N-1)*rounds` 个选手回合；16 人 × 100 轮为 48,000 回合，默认最多
 重试 3 次时理论上限为 144,000 次选手调用。超过保守阈值会在建库和调用前拒绝；
-确认费用、超时和中断风险后才使用 `--allow-large-tournament`，并先在 Provider
+确认费用和超时风险后才使用 `--allow-large-tournament`，并先在 Provider
 账户或网关设置整场费用上限。
 
 LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
@@ -228,10 +242,13 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 在 Provider 账户和网关侧设置费用、响应体及整场调用预算。
 
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO；
-`series` 把两局和批量 ELO 作为一个原子事务保存；`round-robin` 则把完整赛程、
-所有系列与对局、总局分和 ELO 变化一次性原子保存。循环赛以赛事开始前冻结
-的 ELO 为所有对局计算期望值；在给定同一组已完成对局结果时，ELO 聚合不受处理或
-保存顺序影响。对阵执行顺序仍可能影响有状态或随机 Provider 的实际输出。
+`series` 把两局和批量 ELO 作为一个原子事务保存；`round-robin` 把每个已完成的双局
+对阵作为不计分检查点原子追加，全部赛程完成后再在一个事务中封存正式赛事、
+系列、对局、总局分和 ELO 变化。检查点封存前不会出现在对局历史或榜单中，重复恢复/
+封存同一赛事也不会重复计分。循环赛在最终封存事务开始时读取并冻结当前 ELO，
+再为所有对局计算期望值；因此中断期间先落库的其他计分对局会先进入基准分。在给定
+同一组已完成对局结果和同一封存基准分时，ELO 聚合不受处理或保存顺序影响。对阵执行
+顺序仍可能影响有状态或随机 Provider 的实际输出。
 直接使用 Python 存储 API 时，`SQLiteStore.save_match()` / `save_series()` /
 `save_tournament()` 默认按外部导入处理，只存档、不计分；只有本地比赛引擎应显式传入
 `rating_source="engine"`，该参数是本进程内的信任声明，并非来源认证或数字签名。

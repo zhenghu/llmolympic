@@ -536,7 +536,7 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
     assert loaded.moves[0].reason == "测试拒绝"
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
 
@@ -797,7 +797,7 @@ def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> Non
     ]
     assert all(entry.games_played == 1 for entry in migrated.leaderboard())
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             connection.execute(
                 "SELECT archive_json FROM matches WHERE match_id = ?", (payload["match_id"],)
@@ -838,7 +838,7 @@ def test_v2_series_migration_preserves_raw_json_and_backfills_legacy_identity(
         legacy_entrant_id("乙"),
     }
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             connection.execute(
                 "SELECT series_json FROM series_archives WHERE series_id = ?",
@@ -1873,7 +1873,7 @@ def test_concurrent_v1_migration_is_serialized_and_idempotent(tmp_path) -> None:
 
     assert all(store.path == path.resolve() for store in stores)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

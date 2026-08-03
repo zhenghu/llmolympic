@@ -30,9 +30,15 @@ from llmolympic.core.archive import (
 from llmolympic.core.elo import DEFAULT_RATING, K_FACTOR, expected_score, update_ratings
 from llmolympic.core.events import EventType
 from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, head_to_head_point
-from llmolympic.core.tournament import TOURNAMENT_SCHEMA_VERSION, TournamentArchive
+from llmolympic.core.tournament import (
+    TOURNAMENT_CHECKPOINT_SCHEMA_VERSION,
+    TOURNAMENT_SCHEMA_VERSION,
+    TournamentArchive,
+    TournamentCheckpoint,
+    tournament_from_series,
+)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 RatingSource = Literal["engine", "imported"]
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
@@ -189,7 +195,7 @@ _V3_REQUIRED_COLUMNS = {
     },
 }
 
-_REQUIRED_COLUMNS = {
+_V4_REQUIRED_COLUMNS = {
     **_V3_REQUIRED_COLUMNS,
     "tournament_archives": {
         "tournament_id",
@@ -260,6 +266,40 @@ _REQUIRED_COLUMNS = {
         "opponent_frozen_rating",
         "expected_score",
         "rating_delta",
+    },
+}
+
+_REQUIRED_COLUMNS = {
+    **_V4_REQUIRED_COLUMNS,
+    "tournament_checkpoints": {
+        "tournament_id",
+        "schema_version",
+        "source",
+        "format",
+        "pairing_policy",
+        "seed_policy",
+        "game",
+        "seed",
+        "players_json",
+        "game_config_json",
+        "schedule_json",
+        "max_attempts",
+        "pairing_count",
+        "created_at",
+        "updated_at",
+        "status",
+        "finalized_at",
+        "final_tournament_id",
+        "config_json",
+    },
+    "tournament_checkpoint_series": {
+        "tournament_id",
+        "pairing_number",
+        "series_id",
+        "match_1_id",
+        "match_2_id",
+        "completed_at",
+        "series_json",
     },
 }
 
@@ -339,6 +379,10 @@ class TournamentIdCollisionError(StorageError):
     """A tournament id is already attached to a different archive."""
 
 
+class TournamentCheckpointCollisionError(StorageError):
+    """A tournament checkpoint id is attached to different configuration or progress."""
+
+
 class UnsupportedSchemaError(StorageError):
     """The database was created by a newer, unsupported schema version."""
 
@@ -398,6 +442,15 @@ class TournamentSaveResult:
     pairing_count: int
     match_count: int
     rating_changes: tuple[TournamentRatingChange, ...] = ()
+
+
+@dataclass(frozen=True)
+class TournamentCheckpointSaveResult:
+    """Result of creating or appending one resumable tournament checkpoint."""
+
+    inserted: bool
+    completed_pairing_count: int
+    pairing_count: int
 
 
 @dataclass(frozen=True)
@@ -632,8 +685,12 @@ class SQLiteStore:
                     self._migrate_to_v3(connection, include_series=True)
                 elif locked_version == 3:
                     self._verify_v3_schema(connection)
-                if locked_version < SCHEMA_VERSION:
+                elif locked_version == 4:
+                    self._verify_v4_schema(connection)
+                if locked_version < 4:
                     self._create_tournament_schema(connection)
+                if locked_version < 5:
+                    self._create_checkpoint_schema(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
                 if locked_version < SCHEMA_VERSION:
@@ -964,6 +1021,68 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _create_checkpoint_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_checkpoints (
+                tournament_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                source TEXT NOT NULL CHECK (source = 'local_engine'),
+                format TEXT NOT NULL CHECK (format = 'round_robin_two_leg'),
+                pairing_policy TEXT NOT NULL
+                    CHECK (pairing_policy = 'input_order_combinations_v1'),
+                seed_policy TEXT NOT NULL
+                    CHECK (seed_policy = 'entrant_pair_sha256_v1'),
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                game_config_json TEXT NOT NULL,
+                schedule_json TEXT NOT NULL,
+                max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+                pairing_count INTEGER NOT NULL CHECK (pairing_count >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'finalized')),
+                finalized_at TEXT,
+                final_tournament_id TEXT UNIQUE
+                    REFERENCES tournament_archives(tournament_id) ON DELETE RESTRICT,
+                config_json TEXT NOT NULL,
+                CHECK (
+                    (status = 'in_progress'
+                     AND finalized_at IS NULL
+                     AND final_tournament_id IS NULL)
+                    OR
+                    (status = 'finalized'
+                     AND finalized_at IS NOT NULL
+                     AND final_tournament_id = tournament_id)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tournament_checkpoints_updated_at_idx
+            ON tournament_checkpoints(status, updated_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_checkpoint_series (
+                tournament_id TEXT NOT NULL
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                pairing_number INTEGER NOT NULL CHECK (pairing_number >= 1),
+                series_id TEXT NOT NULL UNIQUE,
+                match_1_id TEXT NOT NULL UNIQUE,
+                match_2_id TEXT NOT NULL UNIQUE,
+                completed_at TEXT NOT NULL,
+                series_json TEXT NOT NULL,
+                PRIMARY KEY (tournament_id, pairing_number),
+                CHECK (match_1_id <> match_2_id)
+            )
+            """
+        )
+
+    @staticmethod
     def _migrate_to_v3(connection: sqlite3.Connection, *, include_series: bool) -> None:
         """Move name-keyed ratings to isolated legacy entrant identities atomically."""
 
@@ -1247,6 +1366,10 @@ class SQLiteStore:
         SQLiteStore._verify_required_columns(connection, _V3_REQUIRED_COLUMNS)
 
     @staticmethod
+    def _verify_v4_schema(connection: sqlite3.Connection) -> None:
+        SQLiteStore._verify_required_columns(connection, _V4_REQUIRED_COLUMNS)
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         SQLiteStore._verify_required_columns(connection, _REQUIRED_COLUMNS)
 
@@ -1431,6 +1554,27 @@ class SQLiteStore:
         except (TypeError, ValueError) as exc:
             raise StorageError("数据库中的循环赛档案 JSON 已损坏") from exc
         return _canonical_json(tournament.model_dump(mode="json"))
+
+    @staticmethod
+    def _checkpoint_config_payload(checkpoint: TournamentCheckpoint) -> dict:
+        payload = checkpoint.model_dump(mode="json")
+        payload.pop("completed_series")
+        payload.pop("updated_at")
+        return payload
+
+    @staticmethod
+    def _semantic_checkpoint_config_json(raw_json: str) -> str:
+        try:
+            payload = json.loads(raw_json)
+        except (TypeError, ValueError) as exc:
+            raise StorageError("数据库中的循环赛 checkpoint 配置 JSON 已损坏") from exc
+        if (
+            not isinstance(payload, dict)
+            or "completed_series" in payload
+            or "updated_at" in payload
+        ):
+            raise StorageError("数据库中的循环赛 checkpoint 配置 JSON 已损坏")
+        return _canonical_json(payload)
 
     @staticmethod
     def _semantic_descriptor_json(raw_json: str, *, legacy: bool) -> str:
@@ -1883,6 +2027,21 @@ class SQLiteStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            checkpoint_owner = connection.execute(
+                """
+                SELECT tcs.tournament_id
+                FROM tournament_checkpoint_series AS tcs
+                JOIN tournament_checkpoints AS tc
+                  ON tc.tournament_id = tcs.tournament_id
+                WHERE tc.status = 'in_progress'
+                  AND (tcs.match_1_id = ? OR tcs.match_2_id = ?)
+                """,
+                (archive.match_id, archive.match_id),
+            ).fetchone()
+            if checkpoint_owner is not None:
+                raise MatchIdCollisionError(
+                    f"match_id {archive.match_id!r} 已由进行中的循环赛 checkpoint 保留"
+                )
             existing = connection.execute(
                 """
                 SELECT match_id, schema_version, game, seed, players_json, scores_json,
@@ -2695,6 +2854,403 @@ class SQLiteStore:
             rated=rated,
         )
 
+    def _load_tournament_checkpoint(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+    ) -> tuple[TournamentCheckpoint, str] | None:
+        row = connection.execute(
+            """
+            SELECT tournament_id, schema_version, source, format,
+                   pairing_policy, seed_policy, game, seed, players_json,
+                   game_config_json, schedule_json, max_attempts,
+                   pairing_count, created_at, updated_at, status,
+                   finalized_at, final_tournament_id, config_json
+            FROM tournament_checkpoints
+            WHERE tournament_id = ?
+            """,
+            (tournament_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        series_rows = connection.execute(
+            """
+            SELECT pairing_number, series_id, match_1_id, match_2_id,
+                   completed_at, series_json
+            FROM tournament_checkpoint_series
+            WHERE tournament_id = ?
+            ORDER BY pairing_number
+            """,
+            (tournament_id,),
+        ).fetchall()
+        try:
+            semantic_config = self._semantic_checkpoint_config_json(row["config_json"])
+            config_payload = json.loads(row["config_json"])
+            completed_series: list[SeriesArchive] = []
+            for expected_pairing_number, series_row in enumerate(series_rows, start=1):
+                if series_row["pairing_number"] != expected_pairing_number:
+                    raise StorageError("已完成组编号不是连续前缀")
+                series = SeriesArchive.model_validate_json(series_row["series_json"])
+                series, _ = self._validate_series(series)
+                if (
+                    self._semantic_series_json(series_row["series_json"])
+                    != _canonical_json(series.model_dump(mode="json"))
+                    or series_row["series_id"] != series.series_id
+                    or series_row["match_1_id"] != series.legs[0].match_id
+                    or series_row["match_2_id"] != series.legs[1].match_id
+                    or not self._timestamp_matches(series_row["completed_at"], series.finished_at)
+                ):
+                    raise StorageError("已完成双局赛索引与档案不一致")
+                completed_series.append(series)
+
+            config_payload["completed_series"] = [
+                series.model_dump(mode="json") for series in completed_series
+            ]
+            config_payload["updated_at"] = row["updated_at"]
+            checkpoint = TournamentCheckpoint.model_validate(config_payload)
+            checkpoint, _ = self._validate_checkpoint(checkpoint)
+
+            payload = checkpoint.model_dump(mode="json")
+            stored_players = self._semantic_players_json(row["players_json"], legacy=False)
+            stored_game_config = self._semantic_json_column(row["game_config_json"])
+            stored_schedule = self._semantic_json_column(row["schedule_json"])
+            expected_config = _canonical_json(self._checkpoint_config_payload(checkpoint))
+        except (KeyError, TypeError, ValueError, StorageError) as exc:
+            raise StorageError(
+                f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 已损坏"
+            ) from exc
+
+        if (
+            semantic_config != expected_config
+            or row["tournament_id"] != checkpoint.tournament_id
+            or row["schema_version"] != checkpoint.schema_version
+            or row["source"] != checkpoint.source
+            or row["format"] != checkpoint.format
+            or row["pairing_policy"] != checkpoint.pairing_policy
+            or row["seed_policy"] != checkpoint.seed_policy
+            or row["game"] != checkpoint.game
+            or row["seed"] != checkpoint.seed
+            or stored_players != _canonical_json(payload["players"])
+            or stored_game_config != _canonical_json(payload["game_config"])
+            or stored_schedule != _canonical_json(payload["schedule"])
+            or row["max_attempts"] != checkpoint.max_attempts
+            or row["pairing_count"] != len(checkpoint.schedule)
+            or not self._timestamp_matches(row["created_at"], checkpoint.created_at)
+            or not self._timestamp_matches(row["updated_at"], checkpoint.updated_at)
+            or len(completed_series) > row["pairing_count"]
+        ):
+            raise StorageError(
+                f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 元数据已损坏"
+            )
+
+        status = row["status"]
+        if status == "in_progress":
+            if row["finalized_at"] is not None or row["final_tournament_id"] is not None:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
+                )
+        elif status == "finalized":
+            if (
+                row["final_tournament_id"] != tournament_id
+                or not checkpoint.is_complete
+                or not isinstance(row["finalized_at"], str)
+            ):
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
+                )
+            try:
+                finalized_at = datetime.fromisoformat(row["finalized_at"])
+            except ValueError as exc:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
+                ) from exc
+            if finalized_at.utcoffset() is None:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
+                )
+            final_row = connection.execute(
+                """
+                SELECT tournament_json FROM tournament_archives
+                WHERE tournament_id = ?
+                """,
+                (tournament_id,),
+            ).fetchone()
+            if final_row is None:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的正式循环赛档案已丢失"
+                )
+            expected_tournament = tournament_from_series(
+                checkpoint.players,
+                checkpoint.completed_series,
+                seed=checkpoint.seed,
+                tournament_id=checkpoint.tournament_id,
+            )
+            try:
+                stored_tournament = self._semantic_tournament_json(final_row["tournament_json"])
+            except StorageError as exc:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的正式循环赛档案已损坏"
+                ) from exc
+            if stored_tournament != _canonical_json(expected_tournament.model_dump(mode="json")):
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament_id!r} 的正式循环赛档案已损坏"
+                )
+        else:
+            raise StorageError(f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏")
+        return checkpoint, status
+
+    def save_tournament_checkpoint(
+        self,
+        checkpoint: TournamentCheckpoint,
+    ) -> TournamentCheckpointSaveResult:
+        """Create or atomically append one complete series to a checkpoint prefix."""
+
+        checkpoint, _ = self._validate_checkpoint(checkpoint)
+        payload = checkpoint.model_dump(mode="json")
+        config_json = _canonical_json(self._checkpoint_config_payload(checkpoint))
+        pairing_count = len(checkpoint.schedule)
+        completed_count = len(checkpoint.completed_series)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            loaded = self._load_tournament_checkpoint(
+                connection,
+                checkpoint.tournament_id,
+            )
+            if loaded is None:
+                if completed_count:
+                    raise StorageError("新循环赛 checkpoint 必须在第一组开始前以空进度创建")
+                if connection.execute(
+                    "SELECT 1 FROM tournament_archives WHERE tournament_id = ?",
+                    (checkpoint.tournament_id,),
+                ).fetchone():
+                    raise TournamentCheckpointCollisionError(
+                        f"tournament_id {checkpoint.tournament_id!r} 已有正式循环赛档案"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO tournament_checkpoints (
+                        tournament_id, schema_version, source, format,
+                        pairing_policy, seed_policy, game, seed, players_json,
+                        game_config_json, schedule_json, max_attempts,
+                        pairing_count, created_at, updated_at, status,
+                        finalized_at, final_tournament_id, config_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                    """,
+                    (
+                        checkpoint.tournament_id,
+                        checkpoint.schema_version,
+                        checkpoint.source,
+                        checkpoint.format,
+                        checkpoint.pairing_policy,
+                        checkpoint.seed_policy,
+                        checkpoint.game,
+                        checkpoint.seed,
+                        _canonical_json(payload["players"]),
+                        _canonical_json(payload["game_config"]),
+                        _canonical_json(payload["schedule"]),
+                        checkpoint.max_attempts,
+                        pairing_count,
+                        checkpoint.created_at.astimezone(UTC).isoformat(),
+                        checkpoint.updated_at.astimezone(UTC).isoformat(),
+                        "in_progress",
+                        config_json,
+                    ),
+                )
+                connection.commit()
+                return TournamentCheckpointSaveResult(
+                    inserted=True,
+                    completed_pairing_count=0,
+                    pairing_count=pairing_count,
+                )
+
+            stored, status = loaded
+            stored_config_json = _canonical_json(self._checkpoint_config_payload(stored))
+            if stored_config_json != config_json:
+                raise TournamentCheckpointCollisionError(
+                    f"tournament_id {checkpoint.tournament_id!r} 已对应另一份 checkpoint 配置"
+                )
+            stored_series_json = tuple(
+                _canonical_json(series.model_dump(mode="json"))
+                for series in stored.completed_series
+            )
+            incoming_series_json = tuple(
+                _canonical_json(series.model_dump(mode="json"))
+                for series in checkpoint.completed_series
+            )
+            stored_count = len(stored.completed_series)
+            if incoming_series_json == stored_series_json:
+                connection.commit()
+                return TournamentCheckpointSaveResult(
+                    inserted=False,
+                    completed_pairing_count=stored_count,
+                    pairing_count=pairing_count,
+                )
+            if status != "in_progress":
+                raise TournamentCheckpointCollisionError(
+                    f"tournament_id {checkpoint.tournament_id!r} 的 checkpoint 已封存"
+                )
+            if (
+                completed_count != stored_count + 1
+                or incoming_series_json[:stored_count] != stored_series_json
+            ):
+                raise TournamentCheckpointCollisionError(
+                    "循环赛 checkpoint 只能按赛程连续追加恰好一组双局赛"
+                )
+
+            series = checkpoint.completed_series[-1]
+            if (
+                connection.execute(
+                    "SELECT 1 FROM series_archives WHERE series_id = ?",
+                    (series.series_id,),
+                ).fetchone()
+                or connection.execute(
+                    "SELECT 1 FROM tournament_checkpoint_series WHERE series_id = ?",
+                    (series.series_id,),
+                ).fetchone()
+            ):
+                raise SeriesIdCollisionError(f"series_id {series.series_id!r} 已存档")
+            match_ids = (series.legs[0].match_id, series.legs[1].match_id)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM matches WHERE match_id IN (?, ?)",
+                    match_ids,
+                ).fetchone()
+                or connection.execute(
+                    """
+                SELECT 1 FROM tournament_checkpoint_series
+                WHERE match_1_id IN (?, ?)
+                   OR match_2_id IN (?, ?)
+                """,
+                    (*match_ids, *match_ids),
+                ).fetchone()
+            ):
+                raise MatchIdCollisionError("循环赛 checkpoint 的 match_id 已存档")
+
+            connection.execute(
+                """
+                INSERT INTO tournament_checkpoint_series (
+                    tournament_id, pairing_number, series_id, match_1_id,
+                    match_2_id, completed_at, series_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint.tournament_id,
+                    completed_count,
+                    series.series_id,
+                    match_ids[0],
+                    match_ids[1],
+                    series.finished_at.astimezone(UTC).isoformat(),
+                    incoming_series_json[-1],
+                ),
+            )
+            updated = connection.execute(
+                """
+                UPDATE tournament_checkpoints
+                SET updated_at = ?
+                WHERE tournament_id = ? AND status = 'in_progress'
+                """,
+                (
+                    checkpoint.updated_at.astimezone(UTC).isoformat(),
+                    checkpoint.tournament_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StorageError("循环赛 checkpoint 状态发生并发变化")
+            connection.commit()
+            return TournamentCheckpointSaveResult(
+                inserted=True,
+                completed_pairing_count=completed_count,
+                pairing_count=pairing_count,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_tournament_checkpoint(
+        self,
+        tournament_id: str,
+    ) -> TournamentCheckpoint | None:
+        """Load and deeply validate one resumable tournament checkpoint."""
+
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            try:
+                loaded = self._load_tournament_checkpoint(connection, tournament_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return None if loaded is None else loaded[0]
+
+    def finalize_tournament_checkpoint(
+        self,
+        tournament_id: str,
+    ) -> TournamentSaveResult:
+        """Atomically promote a complete checkpoint and apply tournament ELO once."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            loaded = self._load_tournament_checkpoint(connection, tournament_id)
+            if loaded is None:
+                raise StorageError(f"循环赛 checkpoint {tournament_id!r} 不存在")
+            checkpoint, status = loaded
+            if not checkpoint.is_complete:
+                raise StorageError("循环赛 checkpoint 尚未完成，不能封存")
+            tournament = tournament_from_series(
+                checkpoint.players,
+                checkpoint.completed_series,
+                seed=checkpoint.seed,
+                tournament_id=checkpoint.tournament_id,
+            )
+            if (
+                status == "in_progress"
+                and connection.execute(
+                    "SELECT 1 FROM tournament_archives WHERE tournament_id = ?",
+                    (tournament_id,),
+                ).fetchone()
+            ):
+                raise StorageError("进行中的 checkpoint 已存在同 ID 正式循环赛档案")
+
+            result = self._save_tournament_in_transaction(
+                connection,
+                tournament,
+                rating_source="engine",
+                checkpoint_owner_id=tournament_id,
+            )
+            if status == "in_progress":
+                if not result.inserted:
+                    raise StorageError("进行中的 checkpoint 未能创建正式循环赛档案")
+                updated = connection.execute(
+                    """
+                    UPDATE tournament_checkpoints
+                    SET status = 'finalized', finalized_at = ?,
+                        final_tournament_id = ?
+                    WHERE tournament_id = ? AND status = 'in_progress'
+                    """,
+                    (
+                        datetime.now(UTC).isoformat(),
+                        tournament_id,
+                        tournament_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise StorageError("循环赛 checkpoint 状态发生并发变化")
+            elif result.inserted:
+                raise StorageError("已封存 checkpoint 的正式循环赛档案状态已损坏")
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def save_tournament(
         self,
         tournament: TournamentArchive,
@@ -2703,6 +3259,34 @@ class SQLiteStore:
     ) -> TournamentSaveResult:
         """Atomically persist and batch-rate one complete round-robin tournament."""
 
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            result = self._save_tournament_in_transaction(
+                connection,
+                tournament,
+                rating_source=rating_source,
+            )
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _save_tournament_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        tournament: TournamentArchive,
+        *,
+        rating_source: RatingSource,
+        checkpoint_owner_id: str | None = None,
+    ) -> TournamentSaveResult:
+        """Persist a complete tournament using the caller's active write transaction."""
+
+        if not connection.in_transaction:
+            raise StorageError("保存循环赛需要调用方先开启 SQLite 写事务")
         rating_source = self._validate_rating_source(rating_source)
         tournament, entrants = self._validate_tournament(tournament)
         trusted_engine = (
@@ -2717,9 +3301,22 @@ class SQLiteStore:
         pairing_count = len(tournament.pairings)
         match_count = pairing_count * 2
 
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
+        def persist() -> TournamentSaveResult:
+            checkpoint_row = connection.execute(
+                """
+                SELECT status FROM tournament_checkpoints
+                WHERE tournament_id = ?
+                """,
+                (tournament.tournament_id,),
+            ).fetchone()
+            if (
+                checkpoint_row is not None
+                and checkpoint_row["status"] == "in_progress"
+                and checkpoint_owner_id != tournament.tournament_id
+            ):
+                raise TournamentIdCollisionError(
+                    f"tournament_id {tournament.tournament_id!r} 已由进行中的循环赛 checkpoint 保留"
+                )
             existing = connection.execute(
                 """
                 SELECT tournament_json, archive_source, rating_source, rated,
@@ -2776,7 +3373,6 @@ class SQLiteStore:
                     rated=stored_rated,
                     rating_policy=existing["rating_policy"],
                 )
-                connection.commit()
                 return TournamentSaveResult(
                     inserted=False,
                     rated=stored_rated,
@@ -2786,6 +3382,23 @@ class SQLiteStore:
 
             for pairing in tournament.pairings:
                 series = pairing.series
+                checkpoint_series_owner = connection.execute(
+                    """
+                    SELECT tcs.tournament_id
+                    FROM tournament_checkpoint_series AS tcs
+                    JOIN tournament_checkpoints AS tc
+                      ON tc.tournament_id = tcs.tournament_id
+                    WHERE tc.status = 'in_progress' AND tcs.series_id = ?
+                    """,
+                    (series.series_id,),
+                ).fetchone()
+                if (
+                    checkpoint_series_owner is not None
+                    and checkpoint_series_owner["tournament_id"] != checkpoint_owner_id
+                ):
+                    raise SeriesIdCollisionError(
+                        f"series_id {series.series_id!r} 已由进行中的循环赛 checkpoint 保留"
+                    )
                 if connection.execute(
                     "SELECT 1 FROM series_archives WHERE series_id = ?",
                     (series.series_id,),
@@ -2794,6 +3407,24 @@ class SQLiteStore:
                         f"series_id {series.series_id!r} 已存档，不能重复归入循环赛"
                     )
                 for leg in series.legs:
+                    checkpoint_match_owner = connection.execute(
+                        """
+                        SELECT tcs.tournament_id
+                        FROM tournament_checkpoint_series AS tcs
+                        JOIN tournament_checkpoints AS tc
+                          ON tc.tournament_id = tcs.tournament_id
+                        WHERE tc.status = 'in_progress'
+                          AND (tcs.match_1_id = ? OR tcs.match_2_id = ?)
+                        """,
+                        (leg.match_id, leg.match_id),
+                    ).fetchone()
+                    if (
+                        checkpoint_match_owner is not None
+                        and checkpoint_match_owner["tournament_id"] != checkpoint_owner_id
+                    ):
+                        raise MatchIdCollisionError(
+                            f"match_id {leg.match_id!r} 已由进行中的循环赛 checkpoint 保留"
+                        )
                     if connection.execute(
                         "SELECT 1 FROM matches WHERE match_id = ?",
                         (leg.match_id,),
@@ -2909,7 +3540,6 @@ class SQLiteStore:
                     entrants,
                 )
 
-            connection.commit()
             return TournamentSaveResult(
                 inserted=True,
                 rated=rated,
@@ -2917,11 +3547,8 @@ class SQLiteStore:
                 match_count=match_count,
                 rating_changes=tuple(rating_changes),
             )
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+
+        return persist()
 
     def save_series(
         self,
@@ -2954,6 +3581,36 @@ class SQLiteStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            checkpoint_owner = connection.execute(
+                """
+                SELECT tcs.tournament_id
+                FROM tournament_checkpoint_series AS tcs
+                JOIN tournament_checkpoints AS tc
+                  ON tc.tournament_id = tcs.tournament_id
+                WHERE tc.status = 'in_progress' AND tcs.series_id = ?
+                """,
+                (series.series_id,),
+            ).fetchone()
+            if checkpoint_owner is not None:
+                raise SeriesIdCollisionError(
+                    f"series_id {series.series_id!r} 已由进行中的循环赛 checkpoint 保留"
+                )
+            for leg in series.legs:
+                checkpoint_match_owner = connection.execute(
+                    """
+                    SELECT tcs.tournament_id
+                    FROM tournament_checkpoint_series AS tcs
+                    JOIN tournament_checkpoints AS tc
+                      ON tc.tournament_id = tcs.tournament_id
+                    WHERE tc.status = 'in_progress'
+                      AND (tcs.match_1_id = ? OR tcs.match_2_id = ?)
+                    """,
+                    (leg.match_id, leg.match_id),
+                ).fetchone()
+                if checkpoint_match_owner is not None:
+                    raise MatchIdCollisionError(
+                        f"match_id {leg.match_id!r} 已由进行中的循环赛 checkpoint 保留"
+                    )
             existing = connection.execute(
                 """
                 SELECT series_json, archive_source, rating_source, rated, rating_policy
@@ -3285,6 +3942,27 @@ class SQLiteStore:
                     raise StorageError(f"数据库中 series_id {series.series_id!r} 的 ELO 历史已损坏")
                 running_a = next_a
                 running_b = next_b
+
+    def _validate_checkpoint(
+        self, checkpoint: TournamentCheckpoint
+    ) -> tuple[TournamentCheckpoint, tuple[_EntrantRef, ...]]:
+        if checkpoint.schema_version != TOURNAMENT_CHECKPOINT_SCHEMA_VERSION:
+            raise StorageError(
+                f"不支持循环赛 checkpoint 版本 {checkpoint.schema_version}；"
+                f"当前支持 {TOURNAMENT_CHECKPOINT_SCHEMA_VERSION}"
+            )
+        try:
+            validated = TournamentCheckpoint.model_validate(checkpoint.model_dump(mode="python"))
+        except (TypeError, ValueError) as exc:
+            raise StorageError(f"循环赛 checkpoint 无效：{exc}") from exc
+        entrants = tuple(
+            self._entrant_ref(descriptor, legacy=False) for descriptor in validated.players
+        )
+        if len({entrant.entrant_id for entrant in entrants}) != len(entrants):
+            raise StorageError("循环赛 checkpoint 中的 entrant_id 必须唯一")
+        for series in validated.completed_series:
+            self._validate_series(series)
+        return validated, entrants
 
     def _validate_tournament(
         self, tournament: TournamentArchive
@@ -3860,7 +4538,7 @@ class SQLiteStore:
                 wins = ratings.wins + excluded.wins,
                 draws = ratings.draws + excluded.draws,
                 losses = ratings.losses + excluded.losses,
-                updated_at = excluded.updated_at
+                updated_at = MAX(ratings.updated_at, excluded.updated_at)
             """,
             (
                 rating_scope,

@@ -1,4 +1,4 @@
-"""SQLite v4 round-robin persistence and frozen-ELO tests."""
+"""SQLite v5 round-robin persistence, checkpoints, and frozen-ELO tests."""
 
 from __future__ import annotations
 
@@ -14,12 +14,15 @@ from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.series import series_from_legs
 from llmolympic.core.storage import (
     MatchIdCollisionError,
+    SeriesIdCollisionError,
     SQLiteStore,
     StorageError,
+    TournamentCheckpointCollisionError,
     TournamentIdCollisionError,
 )
 from llmolympic.core.tournament import (
     TournamentArchive,
+    TournamentCheckpoint,
     round_robin_pair_seed,
     tournament_from_series,
 )
@@ -150,6 +153,35 @@ def _seed_unequal_ratings(store: SQLiteStore) -> None:
         )
 
 
+def _checkpoint(
+    tournament: TournamentArchive,
+    completed_count: int = 0,
+    *,
+    game_config: dict | None = None,
+) -> TournamentCheckpoint:
+    completed_series = tuple(pairing.series for pairing in tournament.pairings[:completed_count])
+    created_at = tournament.started_at - timedelta(seconds=1)
+    return TournamentCheckpoint(
+        tournament_id=tournament.tournament_id,
+        game=tournament.game,
+        game_config={} if game_config is None else game_config,
+        seed=tournament.seed,
+        max_attempts=3,
+        players=tournament.players,
+        schedule=tuple(
+            {
+                "pairing_number": pairing.pairing_number,
+                "player_indices": pairing.player_indices,
+                "seed": pairing.seed,
+            }
+            for pairing in tournament.pairings
+        ),
+        completed_series=completed_series,
+        created_at=created_at,
+        updated_at=(created_at if not completed_series else completed_series[-1].finished_at),
+    )
+
+
 def test_tournament_save_round_trip_and_frozen_rating_ledger(tmp_path) -> None:
     path = tmp_path / "tournament.db"
     tournament = _tournament()
@@ -172,7 +204,7 @@ def test_tournament_save_round_trip_and_frozen_rating_ledger(tmp_path) -> None:
     assert all(entry.games_played == 4 for entry in store.leaderboard())
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT count(*) FROM tournament_archives").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM tournament_pairings").fetchone()[0] == 3
         assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 3
@@ -187,6 +219,273 @@ def test_tournament_save_round_trip_and_frozen_rating_ledger(tmp_path) -> None:
             == 24
         )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_checkpoint_prefix_reopens_finalizes_and_rates_exactly_once(tmp_path) -> None:
+    path = tmp_path / "checkpoint.db"
+    tournament = _tournament(tournament_id="checkpoint-tournament")
+    store = SQLiteStore(path)
+
+    created = store.save_tournament_checkpoint(_checkpoint(tournament))
+
+    assert created.inserted
+    assert created.completed_pairing_count == 0
+    assert created.pairing_count == 3
+    assert store.get_tournament(tournament.tournament_id) is None
+    assert store.leaderboard() == []
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM matches").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 0
+        config_json = connection.execute(
+            "SELECT config_json FROM tournament_checkpoints"
+        ).fetchone()[0]
+        assert "completed_series" not in config_json
+
+    for completed_count in range(1, 4):
+        result = SQLiteStore(path, create=False).save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count)
+        )
+        assert result.inserted
+        assert result.completed_pairing_count == completed_count
+        reopened = SQLiteStore(path, create=False).get_tournament_checkpoint(
+            tournament.tournament_id
+        )
+        assert reopened is not None
+        assert len(reopened.completed_series) == completed_count
+        assert reopened.model_dump(mode="json") == _checkpoint(
+            tournament, completed_count
+        ).model_dump(mode="json")
+
+    finalized = SQLiteStore(path, create=False).finalize_tournament_checkpoint(
+        tournament.tournament_id
+    )
+
+    assert finalized.inserted and finalized.rated
+    loaded = SQLiteStore(path, create=False).get_tournament(tournament.tournament_id)
+    assert loaded is not None
+    assert loaded.model_dump(mode="json") == tournament.model_dump(mode="json")
+    with sqlite3.connect(path) as connection:
+        counts_before = {
+            table: connection.execute(
+                f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed allowlist
+            ).fetchone()[0]
+            for table in (
+                "matches",
+                "series_archives",
+                "rating_history",
+                "tournament_rating_snapshots",
+                "tournament_rating_contributions",
+            )
+        }
+        assert (
+            connection.execute("SELECT status FROM tournament_checkpoints").fetchone()[0]
+            == "finalized"
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM tournament_checkpoint_series").fetchone()[0]
+            == 3
+        )
+
+    repeated = SQLiteStore(path, create=False).finalize_tournament_checkpoint(
+        tournament.tournament_id
+    )
+
+    assert not repeated.inserted and repeated.rated
+    with sqlite3.connect(path) as connection:
+        assert {
+            table: connection.execute(
+                f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed allowlist
+            ).fetchone()[0]
+            for table in counts_before
+        } == counts_before
+
+
+def test_checkpoint_append_is_idempotent_and_rejects_non_contiguous_progress(
+    tmp_path,
+) -> None:
+    store = SQLiteStore(tmp_path / "checkpoint-prefix.db")
+    tournament = _tournament(tournament_id="prefix-checkpoint")
+    empty = _checkpoint(tournament)
+
+    assert store.save_tournament_checkpoint(empty).inserted
+    assert not store.save_tournament_checkpoint(empty).inserted
+    with pytest.raises(TournamentCheckpointCollisionError, match="连续追加"):
+        store.save_tournament_checkpoint(_checkpoint(tournament, 2))
+    with pytest.raises(TournamentCheckpointCollisionError, match="另一份 checkpoint 配置"):
+        store.save_tournament_checkpoint(_checkpoint(tournament, game_config={"rounds": 99}))
+
+    first = _checkpoint(tournament, 1)
+    assert store.save_tournament_checkpoint(first).inserted
+    assert not store.save_tournament_checkpoint(first).inserted
+    with pytest.raises(MatchIdCollisionError, match="checkpoint 保留"):
+        store.save_match(tournament.pairings[0].series.legs[0], rating_source="engine")
+    with pytest.raises(SeriesIdCollisionError, match="checkpoint 保留"):
+        store.save_series(tournament.pairings[0].series, rating_source="engine")
+    reused_match_series = tournament.pairings[0].series.model_copy(
+        update={"series_id": "different-series-with-reserved-match"}
+    )
+    with pytest.raises(MatchIdCollisionError, match="checkpoint 保留"):
+        store.save_series(reused_match_series, rating_source="engine")
+    with pytest.raises(TournamentIdCollisionError, match="checkpoint 保留"):
+        store.save_tournament(tournament, rating_source="engine")
+    assert store.get_tournament(tournament.tournament_id) is None
+    assert store.leaderboard() == []
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM matches").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 0
+
+
+def test_incomplete_checkpoint_cannot_finalize(tmp_path) -> None:
+    path = tmp_path / "incomplete-checkpoint.db"
+    tournament = _tournament(tournament_id="incomplete-checkpoint")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+
+    with pytest.raises(StorageError, match="尚未完成"):
+        store.finalize_tournament_checkpoint(tournament.tournament_id)
+
+    assert store.get_tournament(tournament.tournament_id) is None
+    assert store.leaderboard() == []
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM matches").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT status FROM tournament_checkpoints").fetchone()[0]
+            == "in_progress"
+        )
+
+
+def test_checkpoint_finalize_failure_rolls_back_archive_elo_and_status(tmp_path) -> None:
+    class FailingStore(SQLiteStore):
+        def _record_tournament_ratings(self, *args, **kwargs):
+            super()._record_tournament_ratings(*args, **kwargs)
+            raise RuntimeError("injected checkpoint finalize failure")
+
+    path = tmp_path / "checkpoint-finalize-rollback.db"
+    tournament = _tournament(tournament_id="rollback-checkpoint")
+    store = FailingStore(path)
+    for completed_count in range(4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+
+    with pytest.raises(RuntimeError, match="injected checkpoint finalize failure"):
+        store.finalize_tournament_checkpoint(tournament.tournament_id)
+
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute("SELECT status FROM tournament_checkpoints").fetchone()[0]
+            == "in_progress"
+        )
+        for table in (
+            "tournament_archives",
+            "tournament_entrants",
+            "tournament_pairings",
+            "series_archives",
+            "matches",
+            "rating_history",
+            "tournament_rating_snapshots",
+            "tournament_rating_contributions",
+        ):
+            assert (
+                connection.execute(
+                    f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed allowlist
+                ).fetchone()[0]
+                == 0
+            )
+
+    recovered = SQLiteStore(path, create=False).finalize_tournament_checkpoint(
+        tournament.tournament_id
+    )
+    assert recovered.inserted and recovered.rated
+
+
+def test_concurrent_checkpoint_finalize_rates_exactly_once(tmp_path) -> None:
+    path = tmp_path / "concurrent-checkpoint-finalize.db"
+    tournament = _tournament(tournament_id="concurrent-checkpoint")
+    store = SQLiteStore(path)
+    for completed_count in range(4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+
+    def finalize(_: int):
+        return SQLiteStore(path, create=False).finalize_tournament_checkpoint(
+            tournament.tournament_id
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(finalize, range(4)))
+
+    assert sum(result.inserted for result in results) == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 24
+
+
+def test_checkpoint_finalize_freezes_ratings_at_finalization_time(tmp_path) -> None:
+    path = tmp_path / "checkpoint-finalization-ratings.db"
+    tournament = _tournament(tournament_id="finalization-ratings-checkpoint")
+    store = SQLiteStore(path)
+    for completed_count in range(4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+
+    store.save_match(
+        _match(
+            match_id="rated-between-checkpoint-and-finalize",
+            seed=99,
+            players=(_descriptor("A"), _descriptor("B")),
+            winner="A",
+            started_at=tournament.finished_at + timedelta(minutes=1),
+            source="local_engine",
+        ),
+        rating_source="engine",
+    )
+    leaderboard_before_finalize = {entry.entrant_id: entry for entry in store.leaderboard()}
+    ratings_before_finalize = {
+        entrant_id: entry.rating for entrant_id, entry in leaderboard_before_finalize.items()
+    }
+
+    store.finalize_tournament_checkpoint(tournament.tournament_id)
+
+    leaderboard_after_finalize = {entry.entrant_id: entry for entry in store.leaderboard()}
+    for entrant_id, entry in leaderboard_before_finalize.items():
+        assert leaderboard_after_finalize[entrant_id].updated_at >= entry.updated_at
+
+    with sqlite3.connect(path) as connection:
+        snapshot_rows = connection.execute(
+            """
+            SELECT entrant_id, rating_before
+            FROM tournament_rating_snapshots
+            WHERE tournament_id = ? AND rating_scope = 'overall' AND game = ''
+            """,
+            (tournament.tournament_id,),
+        ).fetchall()
+    assert dict(snapshot_rows) == pytest.approx(
+        {
+            descriptor["entrant_id"]: ratings_before_finalize.get(
+                descriptor["entrant_id"],
+                1500.0,
+            )
+            for descriptor in tournament.players
+        }
+    )
+
+
+def test_corrupt_checkpoint_series_is_rejected_on_reopen(tmp_path) -> None:
+    path = tmp_path / "corrupt-checkpoint.db"
+    tournament = _tournament(tournament_id="corrupt-checkpoint")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE tournament_checkpoint_series
+            SET series_json = '{"broken":true}'
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        )
+
+    with pytest.raises(StorageError, match="checkpoint 已损坏"):
+        SQLiteStore(path, create=False).get_tournament_checkpoint(tournament.tournament_id)
 
 
 def test_tournament_and_owned_children_are_idempotent_and_deeply_verified(tmp_path) -> None:
@@ -462,7 +761,7 @@ def test_concurrent_duplicate_tournament_saves_rate_exactly_once(tmp_path) -> No
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 24
 
 
-def test_v3_database_migrates_to_v4_without_rewriting_existing_data(tmp_path) -> None:
+def test_v3_database_migrates_to_v5_without_rewriting_existing_data(tmp_path) -> None:
     path = tmp_path / "migrate-v3.db"
     store = SQLiteStore(path)
     archive = _match(
@@ -490,6 +789,8 @@ def test_v3_database_migrates_to_v4_without_rewriting_existing_data(tmp_path) ->
         ).fetchall()
         connection.executescript(
             """
+            DROP TABLE tournament_checkpoint_series;
+            DROP TABLE tournament_checkpoints;
             DROP TABLE tournament_rating_contributions;
             DROP TABLE tournament_rating_snapshots;
             DROP TABLE tournament_pairings;
@@ -503,7 +804,7 @@ def test_v3_database_migrates_to_v4_without_rewriting_existing_data(tmp_path) ->
 
     assert migrated.get_match(archive.match_id) is not None
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert (
             connection.execute(
                 "SELECT archive_json FROM matches WHERE match_id = ?",
@@ -529,7 +830,105 @@ def test_v3_database_migrates_to_v4_without_rewriting_existing_data(tmp_path) ->
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_failed_v3_to_v4_migration_rolls_back_schema_and_version(
+def test_v4_database_migrates_to_v5_without_rewriting_tournament_or_elo(
+    tmp_path,
+) -> None:
+    path = tmp_path / "migrate-v4.db"
+    tournament = _tournament(tournament_id="before-v5")
+    SQLiteStore(path).save_tournament(tournament, rating_source="engine")
+    with sqlite3.connect(path) as connection:
+        tournament_json = connection.execute(
+            "SELECT tournament_json FROM tournament_archives"
+        ).fetchone()[0]
+        ratings_before = connection.execute(
+            "SELECT * FROM ratings ORDER BY rating_scope, game, entrant_id"
+        ).fetchall()
+        history_before = connection.execute(
+            """
+            SELECT * FROM rating_history
+            ORDER BY match_id, rating_scope, game, entrant_id
+            """
+        ).fetchall()
+        connection.executescript(
+            """
+            DROP TABLE tournament_checkpoint_series;
+            DROP TABLE tournament_checkpoints;
+            PRAGMA user_version = 4;
+            """
+        )
+
+    migrated = SQLiteStore(path, create=False)
+
+    assert migrated.get_tournament(tournament.tournament_id) is not None
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            connection.execute("SELECT tournament_json FROM tournament_archives").fetchone()[0]
+            == tournament_json
+        )
+        assert (
+            connection.execute(
+                "SELECT * FROM ratings ORDER BY rating_scope, game, entrant_id"
+            ).fetchall()
+            == ratings_before
+        )
+        assert (
+            connection.execute(
+                """
+            SELECT * FROM rating_history
+            ORDER BY match_id, rating_scope, game, entrant_id
+            """
+            ).fetchall()
+            == history_before
+        )
+        assert connection.execute("SELECT count(*) FROM tournament_checkpoints").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_failed_v4_to_v5_migration_rolls_back_schema_and_version(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "failed-v4-migration.db"
+    SQLiteStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE tournament_checkpoint_series;
+            DROP TABLE tournament_checkpoints;
+            PRAGMA user_version = 4;
+            """
+        )
+    original_create = SQLiteStore._create_checkpoint_schema
+
+    def fail_after_create(connection: sqlite3.Connection) -> None:
+        original_create(connection)
+        raise RuntimeError("injected checkpoint migration failure")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_create_checkpoint_schema",
+        staticmethod(fail_after_create),
+    )
+
+    with pytest.raises(RuntimeError, match="injected checkpoint migration failure"):
+        SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        for table in ("tournament_checkpoints", "tournament_checkpoint_series"):
+            assert (
+                connection.execute(
+                    """
+                SELECT count(*) FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """,
+                    (table,),
+                ).fetchone()[0]
+                == 0
+            )
+
+
+def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "failed-v3-migration.db"
@@ -537,6 +936,8 @@ def test_failed_v3_to_v4_migration_rolls_back_schema_and_version(
     with sqlite3.connect(path) as connection:
         connection.executescript(
             """
+            DROP TABLE tournament_checkpoint_series;
+            DROP TABLE tournament_checkpoints;
             DROP TABLE tournament_rating_contributions;
             DROP TABLE tournament_rating_snapshots;
             DROP TABLE tournament_pairings;
@@ -549,7 +950,7 @@ def test_failed_v3_to_v4_migration_rolls_back_schema_and_version(
 
     def fail_after_create(connection: sqlite3.Connection) -> None:
         original_create(connection)
-        raise RuntimeError("injected v4 migration failure")
+        raise RuntimeError("injected v5 migration failure")
 
     monkeypatch.setattr(
         SQLiteStore,
@@ -557,7 +958,7 @@ def test_failed_v3_to_v4_migration_rolls_back_schema_and_version(
         staticmethod(fail_after_create),
     )
 
-    with pytest.raises(RuntimeError, match="injected v4 migration failure"):
+    with pytest.raises(RuntimeError, match="injected v5 migration failure"):
         SQLiteStore(path, create=False)
 
     with sqlite3.connect(path) as connection:
@@ -573,8 +974,8 @@ def test_failed_v3_to_v4_migration_rolls_back_schema_and_version(
         )
 
 
-def test_opening_v4_database_rejects_broken_foreign_keys(tmp_path) -> None:
-    path = tmp_path / "broken-v4-foreign-key.db"
+def test_opening_v5_database_rejects_broken_foreign_keys(tmp_path) -> None:
+    path = tmp_path / "broken-v5-foreign-key.db"
     tournament = _tournament()
     SQLiteStore(path).save_tournament(tournament, rating_source="engine")
     contribution = tournament.pairings[0].series.legs[0]

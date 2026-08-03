@@ -8,7 +8,7 @@ import math
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import combinations, pairwise
 from typing import Literal
 
@@ -27,6 +27,7 @@ from llmolympic.core.player import HumanPlayer, Player
 from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, play_two_leg_series
 
 TOURNAMENT_SCHEMA_VERSION = 1
+TOURNAMENT_CHECKPOINT_SCHEMA_VERSION = 1
 MIN_TOURNAMENT_PLAYERS = 3
 MAX_TOURNAMENT_PLAYERS = MAX_PLATFORM_PLAYERS
 
@@ -85,15 +86,14 @@ class TournamentStanding:
     points: float
 
 
-class RoundRobinPairing(BaseModel):
-    """One scheduled entrant pair and its complete swapped-order series."""
+class RoundRobinPairingSpec(BaseModel):
+    """One immutable position in the canonical round-robin schedule."""
 
     model_config = ConfigDict(extra="forbid")
 
     pairing_number: int = Field(ge=1)
     player_indices: tuple[int, int]
     seed: int
-    series: SeriesArchive
 
     @field_validator("pairing_number", mode="before")
     @classmethod
@@ -118,6 +118,12 @@ class RoundRobinPairing(BaseModel):
     @classmethod
     def validate_seed(cls, value: object) -> object:
         return _validate_signed_seed(value)
+
+
+class RoundRobinPairing(RoundRobinPairingSpec):
+    """One scheduled entrant pair and its complete swapped-order series."""
+
+    series: SeriesArchive
 
 
 def _normalized_tournament_players(descriptors: object) -> tuple[dict, ...]:
@@ -152,6 +158,307 @@ def _series_game_config(series: SeriesArchive) -> dict:
     if not isinstance(config, dict):
         raise TypeError("循环赛双局赛必须记录项目配置")
     return config
+
+
+def _round_robin_schedule(players: Sequence[dict], seed: int) -> tuple[RoundRobinPairingSpec, ...]:
+    entrant_ids = tuple(descriptor["entrant_id"] for descriptor in players)
+    return tuple(
+        RoundRobinPairingSpec(
+            pairing_number=pairing_number,
+            player_indices=player_indices,
+            seed=round_robin_pair_seed(
+                seed,
+                entrant_ids[player_indices[0]],
+                entrant_ids[player_indices[1]],
+            ),
+        )
+        for pairing_number, player_indices in enumerate(
+            combinations(range(len(players)), 2), start=1
+        )
+    )
+
+
+def _validate_schedule(
+    schedule: Sequence[RoundRobinPairingSpec],
+    expected: Sequence[RoundRobinPairingSpec],
+) -> None:
+    if len(schedule) != len(expected):
+        raise ValueError("循环赛必须让每对选手恰好进行一个换色双局赛")
+    for pairing, expected_pairing in zip(schedule, expected):
+        if pairing.pairing_number != expected_pairing.pairing_number:
+            raise ValueError("循环赛 pairing_number 必须按执行顺序连续编号")
+        if pairing.player_indices != expected_pairing.player_indices:
+            raise ValueError("循环赛配对必须严格遵循输入顺序的两两组合")
+        if pairing.seed != expected_pairing.seed:
+            raise ValueError("循环赛 pairing seed 与稳定身份派生结果不一致")
+
+
+def _validate_completed_series(
+    *,
+    players: Sequence[dict],
+    schedule: Sequence[RoundRobinPairingSpec],
+    completed_series: Sequence[SeriesArchive],
+    source: TournamentSource,
+    game: str,
+    game_config: dict | None,
+) -> tuple[dict[str, float], dict | None]:
+    """Validate a canonical completed prefix and derive its aggregate points."""
+
+    if len(completed_series) > len(schedule):
+        raise ValueError("循环赛已完成双局赛数量不能超过预建赛程")
+
+    points = {descriptor["name"]: 0.0 for descriptor in players}
+    series_ids: set[str] = set()
+    match_ids: set[str] = set()
+    validated_game_config = game_config
+    previous_finished_at: datetime | None = None
+
+    for spec, series in zip(schedule, completed_series):
+        if series.schema_version != SERIES_SCHEMA_VERSION:
+            raise ValueError("循环赛只接受 schema v2 双局赛档案")
+        if series.source != source:
+            raise ValueError("循环赛与双局赛档案来源必须一致")
+        if series.game != game:
+            raise ValueError("循环赛与双局赛项目必须一致")
+        if series.seed != spec.seed:
+            raise ValueError("循环赛 pairing 与双局赛 seed 必须一致")
+
+        first_index, second_index = spec.player_indices
+        expected_players = (players[first_index], players[second_index])
+        if series.players != expected_players:
+            raise ValueError("循环赛双局赛选手必须与配对索引及身份完全一致")
+
+        for leg in series.legs:
+            if [event.seq for event in leg.events] != list(range(len(leg.events))):
+                raise ValueError("循环赛对局事件 seq 必须从 0 开始且连续")
+            started_events = [
+                event for event in leg.events if event.type == EventType.MATCH_STARTED
+            ]
+            finished_events = [
+                event for event in leg.events if event.type == EventType.MATCH_FINISHED
+            ]
+            if len(started_events) != 1 or started_events[0] is not leg.events[0]:
+                raise ValueError("循环赛对局必须以唯一的 match_started 开始")
+            if len(finished_events) != 1 or finished_events[0] is not leg.events[-1]:
+                raise ValueError("循环赛对局必须以唯一的 match_finished 结束")
+            event_timestamps = [event.timestamp for event in leg.events]
+            if any(timestamp.utcoffset() is None for timestamp in event_timestamps):
+                raise ValueError("循环赛对局事件时间必须包含时区")
+            if any(current < previous for previous, current in pairwise(event_timestamps)):
+                raise ValueError("循环赛对局事件时间不能逆序")
+            if event_timestamps[0] < leg.started_at or event_timestamps[-1] > leg.finished_at:
+                raise ValueError("循环赛对局事件必须位于对局时间边界内")
+            started_data = started_events[0].data
+            if (
+                started_data.get("game") != leg.game
+                or started_data.get("seed") != leg.seed
+                or started_data.get("players") != leg.players
+            ):
+                raise ValueError("循环赛 match_started 的项目、seed 或选手与对局档案不一致")
+            finished_scores = finished_events[0].data.get("scores")
+            if not isinstance(finished_scores, dict) or any(
+                not isinstance(name, str)
+                or isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(score)
+                for name, score in finished_scores.items()
+            ):
+                raise ValueError("循环赛 match_finished 必须包含有限数值比分")
+            if {name: float(score) for name, score in finished_scores.items()} != leg.scores:
+                raise ValueError("循环赛 match_finished 比分与对局档案不一致")
+
+        current_config = _series_game_config(series)
+        if validated_game_config is None:
+            validated_game_config = current_config
+        elif current_config != validated_game_config:
+            raise ValueError("循环赛所有双局赛必须使用完全相同的项目配置")
+
+        if series.series_id in series_ids:
+            raise ValueError("循环赛中的 series_id 必须全局唯一")
+        series_ids.add(series.series_id)
+        for leg in series.legs:
+            if leg.match_id in match_ids:
+                raise ValueError("循环赛中的 match_id 必须全局唯一")
+            match_ids.add(leg.match_id)
+
+        if previous_finished_at is not None and series.started_at < previous_finished_at:
+            raise ValueError("循环赛双局赛时间不能重叠或逆序")
+        previous_finished_at = series.finished_at
+        for player, point in series.points.items():
+            if player not in points:
+                raise ValueError("双局赛 points 包含循环赛之外的选手")
+            points[player] += point
+
+    return points, validated_game_config
+
+
+def _standings_from_series(
+    players: Sequence[dict],
+    completed_series: Sequence[SeriesArchive],
+    points: dict[str, float],
+) -> tuple[TournamentStanding, ...]:
+    aggregates: dict[str, dict[str, int | float | str]] = {}
+    for descriptor in players:
+        player = descriptor["name"]
+        aggregates[player] = {
+            "player": player,
+            "entrant_id": descriptor["entrant_id"],
+            "series_played": 0,
+            "series_wins": 0,
+            "series_draws": 0,
+            "series_losses": 0,
+            "games_played": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+            "technical_losses": 0,
+            "points": points[player],
+        }
+
+    for series in completed_series:
+        first_name = series.players[0]["name"]
+        second_name = series.players[1]["name"]
+        for player, opponent in (
+            (first_name, second_name),
+            (second_name, first_name),
+        ):
+            standing = series.standings[player]
+            aggregate = aggregates[player]
+            aggregate["series_played"] += 1
+            aggregate["games_played"] += 2
+            aggregate["wins"] += standing.wins
+            aggregate["draws"] += standing.draws
+            aggregate["losses"] += standing.losses
+            aggregate["technical_losses"] += standing.technical_losses
+            if series.points[player] > series.points[opponent]:
+                aggregate["series_wins"] += 1
+            elif series.points[player] < series.points[opponent]:
+                aggregate["series_losses"] += 1
+            else:
+                aggregate["series_draws"] += 1
+
+    standings = tuple(TournamentStanding(**values) for values in aggregates.values())
+    return tuple(
+        sorted(
+            standings,
+            key=lambda standing: (
+                -standing.points,
+                -standing.wins,
+                standing.technical_losses,
+                standing.entrant_id,
+            ),
+        )
+    )
+
+
+class TournamentCheckpoint(BaseModel):
+    """A validated, resumable prefix of one local round-robin tournament."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = TOURNAMENT_CHECKPOINT_SCHEMA_VERSION
+    source: Literal["local_engine"] = "local_engine"
+    tournament_id: str = Field(default_factory=lambda: uuid.uuid4().hex, min_length=1)
+    format: Literal["round_robin_two_leg"] = "round_robin_two_leg"
+    pairing_policy: Literal["input_order_combinations_v1"] = "input_order_combinations_v1"
+    seed_policy: Literal["entrant_pair_sha256_v1"] = "entrant_pair_sha256_v1"
+    game: str
+    game_config: dict
+    seed: int
+    max_attempts: int
+    players: tuple[dict, ...]
+    schedule: tuple[RoundRobinPairingSpec, ...]
+    completed_series: tuple[SeriesArchive, ...] = ()
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_players(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized["players"] = _normalized_tournament_players(normalized.get("players"))
+        game_config = normalized.get("game_config")
+        if not isinstance(game_config, dict):
+            raise TypeError("循环赛 checkpoint game_config 必须是字典")
+        normalized["game_config"] = copy.deepcopy(game_config)
+        return normalized
+
+    @field_validator("game", mode="before")
+    @classmethod
+    def validate_game(cls, value: object) -> object:
+        if not isinstance(value, str) or not value:
+            raise ValueError("循环赛 game 必须是非空字符串")
+        return value
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def validate_seed(cls, value: object) -> object:
+        return _validate_signed_seed(value)
+
+    @field_validator("max_attempts", mode="before")
+    @classmethod
+    def validate_max_attempts(cls, value: object) -> object:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= MAX_MOVE_ATTEMPTS
+        ):
+            raise ValueError(f"max_attempts 必须是 1 到 {MAX_MOVE_ATTEMPTS} 之间的整数")
+        return value
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> TournamentCheckpoint:
+        expected_schedule = _round_robin_schedule(self.players, self.seed)
+        _validate_schedule(self.schedule, expected_schedule)
+        _validate_completed_series(
+            players=self.players,
+            schedule=self.schedule,
+            completed_series=self.completed_series,
+            source=self.source,
+            game=self.game,
+            game_config=self.game_config,
+        )
+
+        timestamps = (self.created_at, self.updated_at)
+        if any(timestamp.utcoffset() is None for timestamp in timestamps):
+            raise ValueError("循环赛 checkpoint 时间必须包含时区")
+        if self.updated_at < self.created_at:
+            raise ValueError("循环赛 checkpoint 更新时间不能早于创建时间")
+        if self.completed_series:
+            if self.created_at > self.completed_series[0].started_at:
+                raise ValueError("循环赛 checkpoint 创建时间不能晚于首组开始时间")
+            if self.updated_at != self.completed_series[-1].finished_at:
+                raise ValueError("循环赛 checkpoint 更新时间必须等于最后完成组的结束时间")
+        elif self.updated_at != self.created_at:
+            raise ValueError("空循环赛 checkpoint 的创建和更新时间必须一致")
+        return self
+
+    @property
+    def points(self) -> dict[str, float]:
+        points = {descriptor["name"]: 0.0 for descriptor in self.players}
+        for series in self.completed_series:
+            for player, point in series.points.items():
+                points[player] += point
+        return points
+
+    @property
+    def standings(self) -> tuple[TournamentStanding, ...]:
+        return _standings_from_series(self.players, self.completed_series, self.points)
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.completed_series) == len(self.schedule)
+
+    @property
+    def next_pairing_number(self) -> int | None:
+        if self.is_complete:
+            return None
+        return self.schedule[len(self.completed_series)].pairing_number
+
+
+TournamentCheckpointCallback = Callable[[TournamentCheckpoint], None]
 
 
 class TournamentArchive(BaseModel):
@@ -214,108 +521,24 @@ class TournamentArchive(BaseModel):
     @model_validator(mode="after")
     def validate_consistency(self) -> TournamentArchive:
         names = tuple(descriptor["name"] for descriptor in self.players)
-        entrant_ids = tuple(descriptor["entrant_id"] for descriptor in self.players)
-        expected_indices = tuple(combinations(range(len(self.players)), 2))
-        if len(self.pairings) != len(expected_indices):
-            raise ValueError("循环赛必须让每对选手恰好进行一个换色双局赛")
-
-        expected_points = {name: 0.0 for name in names}
-        series_ids: set[str] = set()
-        match_ids: set[str] = set()
-        game_config: dict | None = None
-        previous_finished_at: datetime | None = None
-
-        for pairing_number, (pairing, expected_pair) in enumerate(
-            zip(self.pairings, expected_indices), start=1
-        ):
-            if pairing.pairing_number != pairing_number:
-                raise ValueError("循环赛 pairing_number 必须按执行顺序连续编号")
-            if pairing.player_indices != expected_pair:
-                raise ValueError("循环赛配对必须严格遵循输入顺序的两两组合")
-
-            first_index, second_index = expected_pair
-            expected_seed = round_robin_pair_seed(
-                self.seed,
-                entrant_ids[first_index],
-                entrant_ids[second_index],
+        expected_schedule = _round_robin_schedule(self.players, self.seed)
+        actual_schedule = tuple(
+            RoundRobinPairingSpec(
+                pairing_number=pairing.pairing_number,
+                player_indices=pairing.player_indices,
+                seed=pairing.seed,
             )
-            if pairing.seed != expected_seed:
-                raise ValueError("循环赛 pairing seed 与稳定身份派生结果不一致")
-
-            series = pairing.series
-            if series.schema_version != SERIES_SCHEMA_VERSION:
-                raise ValueError("循环赛只接受 schema v2 双局赛档案")
-            if series.source != self.source:
-                raise ValueError("循环赛与双局赛档案来源必须一致")
-            if series.game != self.game:
-                raise ValueError("循环赛与双局赛项目必须一致")
-            if series.seed != pairing.seed:
-                raise ValueError("循环赛 pairing 与双局赛 seed 必须一致")
-            expected_players = (
-                self.players[first_index],
-                self.players[second_index],
-            )
-            if series.players != expected_players:
-                raise ValueError("循环赛双局赛选手必须与配对索引及身份完全一致")
-
-            for leg in series.legs:
-                if [event.seq for event in leg.events] != list(range(len(leg.events))):
-                    raise ValueError("循环赛对局事件 seq 必须从 0 开始且连续")
-                started_events = [
-                    event for event in leg.events if event.type == EventType.MATCH_STARTED
-                ]
-                finished_events = [
-                    event for event in leg.events if event.type == EventType.MATCH_FINISHED
-                ]
-                if len(started_events) != 1 or started_events[0] is not leg.events[0]:
-                    raise ValueError("循环赛对局必须以唯一的 match_started 开始")
-                if len(finished_events) != 1 or finished_events[0] is not leg.events[-1]:
-                    raise ValueError("循环赛对局必须以唯一的 match_finished 结束")
-                event_timestamps = [event.timestamp for event in leg.events]
-                if any(timestamp.utcoffset() is None for timestamp in event_timestamps):
-                    raise ValueError("循环赛对局事件时间必须包含时区")
-                if any(current < previous for previous, current in pairwise(event_timestamps)):
-                    raise ValueError("循环赛对局事件时间不能逆序")
-                if event_timestamps[0] < leg.started_at or event_timestamps[-1] > leg.finished_at:
-                    raise ValueError("循环赛对局事件必须位于对局时间边界内")
-                started_data = started_events[0].data
-                if (
-                    started_data.get("game") != leg.game
-                    or started_data.get("seed") != leg.seed
-                    or started_data.get("players") != leg.players
-                ):
-                    raise ValueError("循环赛 match_started 的项目、seed 或选手与对局档案不一致")
-                finished_scores = finished_events[0].data.get("scores")
-                if not isinstance(finished_scores, dict) or any(
-                    not isinstance(name, str)
-                    or isinstance(score, bool)
-                    or not isinstance(score, (int, float))
-                    or not math.isfinite(score)
-                    for name, score in finished_scores.items()
-                ):
-                    raise ValueError("循环赛 match_finished 必须包含有限数值比分")
-                if {name: float(score) for name, score in finished_scores.items()} != leg.scores:
-                    raise ValueError("循环赛 match_finished 比分与对局档案不一致")
-
-            current_config = _series_game_config(series)
-            if game_config is None:
-                game_config = current_config
-            elif current_config != game_config:
-                raise ValueError("循环赛所有双局赛必须使用完全相同的项目配置")
-
-            if series.series_id in series_ids:
-                raise ValueError("循环赛中的 series_id 必须全局唯一")
-            series_ids.add(series.series_id)
-            for leg in series.legs:
-                if leg.match_id in match_ids:
-                    raise ValueError("循环赛中的 match_id 必须全局唯一")
-                match_ids.add(leg.match_id)
-
-            if previous_finished_at is not None and series.started_at < previous_finished_at:
-                raise ValueError("循环赛双局赛时间不能重叠或逆序")
-            previous_finished_at = series.finished_at
-            for player, point in series.points.items():
-                expected_points[player] += point
+            for pairing in self.pairings
+        )
+        _validate_schedule(actual_schedule, expected_schedule)
+        expected_points, _ = _validate_completed_series(
+            players=self.players,
+            schedule=actual_schedule,
+            completed_series=tuple(pairing.series for pairing in self.pairings),
+            source=self.source,
+            game=self.game,
+            game_config=None,
+        )
 
         timestamps = (self.started_at, self.finished_at)
         if any(timestamp.utcoffset() is None for timestamp in timestamps):
@@ -343,59 +566,10 @@ class TournamentArchive(BaseModel):
     @property
     def standings(self) -> tuple[TournamentStanding, ...]:
         """Return deterministic aggregate standings without duplicating archive data."""
-
-        aggregates: dict[str, dict[str, int | float | str]] = {}
-        for descriptor in self.players:
-            player = descriptor["name"]
-            aggregates[player] = {
-                "player": player,
-                "entrant_id": descriptor["entrant_id"],
-                "series_played": 0,
-                "series_wins": 0,
-                "series_draws": 0,
-                "series_losses": 0,
-                "games_played": 0,
-                "wins": 0,
-                "draws": 0,
-                "losses": 0,
-                "technical_losses": 0,
-                "points": self.points[player],
-            }
-
-        for pairing in self.pairings:
-            series = pairing.series
-            first_name = series.players[0]["name"]
-            second_name = series.players[1]["name"]
-            for player, opponent in (
-                (first_name, second_name),
-                (second_name, first_name),
-            ):
-                standing = series.standings[player]
-                aggregate = aggregates[player]
-                aggregate["series_played"] += 1
-                aggregate["games_played"] += 2
-                aggregate["wins"] += standing.wins
-                aggregate["draws"] += standing.draws
-                aggregate["losses"] += standing.losses
-                aggregate["technical_losses"] += standing.technical_losses
-                if series.points[player] > series.points[opponent]:
-                    aggregate["series_wins"] += 1
-                elif series.points[player] < series.points[opponent]:
-                    aggregate["series_losses"] += 1
-                else:
-                    aggregate["series_draws"] += 1
-
-        standings = tuple(TournamentStanding(**values) for values in aggregates.values())
-        return tuple(
-            sorted(
-                standings,
-                key=lambda standing: (
-                    -standing.points,
-                    -standing.wins,
-                    standing.technical_losses,
-                    standing.entrant_id,
-                ),
-            )
+        return _standings_from_series(
+            self.players,
+            tuple(pairing.series for pairing in self.pairings),
+            self.points,
         )
 
 
@@ -449,15 +623,12 @@ def tournament_from_series(
     return TournamentArchive.model_validate(values)
 
 
-async def play_round_robin(
+def _validated_round_robin_inputs(
     game: Game,
     players: Sequence[Player],
-    seed: int = 0,
-    max_attempts: int = 3,
-    on_event: TournamentEventCallback | None = None,
-) -> TournamentArchive:
-    """Play one swapped-order two-leg series for every entrant pair."""
-
+    seed: int,
+    max_attempts: int,
+) -> tuple[tuple[Player, ...], tuple[dict, ...], dict]:
     _validate_signed_seed(seed)
     if (
         isinstance(max_attempts, bool)
@@ -491,19 +662,88 @@ async def play_round_robin(
         raise ValueError("Player entrant_id 与档案描述不一致")
     if not isinstance(game.name, str) or not game.name:
         raise ValueError("循环赛 game 必须是非空字符串")
-    describe_game_config(game)
+    game_config = describe_game_config(game)
 
     schedule = tuple(combinations(range(count), 2))
     for first_index, second_index in schedule:
         validate_players(game, [names[first_index], names[second_index]])
+    return entrants, descriptors, copy.deepcopy(game_config)
 
-    completed_series: list[SeriesArchive] = []
-    for pairing_number, (first_index, second_index) in enumerate(schedule, start=1):
-        pairing_seed = round_robin_pair_seed(
-            seed,
-            entrant_ids[first_index],
-            entrant_ids[second_index],
-        )
+
+def prepare_round_robin(
+    game: Game,
+    players: Sequence[Player],
+    seed: int = 0,
+    max_attempts: int = 3,
+    *,
+    tournament_id: str | None = None,
+) -> TournamentCheckpoint:
+    """Preflight and freeze one tournament identity, configuration, and schedule."""
+
+    _, descriptors, game_config = _validated_round_robin_inputs(game, players, seed, max_attempts)
+    created_at = datetime.now(UTC)
+    values: dict[str, object] = {
+        "schema_version": TOURNAMENT_CHECKPOINT_SCHEMA_VERSION,
+        "source": "local_engine",
+        "game": game.name,
+        "game_config": game_config,
+        "seed": seed,
+        "max_attempts": max_attempts,
+        "players": descriptors,
+        "schedule": _round_robin_schedule(descriptors, seed),
+        "completed_series": (),
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    if tournament_id is not None:
+        values["tournament_id"] = tournament_id
+    return TournamentCheckpoint.model_validate(values)
+
+
+def checkpoint_with_series(
+    checkpoint: TournamentCheckpoint,
+    series: SeriesArchive,
+) -> TournamentCheckpoint:
+    """Return a checkpoint extended by exactly its next scheduled series."""
+
+    if checkpoint.is_complete:
+        raise ValueError("循环赛 checkpoint 已完成，不能追加双局赛")
+    values: dict[str, object] = {
+        field: getattr(checkpoint, field) for field in TournamentCheckpoint.model_fields
+    }
+    values["completed_series"] = (*checkpoint.completed_series, series)
+    values["updated_at"] = series.finished_at
+    return TournamentCheckpoint.model_validate(values)
+
+
+async def resume_round_robin(
+    game: Game,
+    players: Sequence[Player],
+    checkpoint: TournamentCheckpoint,
+    *,
+    on_event: TournamentEventCallback | None = None,
+    on_checkpoint: TournamentCheckpointCallback | None = None,
+) -> TournamentArchive:
+    """Continue only the unfinished suffix of a validated tournament checkpoint."""
+
+    entrants, descriptors, game_config = _validated_round_robin_inputs(
+        game,
+        players,
+        checkpoint.seed,
+        checkpoint.max_attempts,
+    )
+    if game.name != checkpoint.game:
+        raise ValueError("恢复循环赛的 game 与 checkpoint 不一致")
+    if descriptors != checkpoint.players:
+        raise ValueError("恢复循环赛的选手描述与 checkpoint 不一致")
+    if game_config != checkpoint.game_config:
+        raise ValueError("恢复循环赛的项目配置与 checkpoint 不一致")
+    if _round_robin_schedule(descriptors, checkpoint.seed) != checkpoint.schedule:
+        raise ValueError("恢复循环赛的赛程与 checkpoint 不一致")
+
+    current = checkpoint
+    for spec in current.schedule[len(current.completed_series) :]:
+        first_index, second_index = spec.player_indices
         event_callback: Callable[[int, MatchEvent], None] | None = None
         if on_event is not None:
 
@@ -511,24 +751,54 @@ async def play_round_robin(
                 leg_number: int,
                 event: MatchEvent,
                 *,
-                _pairing_number: int = pairing_number,
+                _pairing_number: int = spec.pairing_number,
             ) -> None:
                 on_event(_pairing_number, leg_number, event)
 
         archive = await play_two_leg_series(
             game,
             [entrants[first_index], entrants[second_index]],
-            seed=pairing_seed,
-            max_attempts=max_attempts,
+            seed=spec.seed,
+            max_attempts=current.max_attempts,
             on_event=event_callback,
         )
-        expected_players = (descriptors[first_index], descriptors[second_index])
-        if archive.players != expected_players:
-            raise ValueError("循环赛期间 Player 身份或描述发生变化")
-        completed_series.append(archive)
+        current = checkpoint_with_series(current, archive)
+        if on_checkpoint is not None:
+            on_checkpoint(current)
 
     return tournament_from_series(
-        descriptors,
-        completed_series,
+        current.players,
+        current.completed_series,
+        seed=current.seed,
+        tournament_id=current.tournament_id,
+    )
+
+
+async def play_round_robin(
+    game: Game,
+    players: Sequence[Player],
+    seed: int = 0,
+    max_attempts: int = 3,
+    on_event: TournamentEventCallback | None = None,
+    *,
+    tournament_id: str | None = None,
+    on_checkpoint: TournamentCheckpointCallback | None = None,
+) -> TournamentArchive:
+    """Play one swapped-order two-leg series for every entrant pair."""
+
+    checkpoint = prepare_round_robin(
+        game,
+        players,
         seed=seed,
+        max_attempts=max_attempts,
+        tournament_id=tournament_id,
+    )
+    if on_checkpoint is not None:
+        on_checkpoint(checkpoint)
+    return await resume_round_robin(
+        game,
+        players,
+        checkpoint,
+        on_event=on_event,
+        on_checkpoint=on_checkpoint,
     )
