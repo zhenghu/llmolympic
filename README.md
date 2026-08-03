@@ -103,7 +103,8 @@ llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
 ## 运行
 
 macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、国际象棋、
-数学、知识、逻辑推理和猜谜竞答，并提供人类对战或两个 mock 自动演示。
+数学、知识、逻辑推理和猜谜竞答；全部六个项目都提供三个 mock 的离线循环赛入口，
+并保留已有的人类对战、两个 mock 自动演示和棋类换先手双局赛。
 
 ```bash
 # 两个 mock 选手演示（离线，无需 key）
@@ -136,6 +137,10 @@ llmolympic play --game gomoku --players mock:random,mock:fixed
 # 公平双局赛：同一 seed，各执黑一次，两局一起存档并批量更新 ELO
 llmolympic series --game gomoku --players mock:random,mock:fixed --seed 42
 
+# 三名以上非人类选手循环赛：每一对选手交换顺序各赛一局
+llmolympic round-robin --game knowledge_quiz \
+  --players profile:kimi,profile:deepseek,profile:local --rounds 5 --seed 42
+
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
 llmolympic play --game chess --players human:我,mock:random
 
@@ -151,13 +156,13 @@ llmolympic leaderboard --game math_quiz
 
 # 查看对局历史与完整档案
 llmolympic history
-llmolympic archive <MATCH_OR_SERIES_ID>
+llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 ```
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
 中心是 `H8`。选手连续 3 次非法落子，或人类选手超时未落子，会立即判负。
-`--rounds` 用于数学、知识、逻辑推理和猜谜项目，不适用于棋类（包括双局赛）。
+`--rounds` 用于数学、知识、逻辑推理和猜谜项目，不适用于棋类（包括双局赛和循环赛）。
 
 国际象棋采用标准初始局面，玩家列表第一位执白、第二位执黑。规则引擎完整校验
 将军、将死、王车易位、吃过路兵与升变；输入严格接受一个 SAN 或 UCI 走法。
@@ -190,6 +195,20 @@ llmolympic archive <MATCH_OR_SERIES_ID>
 输入线程无法可靠取消，贸然开始第二局可能抢占输入；待可取消输入链路完成后
 再开放人类双局赛。单局 `play` 的人类对战不受影响。
 
+`round-robin` 接受 3–16 名 LLM/mock/Profile 选手，不接受人类选手。每个无序
+选手对运行一次双局赛，因此 N 名选手会产生 `N*(N-1)/2` 个系列、`N*(N-1)`
+场对局。每个对阵的 seed 由赛事 seed 和双方稳定 `entrant_id` 确定性派生，
+同一对阵的两局共用派生 seed 并完整交换选手顺序。最终表汇总局分、胜平负、
+技术负和 ELO 净变化。排名依次按总局分、胜局数、较少技术负排序；完全同绩时
+仅用稳定 `entrant_id` 生成确定的展示顺序。
+
+循环赛当前串行执行并在全部完成后才原子存档，尚无中途检查点；`Ctrl-C`、进程或
+机器中断时，已跑的部分不会存档或计分。问答赛估算为
+`2*N*(N-1)*rounds` 个选手回合；16 人 × 100 轮为 48,000 回合，默认最多
+重试 3 次时理论上限为 144,000 次选手调用。超过保守阈值会在建库和调用前拒绝；
+确认费用、超时和中断风险后才使用 `--allow-large-tournament`，并先在 Provider
+账户或网关设置整场费用上限。
+
 LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 `LLMOLYMPIC_LLM_TIMEOUT` 或 `[match] llm_timeout_seconds` 调整。OpenAI、Ollama
 和 mock 都使用可取消的原生异步调用；模型超时或 Provider 运行期异常会立即判
@@ -209,12 +228,15 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 在 Provider 账户和网关侧设置费用、响应体及整场调用预算。
 
 每场 `play` 完成后会自动写入 SQLite，并在同一事务中更新总榜与分项目 ELO；
-`series` 则把两局和批量 ELO 作为一个原子事务保存。
-直接使用 Python 存储 API 时，`SQLiteStore.save_match()` / `save_series()` 默认按
-外部导入处理，只存档、不计分；只有本地比赛引擎应显式传入
+`series` 把两局和批量 ELO 作为一个原子事务保存；`round-robin` 则把完整赛程、
+所有系列与对局、总局分和 ELO 变化一次性原子保存。循环赛以赛事开始前冻结
+的 ELO 为所有对局计算期望值；在给定同一组已完成对局结果时，ELO 聚合不受处理或
+保存顺序影响。对阵执行顺序仍可能影响有状态或随机 Provider 的实际输出。
+直接使用 Python 存储 API 时，`SQLiteStore.save_match()` / `save_series()` /
+`save_tournament()` 默认按外部导入处理，只存档、不计分；只有本地比赛引擎应显式传入
 `rating_source="engine"`，该参数是本进程内的信任声明，并非来源认证或数字签名。
-`history` 会标出系列赛 ID 与局号；`archive` 既可读取单局 ID，也可用系列赛 ID
-读取包含两局的完整档案。
+`history` 会标出循环赛 ID、对阵号、系列赛 ID 与局号；`archive` 可用对局、系列赛
+或循环赛 ID 读取对应的完整档案。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
 `~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
 或各命令的 `--db` 覆盖。

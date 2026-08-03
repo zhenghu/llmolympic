@@ -8,6 +8,7 @@ import math
 import sqlite3
 from collections import Counter
 from collections.abc import Callable
+from itertools import combinations
 from pathlib import Path
 from typing import Annotated
 
@@ -30,6 +31,7 @@ from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import (
     MAX_PLAYER_NAME_CHARS,
     Game,
+    describe_game_config,
     validate_player_count,
     validate_players,
 )
@@ -48,6 +50,13 @@ from llmolympic.core.storage import (
     SaveResult,
     SQLiteStore,
     StorageError,
+    TournamentSaveResult,
+)
+from llmolympic.core.tournament import (
+    MAX_TOURNAMENT_PLAYERS,
+    MIN_TOURNAMENT_PLAYERS,
+    TournamentArchive,
+    play_round_robin,
 )
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_profile_provider, create_provider
@@ -57,6 +66,10 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+MAX_UNCONFIRMED_TOURNAMENT_MATCHES = 30
+MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS = 5_000
+TOURNAMENT_MOVE_ATTEMPTS = 3
 
 
 def _render_warning() -> None:
@@ -430,6 +443,95 @@ def _prepare_contest(
     return selected_game, selected_players
 
 
+def _prepare_round_robin(
+    *,
+    game_name: str,
+    player_spec: str,
+    rounds: int | None,
+    llm_timeout: float | None,
+    no_llm_timeout: bool,
+) -> tuple[Game, list[Player]]:
+    """校验循环赛名单，但只把每个二人配对交给 Game 的人数约束。"""
+
+    try:
+        game_options = {} if rounds is None else {"rounds": rounds}
+        selected_game = create_game(game_name, **game_options)
+    except ValueError as exc:
+        param_hint = "--rounds" if rounds is not None and game_name in list_games() else "--game"
+        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
+
+    try:
+        player_specs = _split_player_specs(player_spec)
+        player_count = len(player_specs)
+        if not MIN_TOURNAMENT_PLAYERS <= player_count <= MAX_TOURNAMENT_PLAYERS:
+            raise typer.BadParameter(
+                f"循环赛需要 {MIN_TOURNAMENT_PLAYERS} 到 {MAX_TOURNAMENT_PLAYERS} 名选手，"
+                f"实际为 {player_count} 名",
+                param_hint="--players",
+            )
+        if any(spec.partition(":")[0] == "human" for spec in player_specs):
+            raise typer.BadParameter(
+                "循环赛暂只支持 LLM/mock/Profile，不支持人类选手",
+                param_hint="--players",
+            )
+        effective_llm_timeout = _resolve_llm_timeout(
+            llm_timeout,
+            disabled=no_llm_timeout,
+        )
+        selected_players = _parse_players(player_spec, 60.0, effective_llm_timeout)
+        names = [player.name for player in selected_players]
+        entrant_ids = [player.entrant_id for player in selected_players]
+        if len(set(names)) != player_count:
+            raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
+        if len(set(entrant_ids)) != player_count:
+            raise typer.BadParameter(
+                f"选手稳定身份必须唯一: {entrant_ids}",
+                param_hint="--players",
+            )
+        for first, second in combinations(selected_players, 2):
+            validate_players(selected_game, [first.name, second.name])
+    except typer.BadParameter:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    return selected_game, selected_players
+
+
+def _tournament_workload(
+    game: Game,
+    player_count: int,
+) -> tuple[int, int, int | None, int | None]:
+    pairing_count = player_count * (player_count - 1) // 2
+    match_count = pairing_count * 2
+    rounds = describe_game_config(game).get("rounds")
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        return pairing_count, match_count, None, None
+    turns = match_count * 2 * rounds
+    return pairing_count, match_count, turns, turns * TOURNAMENT_MOVE_ATTEMPTS
+
+
+def _validate_tournament_workload(
+    game: Game,
+    player_count: int,
+    *,
+    allow_large: bool,
+) -> None:
+    _, match_count, turns, max_calls = _tournament_workload(game, player_count)
+    too_large = match_count > MAX_UNCONFIRMED_TOURNAMENT_MATCHES or (
+        max_calls is not None and max_calls > MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS
+    )
+    if not too_large or allow_large:
+        return
+    estimate = f"{match_count} 场对局"
+    if turns is not None and max_calls is not None:
+        estimate += f"、{turns} 个回合（最多约 {max_calls} 次选手调用）"
+    raise typer.BadParameter(
+        f"循环赛预计需要 {estimate}，超过默认费用保护阈值；"
+        "确认 Provider 预算与中断风险后使用 --allow-large-tournament",
+        param_hint="--allow-large-tournament",
+    )
+
+
 async def _run(game: Game, players: list[Player], seed: int, store: SQLiteStore) -> None:
     archive = await play_match(game, players, seed=seed, on_event=_guard_renderer(_render))
     result = store.save_match(archive, rating_source="engine")
@@ -523,6 +625,121 @@ async def _run_series(
     result = store.save_series(series_archive, rating_source="engine")
     _best_effort_render(_render_series_summary, series_archive)
     _best_effort_render(_render_series_saved, series_archive, store, result)
+
+
+def _render_tournament_summary(tournament: TournamentArchive) -> None:
+    table = Table(title="循环赛结果")
+    table.add_column("排名", justify="right")
+    table.add_column("选手")
+    table.add_column("系列胜-平-负", justify="right")
+    table.add_column("对局胜-平-负", justify="right")
+    table.add_column("局分", justify="right")
+    table.add_column("技术负", justify="right")
+    for rank, standing in enumerate(tournament.standings, start=1):
+        table.add_row(
+            Text(str(rank)),
+            literal_text(standing.player, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{standing.series_wins}-{standing.series_draws}-{standing.series_losses}"),
+            Text(f"{standing.wins}-{standing.draws}-{standing.losses}"),
+            Text(f"{standing.points:.1f}"),
+            Text(str(standing.technical_losses)),
+        )
+    console.print(table)
+
+
+def _render_tournament_rating_changes(result: TournamentSaveResult) -> None:
+    table = Table(title="循环赛 ELO 净变化")
+    table.add_column("榜单")
+    table.add_column("选手")
+    table.add_column("原分", justify="right")
+    table.add_column("新分", justify="right")
+    table.add_column("变化", justify="right")
+    for change in result.rating_changes:
+        scope = "总榜" if change.game is None else change.game
+        table.add_row(
+            literal_text(scope, max_chars=NAME_DISPLAY_LIMIT),
+            literal_text(change.display_name, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{change.before:.1f}"),
+            Text(f"{change.after:.1f}"),
+            Text(f"{change.after - change.before:+.1f}"),
+        )
+    console.print(table)
+
+
+def _render_tournament_saved(
+    tournament: TournamentArchive,
+    store: SQLiteStore,
+    result: TournamentSaveResult,
+) -> None:
+    if not result.inserted:
+        line = Text("循环赛 ", style="yellow")
+        line.append(literal_text(tournament.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+        line.append(" 已存在，未重复更新 ELO。")
+        console.print(line)
+        return
+
+    line = Text("✓ 循环赛已原子存档", style="green")
+    line.append("  ")
+    line.append(literal_text(tournament.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append(f"\n  {result.pairing_count} 组对阵 · {result.match_count} 场对局")
+    line.append("\n  ")
+    line.append(literal_text(store.path))
+    console.print(line)
+    if result.rated:
+        _render_tournament_rating_changes(result)
+
+
+async def _run_round_robin(
+    game: Game,
+    players: list[Player],
+    seed: int,
+    store: SQLiteStore,
+) -> None:
+    pairing_count, match_count, turns, max_calls = _tournament_workload(game, len(players))
+    intro = Text("项目 ")
+    intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(" · seed=")
+    intro.append(literal_text(seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(f"\n{len(players)} 名选手 · {pairing_count} 组对阵 · {match_count} 场对局")
+    if turns is not None and max_calls is not None:
+        intro.append(f"\n预计 {turns} 个回合 · 最多约 {max_calls} 次选手调用")
+    intro.append("\n选手：")
+    for index, player in enumerate(players):
+        if index:
+            intro.append(" · ")
+        intro.append(literal_text(player.name, max_chars=NAME_DISPLAY_LIMIT))
+    _best_effort_render(console.print, Panel(intro, title=Text("循环赛开始")))
+
+    def render_pairing(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
+        if event.type == EventType.MATCH_STARTED:
+            first, second = (descriptor["name"] for descriptor in event.data["players"])
+            title = Text(f"第 {pairing_number}/{pairing_count} 组 · 第 {leg_number}/2 局 · ")
+            title.append(literal_text(first, max_chars=NAME_DISPLAY_LIMIT))
+            if game.name == "gomoku":
+                title.append("（黑） vs ")
+            elif game.name == "chess":
+                title.append("（白） vs ")
+            else:
+                title.append("（第一席） vs ")
+            title.append(literal_text(second, max_chars=NAME_DISPLAY_LIMIT))
+            if game.name == "gomoku":
+                title.append("（白）")
+            elif game.name == "chess":
+                title.append("（黑）")
+            else:
+                title.append("（第二席）")
+            console.rule(title)
+        _render(event)
+
+    tournament = await play_round_robin(
+        game,
+        players,
+        seed=seed,
+        on_event=_guard_renderer(render_pairing),
+    )
+    result = store.save_tournament(tournament, rating_source="engine")
+    _best_effort_render(_render_tournament_summary, tournament)
+    _best_effort_render(_render_tournament_saved, tournament, store, result)
 
 
 @app.command()
@@ -665,6 +882,85 @@ def series(
         raise typer.Exit(code=1) from exc
 
 
+@app.command(name="round-robin")
+def round_robin(
+    game: str = typer.Option(
+        "knowledge_quiz",
+        "--game",
+        "-g",
+        help=f"比赛项目: {', '.join(list_games())}",
+    ),
+    players: str = typer.Option(
+        "mock:random,mock:fixed,mock:illegal",
+        "--players",
+        "-p",
+        help=("3–16 名非人类选手，如 profile:kimi,profile:deepseek,profile:local"),
+    ),
+    rounds: int | None = typer.Option(
+        None,
+        "--rounds",
+        "-n",
+        min=1,
+        max=100,
+        help="题目型项目的每人题数（棋类项目不适用；默认 5）",
+    ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        "-s",
+        min=SQLITE_INT_MIN,
+        max=SQLITE_INT_MAX,
+        help="赛事随机种子；每组对阵会按稳定身份确定性派生自己的 seed",
+    ),
+    llm_timeout: float | None = typer.Option(
+        None,
+        "--llm-timeout",
+        min=0.001,
+        help=(
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / match.llm_timeout_seconds / 120"
+        ),
+    ),
+    no_llm_timeout: bool = typer.Option(
+        False,
+        "--no-llm-timeout",
+        help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
+    ),
+    allow_large_tournament: bool = typer.Option(
+        False,
+        "--allow-large-tournament",
+        help=(
+            "显式允许超过默认对局/调用阈值的大型循环赛；请先确认 Provider 费用预算与中断不存档风险"
+        ),
+    ),
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
+) -> None:
+    """让 3–16 名非人类选手两两进行交换顺序双局赛。"""
+
+    selected_game, selected_players = _prepare_round_robin(
+        game_name=game,
+        player_spec=players,
+        rounds=rounds,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+    )
+    _validate_tournament_workload(
+        selected_game,
+        len(selected_players),
+        allow_large=allow_large_tournament,
+    )
+    store = _open_store(database)
+    try:
+        asyncio.run(_run_round_robin(selected_game, selected_players, seed, store))
+    except (OSError, sqlite3.Error, StorageError) as exc:
+        line = Text("循环赛已完成，但 SQLite 原子存档失败：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+
+
 @app.command(name="games")
 def list_available_games() -> None:
     """列出已注册的比赛项目。"""
@@ -700,7 +996,16 @@ def history(
         line.append("  ")
         line.append(Text(row.finished_at.astimezone().strftime("%Y-%m-%d %H:%M")))
         line.append("\n")
-        if row.series_id is not None:
+        if row.tournament_id is not None:
+            line.append("  循环赛 ")
+            line.append(literal_text(row.tournament_id, max_chars=NAME_DISPLAY_LIMIT))
+            line.append(f" 第 {row.pairing_number}/{row.pairing_count} 组")
+            if row.series_id is not None:
+                line.append(" · 系列 ")
+                line.append(literal_text(row.series_id, max_chars=NAME_DISPLAY_LIMIT))
+                line.append(f" 第 {row.leg_number}/2 局")
+            line.append("\n")
+        elif row.series_id is not None:
             line.append("  系列 ")
             line.append(literal_text(row.series_id, max_chars=NAME_DISPLAY_LIMIT))
             line.append(f" 第 {row.leg_number}/2 局\n")
@@ -752,22 +1057,24 @@ def leaderboard(
 
 @app.command(name="archive")
 def show_archive(
-    match_id: str = typer.Argument(..., help="对局或系列赛 ID"),
+    match_id: str = typer.Argument(..., help="对局、系列赛或循环赛 ID"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
-    """输出一场对局或一个双局赛的完整 JSON 档案。"""
+    """输出一场对局、一个双局赛或一个循环赛的完整 JSON 档案。"""
     try:
         store = _open_store(database, create=False)
         archive = store.get_match(match_id)
         if archive is None:
             archive = store.get_series(match_id)
+        if archive is None:
+            archive = store.get_tournament(match_id)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
-        line = Text("无法读取 SQLite 对局档案：", style="red")
+        line = Text("无法读取 SQLite 档案：", style="red")
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
     if archive is None:
-        line = Text("未找到对局或系列赛 ", style="red")
+        line = Text("未找到对局、系列赛或循环赛 ", style="red")
         line.append(literal_text(repr(match_id), max_chars=NAME_DISPLAY_LIMIT))
         line.append("。")
         console.print(line)

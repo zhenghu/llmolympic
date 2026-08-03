@@ -404,9 +404,7 @@ def _create_legacy_database(
                 for scope, game_key in (("overall", ""), ("game", payload["game"])):
                     before_first = current_ratings.get((scope, game_key, first), 1500.0)
                     before_second = current_ratings.get((scope, game_key, second), 1500.0)
-                    after_first, after_second = update_ratings(
-                        before_first, before_second, outcome
-                    )
+                    after_first, after_second = update_ratings(before_first, before_second, outcome)
                     record_history(
                         payload,
                         scope,
@@ -437,9 +435,7 @@ def _create_legacy_database(
                     for payload in series_payload["legs"]:
                         score_a = payload["scores"][player_a]
                         score_b = payload["scores"][player_b]
-                        outcome_a = (
-                            1.0 if score_a > score_b else 0.0 if score_a < score_b else 0.5
-                        )
+                        outcome_a = 1.0 if score_a > score_b else 0.0 if score_a < score_b else 0.5
                         delta_a = K_FACTOR * (outcome_a - frozen_expectation)
                         next_a = running_a + delta_a
                         next_b = running_b - delta_a
@@ -540,7 +536,7 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
     assert loaded.moves[0].reason == "测试拒绝"
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
 
@@ -801,7 +797,7 @@ def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> Non
     ]
     assert all(entry.games_played == 1 for entry in migrated.leaderboard())
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             connection.execute(
                 "SELECT archive_json FROM matches WHERE match_id = ?", (payload["match_id"],)
@@ -842,7 +838,7 @@ def test_v2_series_migration_preserves_raw_json_and_backfills_legacy_identity(
         legacy_entrant_id("乙"),
     }
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             connection.execute(
                 "SELECT series_json FROM series_archives WHERE series_id = ?",
@@ -1877,7 +1873,7 @@ def test_concurrent_v1_migration_is_serialized_and_idempotent(tmp_path) -> None:
 
     assert all(store.path == path.resolve() for store in stores)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
