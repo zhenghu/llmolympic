@@ -12,9 +12,10 @@ from rich.text import Text
 from typer.testing import CliRunner
 
 from llmolympic import config
-from llmolympic.cli.main import app
+from llmolympic.cli.main import _prepare_round_robin, _validate_tournament_workload, app
 from llmolympic.core.events import EventType
 from llmolympic.core.storage import SQLiteStore
+from llmolympic.games import create_game
 from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
 
@@ -273,6 +274,143 @@ def test_chess_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) -> 
     assert board["mock:fixed"].rating == pytest.approx(1532.0)
     assert board["mock:illegal"].rating == pytest.approx(1468.0)
     assert (board["mock:fixed"].wins, board["mock:fixed"].losses) == (2, 0)
+
+
+def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) -> None:
+    path = tmp_path / "round-robin.db"
+    result = runner.invoke(
+        app,
+        [
+            "round-robin",
+            "--game",
+            "knowledge_quiz",
+            "--players",
+            "mock:fixed,mock:random,mock:illegal",
+            "--rounds",
+            "1",
+            "--seed",
+            "17",
+            "--llm-timeout",
+            "1",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "循环赛开始" in result.output
+    assert "第 1/3 组 · 第 1/2 局" in result.output
+    assert "第 3/3 组 · 第 2/2 局" in result.output
+    assert "循环赛结果" in result.output
+    assert "循环赛已原子存档" in result.output
+    assert "3 组对阵 · 6 场对局" in result.output
+    assert "循环赛 ELO 净变化" in result.output
+
+    store = SQLiteStore(path)
+    matches = store.list_matches(game="knowledge_quiz")
+    assert len(matches) == 6
+    tournament_ids = {row.tournament_id for row in matches}
+    assert None not in tournament_ids
+    assert len(tournament_ids) == 1
+    tournament_id = next(iter(tournament_ids))
+    assert {row.pairing_number for row in matches} == {1, 2, 3}
+    assert {row.pairing_count for row in matches} == {3}
+    assert len({row.series_id for row in matches}) == 3
+
+    tournament = store.get_tournament(tournament_id)
+    assert tournament is not None
+    assert len(tournament.players) == 3
+    assert len(tournament.pairings) == 3
+    assert sum(len(pairing.series.legs) for pairing in tournament.pairings) == 6
+    assert all(entry.games_played == 4 for entry in store.leaderboard())
+
+    history = runner.invoke(app, ["history", "--db", str(path)])
+    assert history.exit_code == 0
+    assert tournament_id in history.output
+    assert "第 1/3 组" in history.output
+    assert "第 3/3 组" in history.output
+
+    archive = runner.invoke(app, ["archive", tournament_id, "--db", str(path)])
+    assert archive.exit_code == 0
+    assert tournament_id in archive.output
+    assert '"format": "round_robin_two_leg"' in archive.output
+    assert '"pairings"' in archive.output
+
+
+def test_round_robin_board_game_roster_is_validated_as_two_player_pairs() -> None:
+    game, players = _prepare_round_robin(
+        game_name="gomoku",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=None,
+        llm_timeout=None,
+        no_llm_timeout=True,
+    )
+
+    assert game.name == "gomoku"
+    assert [player.name for player in players] == [
+        "mock:fixed",
+        "mock:random",
+        "mock:illegal",
+    ]
+
+
+def test_large_round_robin_requires_explicit_budget_override() -> None:
+    game = create_game("knowledge_quiz", rounds=100)
+
+    with pytest.raises(typer.BadParameter, match="allow-large-tournament"):
+        _validate_tournament_workload(game, 16, allow_large=False)
+
+    _validate_tournament_workload(game, 16, allow_large=True)
+
+
+@pytest.mark.parametrize(
+    "players,error",
+    [
+        ("mock:fixed,mock:random", "3 到 16"),
+        (",".join(f"mock:entrant-{index}" for index in range(17)), "3 到 16"),
+        ("human:我,mock:fixed,mock:random", "不支持人类"),
+        ("mock:fixed,mock:fixed,mock:illegal", "稳定身份必须唯一"),
+    ],
+)
+def test_round_robin_rejects_invalid_roster_before_database_creation(
+    tmp_path, players: str, error: str
+) -> None:
+    path = tmp_path / "invalid-round-robin.db"
+
+    result = runner.invoke(
+        app,
+        [
+            "round-robin",
+            "--players",
+            players,
+            "--llm-timeout",
+            "1",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert error in result.output
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--game", "gomoku", "--rounds", "2"],
+        ["--game", "unknown"],
+        ["--seed", str(2**63)],
+        ["--llm-timeout", "1", "--no-llm-timeout"],
+    ],
+)
+def test_round_robin_rejects_invalid_options_before_database_creation(tmp_path, args) -> None:
+    path = tmp_path / "invalid-round-robin-option.db"
+
+    result = runner.invoke(app, ["round-robin", *args, "--db", str(path)])
+
+    assert result.exit_code == 2
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(

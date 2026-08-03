@@ -32,22 +32,24 @@
 
 ### 1.2 档案来源、兼容迁移与计分信任边界
 
-- 新对局与双局赛分别使用 archive/series schema v2，并记录 `source`：引擎生成
-  为 `local_engine`，外部构造为 `external`；schema v1（包括历史上省略版本号的
-  JSON）读入时标为 `legacy`。
-- SQLite 使用 `PRAGMA user_version = 3`，以 `entrants`、`entrant_id` 和展示名快照
-  持久化对局、榜单及评分历史。v1/v2 数据库升级在单一事务内完成，失败时回滚且
-  不提升版本号。
+- 新对局与双局赛分别使用 archive/series schema v2，循环赛使用 tournament
+  schema v1；三者的新档案均记录 `source`：引擎生成为 `local_engine`，外部构造
+  为 `external`。只有旧 match/series schema v1（包括历史上省略版本号的 JSON）
+  读入时标为 `legacy`；tournament schema v1 不使用 legacy 来源。
+- SQLite 使用 `PRAGMA user_version = 4`，以 `entrants`、`entrant_id` 和展示名快照
+  持久化对局、系列赛、循环赛、榜单及评分历史。v1/v2/v3 数据库升级在单一事务
+  内完成，失败时回滚且不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
   Profile 身份隔离，不能根据旧显示名猜测为新的模型身份。
 - 迁移只补齐关系表、来源和身份索引，已有 `archive_json` / `series_json` 原样保留；
   兼容字段只在读取时于内存中补齐。历史对局是否已计分由现有
   `rating_history` 反推，不能重算或重复计分。
-- `SQLiteStore.save_match()` / `save_series()` 默认 `rating_source="imported"`，只
-  存档、不计 ELO。`rating_source="engine"` 仅供本进程完成对局后的可信调用路径，
+- `SQLiteStore.save_match()` / `save_series()` / `save_tournament()` 默认
+  `rating_source="imported"`，只存档、不计 ELO。`rating_source="engine"` 仅供
+  本进程完成对局后的可信调用路径，
   双人对局才计分；它是调用方信任声明，不是认证、签名或对来源的密码学证明。
-  同一 match/series ID 也不能通过重新保存从 imported 升级为 engine。
+  同一 match/series/tournament ID 也不能通过重新保存从 imported 升级为 engine。
 
 ## 2. 统一 Game 接口（核心设计）
 
@@ -143,13 +145,21 @@ CLI（今天）          WebSocket（将来）
   `rating_history` 仍逐局留痕，但系列赛行记录的是冻结期望值下的贡献账；审计时
   需通过 `series_matches` 关联 `series_archives.rating_policy=elo_batch_v1`，不能
   把第二局单独按其行内 `rating_before` 再算一次标准 ELO。
+- 循环赛让每个无序选手对完成一次双局赛。各对阵 seed 从赛事 seed 和双方稳定
+  `entrant_id` 确定性派生，同一对阵的两局共用 seed；整场赛事以开始前冻结的
+  ELO 批量计算所有贡献，并将赛事、系列、对局和评分历史一次性原子保存，避免
+  同一组已完成对局在处理或保存顺序不同时产生等级分漂移。有状态或随机
+  Provider 的输出仍可受实际执行顺序影响，不应把 ELO 性质误读为模型输出确定性。
 - 人类选手限时作答；同一模型跑 N 局取平均，降低采样运气成分。
 
 ## 6. 比赛模式
 
 - **单挑**：人 vs LLM 或 LLM vs LLM，同题同时作答（已实现）。
 - **交换先手双局赛**：两名非人类选手交换顺序各赛一局（已实现）。
-- **循环赛**：N 个模型两两对战，胜场 + ELO 排名（阶段二）。
+- **循环赛**：3–16 个非人类选手两两进行交换顺序双局赛，依次按总局分、胜局数、
+  较少技术负排名，完全同绩时按 `entrant_id` 确定展示顺序，并展示 ELO 净变化
+  （已实现）。当前串行执行且仅在整届完成后原子存档，中断不保留部分赛果；
+  超过默认对局/调用预算需显式使用 `--allow-large-tournament`。
 - **锦标赛**：单场多题总分制（阶段四）。
 
 ## 7. 技术栈
@@ -168,10 +178,11 @@ CLI（今天）          WebSocket（将来）
 
 1. **MVP** ✅：core 引擎（回合循环 + 事件流）+ 数学/知识问答两个单轮项目 +
    provider 抽象（openai/ollama/mock）+ CLI，LLM vs LLM 与人类入场。
-2. **阶段二（进行中）**：ELO + SQLite 持久化 ✅；五子棋多轮状态机 ✅；
+2. **阶段二（已完成）**：ELO + SQLite 持久化 ✅；五子棋多轮状态机 ✅；
    LLM 超时、Provider 异常技术判负与失败档案 ✅；交换先手双局赛与公平批量
    ELO ✅；逻辑推理与结构化猜谜项目 ✅；标准国际象棋与换色双局赛 ✅；
-   稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；后续增加循环赛。
+   稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；
+   公平循环赛与 SQLite v4 迁移 ✅。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
-4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜；循环赛与锦标赛模式。
+4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。
