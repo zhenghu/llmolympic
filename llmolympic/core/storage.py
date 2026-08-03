@@ -489,6 +489,18 @@ class MatchSummary:
 
 
 @dataclass(frozen=True)
+class DatabaseInspection:
+    """Read-only database compatibility result used by offline diagnostics."""
+
+    path: Path
+    exists: bool
+    schema_version: int | None = None
+    migration_required: bool = False
+    private_permissions: bool = True
+    limited_by_active_journal: bool = False
+
+
+@dataclass(frozen=True)
 class _EntrantRef:
     entrant_id: str
     display_name: str
@@ -534,6 +546,88 @@ def database_path(path: str | Path | None = None) -> Path:
         configured = cfg_get("storage", "database", env="LLMOLYMPIC_DB")
         path = configured or Path.home() / ".llmolympic" / "llmolympic.db"
     return Path(os.path.expandvars(str(path))).expanduser().resolve()
+
+
+def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
+    """Inspect SQLite without creating, chmodding, migrating, or writing sidecars.
+
+    An active rollback journal or WAL requires SQLite's locking/sidecar coordination to
+    read correctly.  The diagnostic therefore stops before opening the database instead
+    of creating a ``-shm`` file or inspecting a stale main-file snapshot.  Without an
+    active journal, ``immutable=1`` and ``query_only`` provide a strictly read-only
+    compatibility and integrity check.
+    """
+
+    resolved = database_path(path)
+    if not resolved.exists():
+        return DatabaseInspection(path=resolved, exists=False)
+    if not resolved.is_file():
+        raise StorageError("数据库路径不是普通文件")
+
+    database_stat = resolved.stat()
+    private_permissions = os.name != "posix" or database_stat.st_mode & 0o077 == 0
+    journal_paths = (Path(f"{resolved}-journal"), Path(f"{resolved}-wal"))
+    if any(sidecar.exists() for sidecar in journal_paths):
+        return DatabaseInspection(
+            path=resolved,
+            exists=True,
+            private_permissions=private_permissions,
+            limited_by_active_journal=True,
+        )
+
+    uri = f"{resolved.as_uri()}?mode=ro&immutable=1"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            check_rows = connection.execute("PRAGMA quick_check(1)").fetchall()
+            if [row[0] for row in check_rows] != ["ok"]:
+                raise StorageError("SQLite 完整性检查失败")
+
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise UnsupportedSchemaError(
+                    f"数据库版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}"
+                )
+            if version == 0:
+                raise StorageError("数据库尚未初始化")
+            if version == 1:
+                SQLiteStore._verify_legacy_schema(connection, include_series=False)
+            elif version == 2:
+                SQLiteStore._verify_legacy_schema(connection, include_series=True)
+            elif version == 3:
+                SQLiteStore._verify_v3_schema(connection)
+            elif version == 4:
+                SQLiteStore._verify_v4_schema(connection)
+            else:
+                SQLiteStore._verify_schema(connection)
+            SQLiteStore._verify_foreign_keys(connection)
+    except (sqlite3.Error, ValueError) as exc:
+        raise StorageError("SQLite 数据库无法读取或已损坏") from exc
+
+    # A writer may have opened a rollback journal or WAL while the immutable snapshot was
+    # being inspected.  A changed main file is likewise evidence that the snapshot raced
+    # a writer.  Do not report that possibly stale snapshot as healthy.
+    after_stat = resolved.stat()
+    limited_by_active_journal = any(sidecar.exists() for sidecar in journal_paths) or (
+        database_stat.st_dev,
+        database_stat.st_ino,
+        database_stat.st_size,
+        database_stat.st_mtime_ns,
+    ) != (
+        after_stat.st_dev,
+        after_stat.st_ino,
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+    )
+    return DatabaseInspection(
+        path=resolved,
+        exists=True,
+        schema_version=version,
+        migration_required=version < SCHEMA_VERSION,
+        private_permissions=private_permissions,
+        limited_by_active_journal=limited_by_active_journal,
+    )
 
 
 def _canonical_json(value: object) -> str:

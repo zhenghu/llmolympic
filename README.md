@@ -5,9 +5,38 @@
 
 ## 安装
 
+### GitHub Release
+
+v0.1.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install \
+  https://github.com/zhenghu/llmolympic/releases/download/v0.1.0/llmolympic-0.1.0-py3-none-any.whl
+```
+
+安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
+
+```bash
+llmolympic --version
+llmolympic doctor
+llmolympic games
+```
+
+本次 v0.1.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+wheel 提供 `llmolympic` 命令；双击启动器 `play.command` 随源码仓库和 GitHub 自动生成的
+源码归档提供，不包含在 wheel 中。
+
+仓库当前未附开源许可证。公开下载不代表授予复制、修改或再分发代码的许可；如需这些
+权限，请先联系仓库所有者。
+
+### 源码开发安装
+
+从源码运行或参与开发时，在仓库根目录创建 editable 环境：
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
 用 OpenAI 模型对战需设置 `OPENAI_API_KEY`（见 `.env.example`）；
@@ -15,7 +44,8 @@ pip install -e ".[dev]"
 
 ## 配置模型
 
-在源码项目根目录复制模板生成自己的配置（`config.toml` 含密钥，已被 git 忽略）：
+源码安装时，可在项目根目录复制模板生成自己的配置（`config.toml` 含密钥，已被 git
+忽略）：
 
 ```bash
 cp config.example.toml config.toml
@@ -60,11 +90,18 @@ display_name = "Local Llama"
 # llm_timeout_seconds = 120.0 # 对应环境变量 LLMOLYMPIC_LLM_TIMEOUT
 ```
 
-也可以显式指定其他位置的配置文件，适合在项目目录外运行已安装的命令：
+wheel 安装不会把 `config.example.toml` 或用户配置写入 site-packages，也不会自动读取
+当前工作目录中的配置。请从源码仓库取得 [config.example.toml](config.example.toml)，
+保存到自己的配置目录，并显式指定路径：
 
 ```bash
+mkdir -p "$HOME/.config/llmolympic"
+# 将 config.example.toml 复制到下面的路径并按需编辑
 export LLMOLYMPIC_CONFIG="$HOME/.config/llmolympic/config.toml"
 ```
+
+源码安装仍可自动读取仓库根目录的 `config.toml`；也可以使用同一个
+`LLMOLYMPIC_CONFIG` 方式覆盖它。
 
 查找顺序为：`LLMOLYMPIC_CONFIG` 指定的文件 > 源码项目根目录的
 `config.toml`。程序不会扫描任意当前工作目录中的 `config.toml`，避免环境中的
@@ -75,6 +112,14 @@ API Key 被意外发送到不可信配置指定的兼容端点。配置项取值
 chmod 600 config.toml
 # 使用显式配置路径时：chmod 600 "$LLMOLYMPIC_CONFIG"
 ```
+
+### 升级已有数据库
+
+首次用 v0.1.0 打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到 v5 并保留
+既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用 SQLite 备份机制
+制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和 `-shm` 文件。升级后的
+数据库不应再交给只支持旧 schema 的版本打开。可先运行 `llmolympic doctor --db 路径`
+进行只读检查；`doctor` 不执行迁移。
 
 Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
 目前支持 `openai` 和 `ollama`。OpenAI 兼容 Profile 必须声明
@@ -281,3 +326,14 @@ ELO 目前适用于双人对局：比较双方最终比分后按胜 / 平 / 负�
 pytest
 ruff check .
 ```
+
+## Release 资产
+
+每个正式 GitHub Release 提供以下可校验资产：
+
+- `llmolympic-0.1.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.1.0.tar.gz`：Python 源码发行包（sdist）。
+- `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
+
+GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。
+发布记录见 [CHANGELOG.md](CHANGELOG.md)，安全支持范围见 [SECURITY.md](SECURITY.md)。

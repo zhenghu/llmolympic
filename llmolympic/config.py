@@ -41,6 +41,14 @@ class ProviderProfile:
     display_name: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigSource:
+    """The single trusted configuration location selected for this process."""
+
+    path: Path
+    explicit: bool
+
+
 def _warn_if_config_is_shared(path: Path) -> None:
     """在 POSIX 上提醒用户不要让含密钥的配置对组/其他用户可读。"""
 
@@ -58,12 +66,21 @@ def _warn_if_config_is_shared(path: Path) -> None:
         )
 
 
-def _find_config() -> Path | None:
+def config_source() -> ConfigSource:
+    """Return the selected config location, even when that file is absent.
+
+    Keeping selection separate from loading lets read-only diagnostics distinguish an
+    intentionally empty installation from a misspelled ``LLMOLYMPIC_CONFIG`` path.
+    """
+
     if env_path := os.environ.get("LLMOLYMPIC_CONFIG"):
-        # 显式指定的路径是唯一来源，不存在就当没有配置
-        path = Path(env_path)
-        return path if path.is_file() else None
-    return _PROJECT_CONFIG if _PROJECT_CONFIG.is_file() else None
+        return ConfigSource(path=Path(env_path), explicit=True)
+    return ConfigSource(path=_PROJECT_CONFIG, explicit=False)
+
+
+def _find_config() -> Path | None:
+    source = config_source()
+    return source.path if source.path.is_file() else None
 
 
 @lru_cache

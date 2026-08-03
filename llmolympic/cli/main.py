@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from llmolympic import __version__
 from llmolympic.cli.terminal import (
     ARCHIVE_DISPLAY_LIMIT,
     NAME_DISPLAY_LIMIT,
@@ -61,6 +62,7 @@ from llmolympic.core.tournament import (
     prepare_round_robin,
     resume_round_robin,
 )
+from llmolympic.diagnostics import run_diagnostics
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_profile_provider, create_provider
 
@@ -76,6 +78,46 @@ TOURNAMENT_MOVE_ATTEMPTS = 3
 DEFAULT_TOURNAMENT_GAME = "knowledge_quiz"
 DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
 DEFAULT_TOURNAMENT_SEED = 0
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"llmolympic {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="显示版本并退出",
+        ),
+    ] = False,
+) -> None:
+    """LLM Olympics command-line interface."""
+
+
+@app.command()
+def doctor(
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
+) -> None:
+    """离线检查版本、配置、Provider 就绪状态与 SQLite 兼容性。"""
+
+    checks = run_diagnostics(database)
+    styles = {"PASS": "green", "WARN": "yellow", "FAIL": "red"}
+    for check in checks:
+        line = Text(f"{check.status} ", style=f"bold {styles[check.status]}")
+        line.append(literal_text(check.message))
+        console.print(line)
+    if any(check.status == "FAIL" for check in checks):
+        raise typer.Exit(code=1)
 
 
 def _render_warning() -> None:
