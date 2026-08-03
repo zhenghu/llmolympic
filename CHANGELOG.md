@@ -2,6 +2,17 @@
 
 本文件记录 LLM Olympics 各正式版本的重要变化。
 
+## [0.1.2] - 2026-08-03
+
+### 安全
+
+- 普通 `openai:model` 使用第三方 OpenAI 兼容端点时，不再继承 OpenAI SDK 的全局
+  organization、project、admin、webhook 或自定义请求头，防止不同端点间串用凭据。
+- 同步、异步客户端及设置单步超时后由 `with_options()` 创建的客户端副本使用相同
+  隔离策略；`OPENAI_API_KEY` 与 `OPENAI_BASE_URL` 的既有配置方式保持不变。
+- 精确的 OpenAI 官方默认端点继续保留 SDK 原有的 organization、project 和自定义头
+  兼容行为；命名 Provider Profile 仍对所有端点执行完整隔离。
+
 ## [0.1.1] - 2026-08-03
 
 ### 许可

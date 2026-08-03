@@ -19,7 +19,7 @@ from llmolympic.providers.base import (
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
-def _isolate_profile_client(client):
+def _isolate_client(client):
     """Remove OpenAI SDK settings inherited from its global environment."""
     # Passing empty strings prevents the constructor from consulting the
     # environment. Reset them to None so no empty organization/project headers
@@ -34,18 +34,17 @@ def _isolate_profile_client(client):
         if hasattr(client, attribute):
             setattr(client, attribute, None)
     if not hasattr(client, "_custom_headers"):
-        raise ProviderConfigurationError("当前 OpenAI SDK 无法安全隔离 Profile 请求头")
+        raise ProviderConfigurationError("当前 OpenAI SDK 无法安全隔离请求头")
     client._custom_headers = {}
     return client
 
 
-def _profile_client_options(client_factory) -> dict[str, object]:
+def _isolated_client_options(client_factory) -> dict[str, object]:
     """Build isolation options accepted by both early and current SDK v1/v2."""
 
     parameters = inspect.signature(client_factory).parameters.values()
     accepts_project = any(
-        parameter.name == "project"
-        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        parameter.name == "project" or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
     options: dict[str, object] = {
@@ -82,10 +81,6 @@ class OpenAIProvider(Provider):
             resolved_base_url = resolved_base_url or cfg_get(
                 "openai", "base_url", env="OPENAI_BASE_URL"
             )
-        else:
-            # Profile 必须将 Key 与端点原子绑定。显式传入官方默认值，
-            # 防止 OpenAI SDK 在 base_url=None 时自行读取 OPENAI_BASE_URL。
-            resolved_base_url = resolved_base_url or _DEFAULT_BASE_URL
         if not resolved_api_key:
             source = (
                 f"Provider Profile {profile_id!r} 的 api_key_env"
@@ -93,27 +88,31 @@ class OpenAIProvider(Provider):
                 else "OPENAI_API_KEY 或 [openai].api_key"
             )
             raise ProviderConfigurationError(f"未配置 OpenAI API Key；请设置 {source}")
-        if resolved_base_url is not None:
-            resolved_base_url = validate_base_url(
-                resolved_base_url,
-                source=(
-                    f"Provider Profile {profile_id!r} 的 base_url"
-                    if profile_id is not None
-                    else "OpenAI base_url"
-                ),
-                require_https_for_remote=True,
-            )
+        # Resolve the official endpoint explicitly so the SDK cannot choose a
+        # different endpoint after the isolation decision below.
+        resolved_base_url = validate_base_url(
+            resolved_base_url or _DEFAULT_BASE_URL,
+            source=(
+                f"Provider Profile {profile_id!r} 的 base_url"
+                if profile_id is not None
+                else "OpenAI base_url"
+            ),
+            require_https_for_remote=True,
+        )
         self.profile_id = profile_id
-        self._profile_mode = not use_legacy_config
-        sync_client_options = {}
-        async_client_options = {}
-        if self._profile_mode:
-            # The SDK otherwise reads OPENAI_ORG_ID and (on versions that
-            # support it) OPENAI_PROJECT_ID even when api_key/base_url are
-            # explicit. default_headers={} alone does not suppress
-            # OPENAI_CUSTOM_HEADERS; _isolate_profile_client does.
-            sync_client_options = _profile_client_options(OpenAI)
-            async_client_options = _profile_client_options(AsyncOpenAI)
+        # Profiles always bind a key to one isolated endpoint. Preserve the
+        # documented legacy SDK behavior for the exact official endpoint, but
+        # never forward ambient OpenAI organization, project, admin, webhook,
+        # or custom headers to a third-party compatible endpoint.
+        self._isolate_sdk_environment = (
+            not use_legacy_config or resolved_base_url != _DEFAULT_BASE_URL
+        )
+        sync_client_options = (
+            _isolated_client_options(OpenAI) if self._isolate_sdk_environment else {}
+        )
+        async_client_options = (
+            _isolated_client_options(AsyncOpenAI) if self._isolate_sdk_environment else {}
+        )
         self._client = OpenAI(
             api_key=resolved_api_key,
             base_url=resolved_base_url,
@@ -124,9 +123,11 @@ class OpenAIProvider(Provider):
             base_url=resolved_base_url,
             **async_client_options,
         )
-        if self._profile_mode:
-            self._client = _isolate_profile_client(self._client)
-            self._async_client = _isolate_profile_client(self._async_client)
+        if self._isolate_sdk_environment:
+            # default_headers={} alone does not suppress
+            # OPENAI_CUSTOM_HEADERS, so scrub each real client too.
+            self._client = _isolate_client(self._client)
+            self._async_client = _isolate_client(self._async_client)
 
     @classmethod
     def _completion_params(cls, params: dict, *, model: str) -> dict:
@@ -154,8 +155,8 @@ class OpenAIProvider(Provider):
         client = self._client
         if request_timeout is not None:
             client = client.with_options(timeout=request_timeout, max_retries=0)
-            if getattr(self, "_profile_mode", False):
-                client = _isolate_profile_client(client)
+            if getattr(self, "_isolate_sdk_environment", False):
+                client = _isolate_client(client)
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -179,8 +180,8 @@ class OpenAIProvider(Provider):
         client = self._async_client
         if request_timeout is not None:
             client = client.with_options(timeout=request_timeout, max_retries=0)
-            if getattr(self, "_profile_mode", False):
-                client = _isolate_profile_client(client)
+            if getattr(self, "_isolate_sdk_environment", False):
+                client = _isolate_client(client)
         try:
             resp = await client.chat.completions.create(
                 model=model,

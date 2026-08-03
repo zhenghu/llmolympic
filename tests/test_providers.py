@@ -196,7 +196,18 @@ def test_openai_profile_without_base_url_does_not_inherit_global_endpoint(monkey
     assert "attacker.example" not in str(provider._client.base_url)
 
 
-def test_openai_profile_clients_do_not_inherit_global_sdk_headers(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "provider_mode",
+    ["legacy-compatible", "legacy-official", "profile-official"],
+)
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("request_timeout", [None, 0.25], ids=["direct", "with-options"])
+def test_openai_sdk_environment_is_isolated_from_compatible_endpoints(
+    monkeypatch,
+    provider_mode: str,
+    async_mode: bool,
+    request_timeout: float | None,
+) -> None:
     sync_requests: list[httpx.Request] = []
     async_requests: list[httpx.Request] = []
     real_sync_client = openai.OpenAI
@@ -243,45 +254,81 @@ def test_openai_profile_clients_do_not_inherit_global_sdk_headers(monkeypatch) -
 
     monkeypatch.setattr(openai, "OpenAI", sync_client)
     monkeypatch.setattr(openai, "AsyncOpenAI", async_client)
-    monkeypatch.setenv(
-        "OPENAI_CUSTOM_HEADERS",
-        "Authorization: Bearer global-key\nX-Global-Leak: inherited-value",
-    )
     monkeypatch.setenv("OPENAI_ORG_ID", "global-organization")
     monkeypatch.setenv("OPENAI_PROJECT_ID", "global-project")
     monkeypatch.setenv("OPENAI_ADMIN_KEY", "global-admin-key")
     monkeypatch.setenv("OPENAI_WEBHOOK_SECRET", "global-webhook-secret")
 
-    provider = OpenAIProvider(
-        api_key="profile-test-key",
-        base_url="https://profile.example/v1",
-        profile_id="isolated",
-        use_legacy_config=False,
-    )
+    isolated = provider_mode != "legacy-official"
+    if isolated:
+        monkeypatch.setenv(
+            "OPENAI_CUSTOM_HEADERS",
+            "Authorization: Bearer global-key\nX-Global-Leak: inherited-value",
+        )
+    else:
+        monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Official-Compatible: retained-value")
 
-    assert provider._client.organization is None
-    assert provider._client.project is None
-    assert provider._client.admin_api_key is None
-    assert provider._client.webhook_secret is None
-    assert provider._client._custom_headers == {}
-    assert provider._async_client.organization is None
-    assert provider._async_client.project is None
-    assert provider._async_client.admin_api_key is None
-    assert provider._async_client.webhook_secret is None
-    assert provider._async_client._custom_headers == {}
-    assert provider.chat([], model="test-model", request_timeout=0.25) == "ok"
-    assert (
-        asyncio.run(provider.achat([], model="test-model", request_timeout=0.25))
-        == "ok"
-    )
+    if provider_mode == "profile-official":
+        expected_api_key = "profile-test-key"
+        expected_base_url = "https://api.openai.com/v1/"
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://attacker.example/v1")
+        provider = OpenAIProvider(
+            api_key=expected_api_key,
+            profile_id="isolated",
+            use_legacy_config=False,
+        )
+    else:
+        expected_api_key = "legacy-test-key"
+        expected_base_url = (
+            "https://compatible.example/v1/"
+            if provider_mode == "legacy-compatible"
+            else "https://api.openai.com/v1/"
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", expected_api_key)
+        monkeypatch.setenv("OPENAI_BASE_URL", expected_base_url)
+        provider = OpenAIProvider()
 
-    for request in [*sync_requests, *async_requests]:
-        assert request.headers["Authorization"] == "Bearer profile-test-key"
+    assert str(provider._client.base_url) == expected_base_url
+    assert str(provider._async_client.base_url) == expected_base_url
+    assert provider._isolate_sdk_environment is isolated
+    if isolated:
+        for client in (provider._client, provider._async_client):
+            assert client.organization is None
+            assert client.project is None
+            assert client.admin_api_key is None
+            assert client.webhook_secret is None
+            assert client._custom_headers == {}
+    else:
+        for client in (provider._client, provider._async_client):
+            assert client.organization == "global-organization"
+            assert client.project == "global-project"
+            assert client.admin_api_key == "global-admin-key"
+            assert client.webhook_secret == "global-webhook-secret"  # noqa: S105 - synthetic value
+            assert client._custom_headers == {"X-Official-Compatible": "retained-value"}
+
+    if async_mode:
+        result = asyncio.run(
+            provider.achat([], model="test-model", request_timeout=request_timeout)
+        )
+    else:
+        result = provider.chat([], model="test-model", request_timeout=request_timeout)
+    assert result == "ok"
+
+    requests = [*sync_requests, *async_requests]
+    assert len(requests) == 1
+    request = requests[0]
+    assert str(request.url).startswith(expected_base_url)
+    assert request.headers["Authorization"] == f"Bearer {expected_api_key}"
+    if isolated:
         assert "X-Global-Leak" not in request.headers
         assert "OpenAI-Organization" not in request.headers
         assert "OpenAI-Project" not in request.headers
         assert "global-key" not in str(request.headers)
         assert "inherited-value" not in str(request.headers)
+    else:
+        assert request.headers["X-Official-Compatible"] == "retained-value"
+        assert request.headers["OpenAI-Organization"] == "global-organization"
+        assert request.headers["OpenAI-Project"] == "global-project"
 
 
 def test_openai_profile_remains_compatible_with_sdk_without_project_argument(
@@ -290,9 +337,7 @@ def test_openai_profile_remains_compatible_with_sdk_without_project_argument(
     real_sync_client = openai.OpenAI
     real_async_client = openai.AsyncOpenAI
 
-    def legacy_sync_client(
-        *, api_key, organization=None, base_url=None, default_headers=None
-    ):
+    def legacy_sync_client(*, api_key, organization=None, base_url=None, default_headers=None):
         return real_sync_client(
             api_key=api_key,
             organization=organization,
@@ -300,9 +345,7 @@ def test_openai_profile_remains_compatible_with_sdk_without_project_argument(
             default_headers=default_headers,
         )
 
-    def legacy_async_client(
-        *, api_key, organization=None, base_url=None, default_headers=None
-    ):
+    def legacy_async_client(*, api_key, organization=None, base_url=None, default_headers=None):
         return real_async_client(
             api_key=api_key,
             organization=organization,
