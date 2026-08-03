@@ -58,7 +58,7 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
-    assert metadata["Version"] == __version__ == "0.1.1"
+    assert metadata["Version"] == __version__ == "0.1.2"
     assert project["project"]["license"] == "MIT"
     assert project["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
     assert metadata["License-Expression"] == "MIT"
@@ -115,7 +115,7 @@ def test_doctor_missing_config_and_database_warns_without_creating_files(tmp_pat
     output = _plain(result.output)
 
     assert result.exit_code == 0
-    assert "PASS llmolympic 0.1.1" in output
+    assert "PASS llmolympic 0.1.2" in output
     assert "WARN 未找到配置文件" in output
     assert "WARN SQLite 数据库尚未创建" in output
     assert not database.exists()

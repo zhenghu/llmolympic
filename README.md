@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.1.1 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.1.2 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.1.1/llmolympic-0.1.1-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.1.2/llmolympic-0.1.2-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.1.1 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.1.2 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command` 随源码仓库和 GitHub 自动生成的
 源码归档提供，不包含在 wheel 中。
 
@@ -131,6 +131,12 @@ Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
 自定义请求头，更不会把 Key 写入对局档案。
 所有携带 API Key 的远程 OpenAI 兼容端点都必须使用 HTTPS；明文 HTTP
 只允许 `localhost`、`127.0.0.0/8` 或 `::1` 回环地址。
+
+普通 `openai:model` 语法仍从 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 或 `[openai]`
+读取所选 Key 与端点。当端点不是精确的 OpenAI 官方默认地址时，客户端不会把
+`OPENAI_ORG_ID`、`OPENAI_PROJECT_ID`、`OPENAI_CUSTOM_HEADERS` 等全局 SDK 设置
+转发到兼容服务，避免不同端点的请求头或凭据发生串用。官方默认端点继续保留 SDK
+对这些环境设置的兼容行为；多端点比赛仍推荐使用隔离边界更明确的命名 Profile。
 
 ```bash
 export KIMI_API_KEY="..."
@@ -334,8 +340,8 @@ ruff check .
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.1.1-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.1.1.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.1.2-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.1.2.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。
