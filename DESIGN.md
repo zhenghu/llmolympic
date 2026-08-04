@@ -51,6 +51,34 @@
   双人对局才计分；它是调用方信任声明，不是认证、签名或对来源的密码学证明。
   同一 match/series/tournament ID 也不能通过重新保存从 imported 升级为 engine。
 
+### 1.3 严格只读赛事审计
+
+- `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
+  `integrity_check`、当前 schema v5 必需列和已声明外键检查覆盖整个文件，业务语义深验
+  则限定在目标赛事。当前不对 PK/UNIQUE/CHECK/FK/必要索引做完整结构指纹；后续应基于
+  `table_xinfo` / `index_list` / `foreign_key_list` 建立兼容迁移库的 manifest，不能逐字匹配 DDL。
+- 审计连接使用 `mode=ro&immutable=1` 与 `query_only`，不构造 `SQLiteStore`、不迁移、
+  不 chmod、不创建 sidecar、不修复数据，也不创建 Provider 或访问网络。发现活动 rollback
+  journal/WAL，或审计前后主文件 device/inode/size/mtime 变化时保守失败。
+- 进行中的 checkpoint 必须是确定赛程的连续完整系列前缀，且其保留的 series/match ID
+  不得进入正式表；已封存 checkpoint 必须完整、封存时间不早于最后更新，并与正式赛事
+  一一对应。checkpoint 创建、加载和审计还会按首个可信观察规则预检既有 `entrant_id`
+  身份，避免不可封存的身份冲突拖到整场完成后才暴露。正式赛事继续深验参赛者、配对、
+  series/match 关系和 canonical JSON。
+- 已计分赛事还会核对正式档案身份与全局 `entrants.identity_json` 的绑定，并重算赛事内的
+  冻结 ELO、逐局 contribution/history 和聚合 snapshot，
+  以及全局榜单的局数/胜平负汇总。若同一选手和作用域存在目标赛事外的其他计分操作，
+  schema v5 缺少全局评分操作序号，不能由事件时间证明相对提交顺序或唯一重放当前 rating；
+  报告必须把 leaderboard 覆盖标为 `partial`，不能宣称完整 PASS。`partial` 仍须验证目标
+  赛前分来自默认值或既有 history 的 `rating_after`、当前分等于某条已知 `rating_after`
+  候选，并按单局、系列赛和循环赛三类评分操作核对排行榜更新时间。未来若要求任意历史状态
+  都可唯一重放，应提升 schema 并引入单调 rating operation sequence。
+- 运行期的 `round-robin --resume` 在把正式赛事视为完成前也使用正式档案深验，避免顶层
+  JSON 尚可解析但关系索引或 ELO 已损坏时错误跳过恢复。
+- checkpoint 目前没有 runner lease；并行恢复同一 ID 时，事务可防止重复落库/ELO，但不能
+  防止两个执行者在冲突被发现前重复调用 Provider。部署层必须保证单执行者；后续 lease
+  设计应使用短事务 claim/renew/expire，绝不能跨网络调用持有 SQLite 写事务。
+
 ## 2. 统一 Game 接口（核心设计）
 
 ```python
@@ -189,7 +217,8 @@ CLI（今天）          WebSocket（将来）
    LLM 超时、Provider 异常技术判负与失败档案 ✅；交换先手双局赛与公平批量
    ELO ✅；逻辑推理与结构化猜谜项目 ✅；标准国际象棋与换色双局赛 ✅；
    稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；
-   公平循环赛与 SQLite v4 迁移 ✅；逐对阵 checkpoint/resume 与 SQLite v5 迁移 ✅。
+   公平循环赛与 SQLite v4 迁移 ✅；逐对阵 checkpoint/resume 与 SQLite v5 迁移 ✅；
+   循环赛严格只读深度审计与恢复完成态校验 ✅。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。

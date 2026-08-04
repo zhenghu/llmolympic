@@ -198,6 +198,10 @@ llmolympic round-robin --game knowledge_quiz \
 # 从开赛时显示的赛事 ID 恢复中断的循环赛（自定义数据库需再次指定）
 llmolympic round-robin --resume <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
 
+# 严格只读审计一项进行中或已封存的循环赛；--json 适合 CI/脚本
+llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
+llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db --json
+
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
 llmolympic play --game chess --players human:我,mock:random
 
@@ -270,6 +274,36 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 模型。检查点只保存无密钥的选手描述，不保存 API Key、Key 哈希或 Provider 客户端；
 恢复进程会从当前的环境变量和 Profile 配置重建 Provider，所需 Key 必须仍可用。如果新赛事
 使用了自定义 `--db`，恢复时也必须指向同一数据库。
+创建和恢复 checkpoint 时会先核对已有可信 `entrant_id` 的身份绑定；若同一稳定 ID 已绑定
+到不同模型/Profile 身份，会在首次或下一次 Provider 调用前拒绝，避免跑完整场后才封存失败。
+
+当前 checkpoint 尚未提供跨进程 runner lease。同一赛事 ID 不要同时启动两个
+`round-robin --resume`：SQLite 的前缀比较与事务会阻止重复落库和重复 ELO，但两个进程仍
+可能在其中一个保存失败前重复调用 Provider、产生额外费用。一次只保留一个恢复进程。
+
+### 严格只读赛事审计
+
+`audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
+权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
+schema v5 必需列和已声明外键检查，再深度核对指定赛事的 checkpoint 连续前缀、正式赛事、
+参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分赛事的稳定
+身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
+已封存赛事会验证正式档案。命令只报告、不修复数据。当前版本不对
+PK/UNIQUE/CHECK/FK/索引定义做完整结构指纹；这类结构级篡改
+需要后续基于 SQLite introspection manifest 补充，不能把本命令当作 DDL 取证工具。
+
+为避免把不一致快照误报为健康，审计前或审计过程中出现同名 `-journal` / `-wal`、主文件
+发生变化时会退出失败；请先停止写入该数据库的比赛进程再重试。旧 schema 也只报告需要
+迁移，不会原地升级或 chmod。退出码 `0` 表示指定赛事通过，`1` 表示数据库/赛事不一致，
+Typer 参数错误使用退出码 `2`；`--json` 输出不包含选手、模型、题面、端点或原始异常。
+
+赛事自身的 ELO 快照、贡献和 history 始终逐项验证。若同一选手和榜单作用域还存在该赛事
+之外的其他计分操作，schema v5 没有全局 rating operation sequence，无法仅凭事件时间证明
+这些操作与目标赛事的相对提交顺序；此时 `checks.leaderboard` 会是 `partial`，而不是把
+覆盖范围夸大为完整 PASS。即使标记为 `partial`，审计仍会验证排行榜胜平负汇总、目标赛事
+赛前分的历史来源、当前分等于某条已知 history 的 `rating_after` 候选，以及更新时间对应
+真实评分操作；它只是不宣称能唯一重放全局提交顺序。`round-robin --resume` 也会在宣告
+正式赛事“已完成”前执行同一套关系与 ELO 深验。
 
 问答赛估算为
 `2*N*(N-1)*rounds` 个选手回合；16 人 × 100 轮为 48,000 回合，默认最多
