@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.1.2 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.2.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.1.2/llmolympic-0.1.2-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.2.0/llmolympic-0.2.0-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.1.2 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.2.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command` 随源码仓库和 GitHub 自动生成的
 源码归档提供，不包含在 wheel 中。
 
@@ -393,8 +393,8 @@ ruff check .
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.1.2-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.1.2.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.2.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.2.0.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。
