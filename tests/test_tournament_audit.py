@@ -306,7 +306,9 @@ def test_audit_in_progress_checkpoint_reports_resumable_prefix(tmp_path: Path) -
     tournament = _tournament("in-progress")
     store = SQLiteStore(database)
     store.save_tournament_checkpoint(_checkpoint(tournament))
-    store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1), lease=lease)
+    store.release_tournament_runner(lease)
 
     report = audit_tournament(tournament.tournament_id, database)
 
@@ -317,6 +319,21 @@ def test_audit_in_progress_checkpoint_reports_resumable_prefix(tmp_path: Path) -
     assert report.resumable
     assert report.checkpoint_present
     assert report.leaderboard_replay_complete is None
+
+
+def test_audit_active_runner_reports_checkpoint_not_yet_resumable(tmp_path: Path) -> None:
+    database = tmp_path / "active-runner-checkpoint.db"
+    tournament = _tournament("active-runner")
+    store = SQLiteStore(database)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+
+    report = audit_tournament(tournament.tournament_id, database)
+
+    assert report.state == "in_progress"
+    assert not report.resumable
+    assert report.checkpoint_present
+    assert store.release_tournament_runner(lease)
 
 
 def test_checkpoint_identity_conflict_fails_before_calls_and_on_legacy_resume(
@@ -384,9 +401,11 @@ def test_audit_finalized_checkpoint_verifies_formal_archive(tmp_path: Path) -> N
     database = tmp_path / "finalized-checkpoint.db"
     tournament = _tournament("finalized-checkpoint")
     store = SQLiteStore(database)
-    for count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, count))
-    store.finalize_tournament_checkpoint(tournament.tournament_id)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for count in range(1, 4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, count), lease=lease)
+    store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
     report = audit_tournament(tournament.tournament_id, database)
 
@@ -833,9 +852,11 @@ def test_audit_rejects_finalization_before_checkpoint_completion(tmp_path: Path)
     database = tmp_path / "bad-finalized-at.db"
     tournament = _tournament("bad-finalized-at")
     store = SQLiteStore(database)
-    for count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, count))
-    store.finalize_tournament_checkpoint(tournament.tournament_id)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for count in range(1, 4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, count), lease=lease)
+    store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
     bad_timestamp = (tournament.finished_at - timedelta(seconds=1)).isoformat()
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -861,8 +882,10 @@ def test_finalize_never_writes_time_before_checkpoint_when_wall_clock_moves_back
     database = tmp_path / "clock-rollback.db"
     tournament = _tournament("clock-rollback")
     store = SQLiteStore(database)
-    for count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, count))
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for count in range(1, 4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, count), lease=lease)
 
     class ClockBehind(datetime):
         @classmethod
@@ -872,7 +895,7 @@ def test_finalize_never_writes_time_before_checkpoint_when_wall_clock_moves_back
 
     monkeypatch.setattr(storage_module, "datetime", ClockBehind)
 
-    store.finalize_tournament_checkpoint(tournament.tournament_id)
+    store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
     with sqlite3.connect(database) as connection:
         finalized_at, updated_at = connection.execute(

@@ -6,6 +6,19 @@
 
 ### 赛事审计与可靠性
 
+- 循环赛 checkpoint 新增 SQLite 跨进程 runner lease：恢复进程会在重建 Provider 和调用模型
+  前原子领取执行权；默认 60 秒租约配合 15 秒心跳及每组开赛前续租，避免同一赛事被并行执行。
+- lease 使用进程内随机 capability token、数据库 token 摘要和单调 generation fencing；过期、
+  释放或已被接管的 v6 runner 不能再追加 checkpoint、封存赛事或更新 ELO。`Ctrl-C` 会尽力
+  立即释放，崩溃后则可在过期后安全接管。
+- SQLite schema 升至 v6；v5→v6 的 lease 表迁移与版本提升处于同一事务，失败会完整回滚。
+  claim、续租、保存和封存都使用短事务，不跨 Provider 网络调用持有写锁。
+- 心跳丢失会取消循环赛任务；只实现同步 `chat()` 的旧第三方 Provider 已在途请求仍可能短暂
+  继续，但其旧 generation 已被禁止持久化任何结果。
+- 心跳会在当前租约有效窗口内重试临时 SQLite `BUSY`/`LOCKED`，避免把短暂写锁竞争误报为
+  失权；完整但未封存的 checkpoint 可直接结算，无需重建 Provider 或重新调用模型。
+- 升级数据库前必须先停止仍在运行的 v5 runner；已经加载的旧代码不理解 lease，v6 schema
+  无法反向约束它继续调用旧写入路径。
 - 新增 `audit-tournament`，以 immutable、query-only SQLite 快照严格只读审计指定的
   循环赛或 checkpoint；检查完整性、当前 schema 必需列、已声明外键、赛事关系索引、
   正式档案及 ELO 账本。

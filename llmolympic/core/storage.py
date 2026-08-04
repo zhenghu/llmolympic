@@ -8,14 +8,16 @@ per-game and overall ELO tables happens in one transaction.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import warnings
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -38,7 +40,7 @@ from llmolympic.core.tournament import (
     tournament_from_series,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 RatingSource = Literal["engine", "imported"]
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
@@ -47,6 +49,9 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
 _SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _SAFE_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_RUNNER_LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
+DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS = 60
+MAX_TOURNAMENT_RUNNER_LEASE_SECONDS = 86_400
 _IDENTITY_SAMPLING_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -269,7 +274,7 @@ _V4_REQUIRED_COLUMNS = {
     },
 }
 
-_REQUIRED_COLUMNS = {
+_V5_REQUIRED_COLUMNS = {
     **_V4_REQUIRED_COLUMNS,
     "tournament_checkpoints": {
         "tournament_id",
@@ -300,6 +305,18 @@ _REQUIRED_COLUMNS = {
         "match_2_id",
         "completed_at",
         "series_json",
+    },
+}
+
+_REQUIRED_COLUMNS = {
+    **_V5_REQUIRED_COLUMNS,
+    "tournament_runner_leases": {
+        "tournament_id",
+        "generation",
+        "token_digest",
+        "acquired_at_epoch",
+        "renewed_at_epoch",
+        "expires_at_epoch",
     },
 }
 
@@ -383,6 +400,18 @@ class TournamentCheckpointCollisionError(StorageError):
     """A tournament checkpoint id is attached to different configuration or progress."""
 
 
+class TournamentRunnerLeaseError(StorageError):
+    """Base exception for runner lease coordination failures."""
+
+
+class TournamentRunnerLeaseBusyError(TournamentRunnerLeaseError):
+    """A different runner currently owns an unexpired tournament lease."""
+
+
+class TournamentRunnerLeaseLostError(TournamentRunnerLeaseError):
+    """A runner no longer owns the active fencing generation."""
+
+
 class UnsupportedSchemaError(StorageError):
     """The database was created by a newer, unsupported schema version."""
 
@@ -459,6 +488,26 @@ class TournamentCheckpointSaveResult:
     inserted: bool
     completed_pairing_count: int
     pairing_count: int
+
+
+@dataclass(frozen=True)
+class TournamentRunnerLease:
+    """Opaque capability and fencing generation for one checkpoint runner."""
+
+    tournament_id: str
+    generation: int
+    token: str = field(repr=False)
+    acquired_at_epoch: int
+    renewed_at_epoch: int
+    expires_at_epoch: int
+
+
+@dataclass(frozen=True)
+class TournamentRunnerClaim:
+    """A checkpoint reloaded under the same transaction that acquired its lease."""
+
+    checkpoint: TournamentCheckpoint
+    lease: TournamentRunnerLease
 
 
 @dataclass(frozen=True)
@@ -558,6 +607,15 @@ class _TournamentAggregate:
     outcomes: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class _TournamentRunnerLeaseState:
+    generation: int
+    token_digest: bytes | None
+    acquired_at_epoch: int | None
+    renewed_at_epoch: int | None
+    expires_at_epoch: int | None
+
+
 def database_path(path: str | Path | None = None) -> Path:
     """Resolve the database path from an override, config, or the default.
 
@@ -570,6 +628,41 @@ def database_path(path: str | Path | None = None) -> Path:
         configured = cfg_get("storage", "database", env="LLMOLYMPIC_DB")
         path = configured or Path.home() / ".llmolympic" / "llmolympic.db"
     return Path(os.path.expandvars(str(path))).expanduser().resolve()
+
+
+def _validate_runner_lease_seconds(value: int) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_TOURNAMENT_RUNNER_LEASE_SECONDS
+    ):
+        raise ValueError(
+            f"runner lease 秒数必须是 1 到 {MAX_TOURNAMENT_RUNNER_LEASE_SECONDS} 之间的整数"
+        )
+    return value
+
+
+def _runner_lease_token_digest(token: str) -> bytes:
+    if not isinstance(token, str) or not _RUNNER_LEASE_TOKEN_RE.fullmatch(token):
+        raise ValueError("runner lease token 无效")
+    return hashlib.sha256(bytes.fromhex(token)).digest()
+
+
+def _validate_runner_lease_handle(
+    lease: TournamentRunnerLease,
+    tournament_id: str,
+) -> bytes:
+    if not isinstance(lease, TournamentRunnerLease):
+        raise TypeError("必须提供 TournamentRunnerLease")
+    if lease.tournament_id != tournament_id:
+        raise ValueError("runner lease 不属于该循环赛")
+    if (
+        isinstance(lease.generation, bool)
+        or not isinstance(lease.generation, int)
+        or lease.generation < 1
+    ):
+        raise ValueError("runner lease generation 无效")
+    return _runner_lease_token_digest(lease.token)
 
 
 def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
@@ -623,6 +716,8 @@ def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
                 SQLiteStore._verify_v3_schema(connection)
             elif version == 4:
                 SQLiteStore._verify_v4_schema(connection)
+            elif version == 5:
+                SQLiteStore._verify_v5_schema(connection)
             else:
                 SQLiteStore._verify_schema(connection)
             SQLiteStore._verify_foreign_keys(connection)
@@ -729,6 +824,10 @@ def audit_tournament(
                 connection,
                 tournament_id,
             )
+            runner_lease = verifier._load_tournament_runner_lease(
+                connection,
+                tournament_id,
+            )
             loaded_tournament = verifier._load_verified_tournament(
                 connection,
                 tournament_id,
@@ -763,6 +862,8 @@ def audit_tournament(
                     game = checkpoint.game
                     pairing_count = len(checkpoint.schedule)
                 else:
+                    if runner_lease is not None:
+                        raise StorageError("finalized checkpoint still has a runner lease")
                     if loaded_tournament is None:
                         raise StorageError("finalized checkpoint has no formal archive")
                     tournament, rated, leaderboard_replay_complete = loaded_tournament
@@ -770,6 +871,8 @@ def audit_tournament(
                     game = tournament.game
                     pairing_count = len(tournament.pairings)
             else:
+                if runner_lease is not None:
+                    raise StorageError("runner lease has no checkpoint")
                 if loaded_tournament is None:
                     raise StorageError("formal tournament disappeared during audit")
                 tournament, rated, leaderboard_replay_complete = loaded_tournament
@@ -784,6 +887,14 @@ def audit_tournament(
                 for series in completed_series
                 for standing in series.standings.values()
             )
+            runner_available = True
+            if (
+                state == "in_progress"
+                and runner_lease is not None
+                and runner_lease.token_digest is not None
+            ):
+                now = verifier._database_epoch(connection)
+                runner_available = runner_lease.expires_at_epoch <= now
             report = TournamentAuditReport(
                 tournament_id=tournament_id,
                 state=state,
@@ -792,7 +903,7 @@ def audit_tournament(
                 pairing_count=pairing_count,
                 technical_losses=technical_losses,
                 rated=rated,
-                resumable=state == "in_progress",
+                resumable=state == "in_progress" and runner_available,
                 checkpoint_present=checkpoint_present,
                 leaderboard_replay_complete=leaderboard_replay_complete,
             )
@@ -984,10 +1095,14 @@ class SQLiteStore:
                     self._verify_v3_schema(connection)
                 elif locked_version == 4:
                     self._verify_v4_schema(connection)
+                elif locked_version == 5:
+                    self._verify_v5_schema(connection)
                 if locked_version < 4:
                     self._create_tournament_schema(connection)
                 if locked_version < 5:
                     self._create_checkpoint_schema(connection)
+                if locked_version < 6:
+                    self._create_runner_lease_schema(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
                 if locked_version < SCHEMA_VERSION:
@@ -1380,6 +1495,43 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _create_runner_lease_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_runner_leases (
+                tournament_id TEXT PRIMARY KEY
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                token_digest BLOB UNIQUE,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER,
+                CHECK (
+                    (token_digest IS NULL
+                     AND acquired_at_epoch IS NULL
+                     AND renewed_at_epoch IS NULL
+                     AND expires_at_epoch IS NULL)
+                    OR
+                    (typeof(token_digest) = 'blob'
+                     AND length(token_digest) = 32
+                     AND acquired_at_epoch IS NOT NULL
+                     AND renewed_at_epoch IS NOT NULL
+                     AND expires_at_epoch IS NOT NULL
+                     AND acquired_at_epoch <= renewed_at_epoch
+                     AND renewed_at_epoch < expires_at_epoch)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS tournament_runner_leases_expires_at_idx
+            ON tournament_runner_leases(expires_at_epoch)
+            WHERE token_digest IS NOT NULL
+            """
+        )
+
+    @staticmethod
     def _migrate_to_v3(connection: sqlite3.Connection, *, include_series: bool) -> None:
         """Move name-keyed ratings to isolated legacy entrant identities atomically."""
 
@@ -1667,8 +1819,51 @@ class SQLiteStore:
         SQLiteStore._verify_required_columns(connection, _V4_REQUIRED_COLUMNS)
 
     @staticmethod
+    def _verify_v5_schema(connection: sqlite3.Connection) -> None:
+        SQLiteStore._verify_required_columns(connection, _V5_REQUIRED_COLUMNS)
+
+    @staticmethod
+    def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
+        table_info = connection.execute("PRAGMA table_info(tournament_runner_leases)").fetchall()
+        primary_key = [row["name"] for row in table_info if row["pk"]]
+        if primary_key != ["tournament_id"]:
+            raise StorageError("SQLite 数据库结构不完整：tournament_runner_leases 主键无效")
+
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(tournament_runner_leases)"
+        ).fetchall()
+        if not any(
+            row["table"] == "tournament_checkpoints"
+            and row["from"] == "tournament_id"
+            and row["to"] == "tournament_id"
+            and row["on_delete"].upper() == "RESTRICT"
+            for row in foreign_keys
+        ):
+            raise StorageError("SQLite 数据库结构不完整：tournament_runner_leases 外键无效")
+
+        has_unique_token = False
+        for index in connection.execute("PRAGMA index_list(tournament_runner_leases)").fetchall():
+            if not index["unique"] or index["partial"]:
+                continue
+            columns = [
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                    (index["name"],),
+                ).fetchall()
+            ]
+            if columns == ["token_digest"]:
+                has_unique_token = True
+                break
+        if not has_unique_token:
+            raise StorageError(
+                "SQLite 数据库结构不完整：tournament_runner_leases 缺少 token 唯一约束"
+            )
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         SQLiteStore._verify_required_columns(connection, _REQUIRED_COLUMNS)
+        SQLiteStore._verify_runner_lease_schema(connection)
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:
@@ -2900,7 +3095,7 @@ class SQLiteStore:
     ) -> bool:
         """Verify the materialized leaderboard when this is its only known operation.
 
-        Schema v5 has event timestamps but no global rating-operation sequence.
+        Schema v6 has event timestamps but no global rating-operation sequence.
         Another history/snapshot row may therefore have been committed before or
         after this tournament regardless of its event time.  Counts can always be
         checked; the current numeric rating is only replay-complete when no other
@@ -3319,6 +3514,300 @@ class SQLiteStore:
         )
         return tournament, rated, replay_complete if rated else None
 
+    @staticmethod
+    def _database_epoch(connection: sqlite3.Connection) -> int:
+        value = connection.execute(
+            "SELECT CAST(strftime('%s', 'now') AS INTEGER) AS epoch"
+        ).fetchone()["epoch"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise StorageError("SQLite 无法提供 runner lease 时钟")
+        return value
+
+    @staticmethod
+    def _load_tournament_runner_lease(
+        connection: sqlite3.Connection,
+        tournament_id: str,
+    ) -> _TournamentRunnerLeaseState | None:
+        row = connection.execute(
+            """
+            SELECT generation, token_digest, acquired_at_epoch,
+                   renewed_at_epoch, expires_at_epoch
+            FROM tournament_runner_leases
+            WHERE tournament_id = ?
+            """,
+            (tournament_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        generation = row["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise StorageError("循环赛 runner lease 已损坏")
+
+        raw_digest = row["token_digest"]
+        timestamps = (
+            row["acquired_at_epoch"],
+            row["renewed_at_epoch"],
+            row["expires_at_epoch"],
+        )
+        if raw_digest is None:
+            if any(value is not None for value in timestamps):
+                raise StorageError("循环赛 runner lease 已损坏")
+            digest = None
+        else:
+            if not isinstance(raw_digest, (bytes, bytearray, memoryview)):
+                raise StorageError("循环赛 runner lease 已损坏")
+            digest = bytes(raw_digest)
+            if len(digest) != 32 or any(
+                isinstance(value, bool) or not isinstance(value, int) for value in timestamps
+            ):
+                raise StorageError("循环赛 runner lease 已损坏")
+            acquired_at, renewed_at, expires_at = timestamps
+            if not acquired_at <= renewed_at < expires_at:
+                raise StorageError("循环赛 runner lease 已损坏")
+
+        return _TournamentRunnerLeaseState(
+            generation=generation,
+            token_digest=digest,
+            acquired_at_epoch=timestamps[0],
+            renewed_at_epoch=timestamps[1],
+            expires_at_epoch=timestamps[2],
+        )
+
+    def _require_active_tournament_runner(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+        lease: TournamentRunnerLease | None,
+        *,
+        renew_seconds: int | None = None,
+    ) -> TournamentRunnerLease:
+        if lease is None:
+            raise TournamentRunnerLeaseLostError("循环赛 checkpoint 写入需要有效的 runner lease")
+        digest = _validate_runner_lease_handle(lease, tournament_id)
+        state = self._load_tournament_runner_lease(connection, tournament_id)
+        now = self._database_epoch(connection)
+        if (
+            state is None
+            or state.token_digest is None
+            or state.generation != lease.generation
+            or state.token_digest != digest
+            or state.expires_at_epoch is None
+            or state.expires_at_epoch <= now
+        ):
+            raise TournamentRunnerLeaseLostError(
+                "循环赛 runner lease 已过期、释放或被其他执行者接管"
+            )
+
+        if renew_seconds is None:
+            return TournamentRunnerLease(
+                tournament_id=tournament_id,
+                generation=state.generation,
+                token=lease.token,
+                acquired_at_epoch=state.acquired_at_epoch,
+                renewed_at_epoch=state.renewed_at_epoch,
+                expires_at_epoch=state.expires_at_epoch,
+            )
+
+        duration = _validate_runner_lease_seconds(renew_seconds)
+        renewed_at = max(now, state.renewed_at_epoch)
+        expires_at = max(now + duration, renewed_at + 1)
+        updated = connection.execute(
+            """
+            UPDATE tournament_runner_leases
+            SET renewed_at_epoch = ?, expires_at_epoch = ?
+            WHERE tournament_id = ? AND generation = ? AND token_digest = ?
+            """,
+            (
+                renewed_at,
+                expires_at,
+                tournament_id,
+                lease.generation,
+                digest,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise TournamentRunnerLeaseLostError("循环赛 runner lease 在续租时发生并发变化")
+        return TournamentRunnerLease(
+            tournament_id=tournament_id,
+            generation=state.generation,
+            token=lease.token,
+            acquired_at_epoch=state.acquired_at_epoch,
+            renewed_at_epoch=renewed_at,
+            expires_at_epoch=expires_at,
+        )
+
+    def claim_tournament_runner(
+        self,
+        tournament_id: str,
+        *,
+        lease_seconds: int = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
+    ) -> TournamentRunnerClaim:
+        """Atomically reload and claim one in-progress tournament checkpoint."""
+
+        if not isinstance(tournament_id, str) or not tournament_id.strip():
+            raise ValueError("tournament_id 必须是非空字符串")
+        duration = _validate_runner_lease_seconds(lease_seconds)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            loaded = self._load_tournament_checkpoint(connection, tournament_id)
+            if loaded is None:
+                raise StorageError(f"循环赛 checkpoint {tournament_id!r} 不存在")
+            checkpoint, status = loaded
+            if status != "in_progress":
+                raise StorageError(f"循环赛 checkpoint {tournament_id!r} 已封存")
+
+            state = self._load_tournament_runner_lease(connection, tournament_id)
+            now = self._database_epoch(connection)
+            if (
+                state is not None
+                and state.token_digest is not None
+                and state.expires_at_epoch is not None
+                and state.expires_at_epoch > now
+            ):
+                raise TournamentRunnerLeaseBusyError(
+                    "循环赛 checkpoint 正由另一个执行者运行；请稍后重试"
+                )
+
+            generation = 1 if state is None else state.generation + 1
+            token = secrets.token_hex(32)
+            digest = _runner_lease_token_digest(token)
+            expires_at = now + duration
+            if state is None:
+                connection.execute(
+                    """
+                    INSERT INTO tournament_runner_leases (
+                        tournament_id, generation, token_digest,
+                        acquired_at_epoch, renewed_at_epoch, expires_at_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (tournament_id, generation, digest, now, now, expires_at),
+                )
+            else:
+                updated = connection.execute(
+                    """
+                    UPDATE tournament_runner_leases
+                    SET generation = ?, token_digest = ?, acquired_at_epoch = ?,
+                        renewed_at_epoch = ?, expires_at_epoch = ?
+                    WHERE tournament_id = ? AND generation = ?
+                    """,
+                    (
+                        generation,
+                        digest,
+                        now,
+                        now,
+                        expires_at,
+                        tournament_id,
+                        state.generation,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise TournamentRunnerLeaseBusyError("循环赛 runner lease 在领取时发生并发变化")
+            connection.commit()
+            return TournamentRunnerClaim(
+                checkpoint=checkpoint,
+                lease=TournamentRunnerLease(
+                    tournament_id=tournament_id,
+                    generation=generation,
+                    token=token,
+                    acquired_at_epoch=now,
+                    renewed_at_epoch=now,
+                    expires_at_epoch=expires_at,
+                ),
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def renew_tournament_runner(
+        self,
+        lease: TournamentRunnerLease,
+        *,
+        lease_seconds: int = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
+    ) -> TournamentRunnerLease:
+        """Extend one active lease without reviving an expired generation."""
+
+        if not isinstance(lease, TournamentRunnerLease):
+            raise TypeError("必须提供 TournamentRunnerLease")
+        duration = _validate_runner_lease_seconds(lease_seconds)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            status_row = connection.execute(
+                "SELECT status FROM tournament_checkpoints WHERE tournament_id = ?",
+                (lease.tournament_id,),
+            ).fetchone()
+            if status_row is None or status_row["status"] != "in_progress":
+                raise TournamentRunnerLeaseLostError(
+                    "循环赛 runner lease 对应的 checkpoint 已不存在或已封存"
+                )
+            renewed = self._require_active_tournament_runner(
+                connection,
+                lease.tournament_id,
+                lease,
+                renew_seconds=duration,
+            )
+            connection.commit()
+            return renewed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_tournament_runner(self, lease: TournamentRunnerLease) -> bool:
+        """Release only the matching fencing generation; stale releases are no-ops."""
+
+        if not isinstance(lease, TournamentRunnerLease):
+            raise TypeError("必须提供 TournamentRunnerLease")
+        digest = _validate_runner_lease_handle(lease, lease.tournament_id)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE tournament_runner_leases
+                SET token_digest = NULL, acquired_at_epoch = NULL,
+                    renewed_at_epoch = NULL, expires_at_epoch = NULL
+                WHERE tournament_id = ? AND generation = ? AND token_digest = ?
+                """,
+                (lease.tournament_id, lease.generation, digest),
+            )
+            connection.commit()
+            return updated.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def expire_tournament_runner_leases(self) -> int:
+        """Clear expired owners while preserving monotonic fencing generations."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            now = self._database_epoch(connection)
+            updated = connection.execute(
+                """
+                UPDATE tournament_runner_leases
+                SET token_digest = NULL, acquired_at_epoch = NULL,
+                    renewed_at_epoch = NULL, expires_at_epoch = NULL
+                WHERE token_digest IS NOT NULL AND expires_at_epoch <= ?
+                """,
+                (now,),
+            )
+            connection.commit()
+            return updated.rowcount
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def _load_tournament_checkpoint(
         self,
         connection: sqlite3.Connection,
@@ -3471,8 +3960,11 @@ class SQLiteStore:
     def save_tournament_checkpoint(
         self,
         checkpoint: TournamentCheckpoint,
+        *,
+        lease: TournamentRunnerLease | None = None,
+        lease_seconds: int = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
     ) -> TournamentCheckpointSaveResult:
-        """Create or atomically append one complete series to a checkpoint prefix."""
+        """Create an empty checkpoint or append one series under an active lease."""
 
         checkpoint, _ = self._validate_checkpoint(checkpoint)
         payload = checkpoint.model_dump(mode="json")
@@ -3491,6 +3983,8 @@ class SQLiteStore:
             if loaded is None:
                 if completed_count:
                     raise StorageError("新循环赛 checkpoint 必须在第一组开始前以空进度创建")
+                if lease is not None:
+                    raise ValueError("新循环赛 checkpoint 必须先创建，再领取 runner lease")
                 if connection.execute(
                     "SELECT 1 FROM tournament_archives WHERE tournament_id = ?",
                     (checkpoint.tournament_id,),
@@ -3536,6 +4030,13 @@ class SQLiteStore:
                 )
 
             stored, status = loaded
+            if status == "in_progress":
+                self._require_active_tournament_runner(
+                    connection,
+                    checkpoint.tournament_id,
+                    lease,
+                    renew_seconds=lease_seconds,
+                )
             stored_config_json = _canonical_json(self._checkpoint_config_payload(stored))
             if stored_config_json != config_json:
                 raise TournamentCheckpointCollisionError(
@@ -3659,6 +4160,8 @@ class SQLiteStore:
     def finalize_tournament_checkpoint(
         self,
         tournament_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
     ) -> TournamentSaveResult:
         """Atomically promote a complete checkpoint and apply tournament ELO once."""
 
@@ -3671,6 +4174,13 @@ class SQLiteStore:
             checkpoint, status = loaded
             if not checkpoint.is_complete:
                 raise StorageError("循环赛 checkpoint 尚未完成，不能封存")
+            if status == "in_progress":
+                self._require_active_tournament_runner(
+                    connection,
+                    tournament_id,
+                    lease,
+                    renew_seconds=DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
+                )
             tournament = tournament_from_series(
                 checkpoint.players,
                 checkpoint.completed_series,
@@ -3714,6 +4224,16 @@ class SQLiteStore:
                 )
                 if updated.rowcount != 1:
                     raise StorageError("循环赛 checkpoint 状态发生并发变化")
+                digest = _validate_runner_lease_handle(lease, tournament_id)
+                deleted = connection.execute(
+                    """
+                    DELETE FROM tournament_runner_leases
+                    WHERE tournament_id = ? AND generation = ? AND token_digest = ?
+                    """,
+                    (tournament_id, lease.generation, digest),
+                )
+                if deleted.rowcount != 1:
+                    raise TournamentRunnerLeaseLostError("循环赛 runner lease 在封存时发生并发变化")
             elif result.inserted:
                 raise StorageError("已封存 checkpoint 的正式循环赛档案状态已损坏")
             connection.commit()

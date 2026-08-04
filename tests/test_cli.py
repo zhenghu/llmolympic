@@ -13,9 +13,24 @@ from rich.text import Text
 from typer.testing import CliRunner
 
 from llmolympic import config
-from llmolympic.cli.main import _prepare_round_robin, _validate_tournament_workload, app
+from llmolympic.cli.main import (
+    _prepare_round_robin,
+    _run_round_robin,
+    _runner_lease_heartbeat,
+    _validate_tournament_workload,
+    app,
+)
 from llmolympic.core.events import EventType
-from llmolympic.core.storage import SQLiteStore
+from llmolympic.core.storage import (
+    SQLiteStore,
+    TournamentRunnerLeaseBusyError,
+    TournamentRunnerLeaseLostError,
+)
+from llmolympic.core.tournament import (
+    checkpoint_with_series,
+    prepare_round_robin,
+    resume_round_robin,
+)
 from llmolympic.games import create_game
 from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
@@ -348,6 +363,238 @@ def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) ->
     assert '"pairings"' in archive.output
 
 
+def test_round_robin_resume_rejects_active_lease_before_restoring_provider(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "active-runner.db"
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=19)
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(checkpoint)
+    active = store.claim_tournament_runner(checkpoint.tournament_id).lease
+    restored = False
+
+    def fail_if_restored(*args, **kwargs):
+        nonlocal restored
+        restored = True
+        raise AssertionError("active lease must fail before Provider reconstruction")
+
+    monkeypatch.setattr("llmolympic.cli.main._restore_round_robin", fail_if_restored)
+    result = runner.invoke(
+        app,
+        ["round-robin", "--resume", checkpoint.tournament_id, "--db", str(path)],
+    )
+    output = Text.from_ansi(result.output).plain
+
+    assert result.exit_code == 1
+    assert "无法取得循环赛执行权" in output
+    assert "另一个执行者" in output
+    assert active.token not in output
+    assert not restored
+    assert store.release_tournament_runner(active)
+
+
+def test_round_robin_complete_checkpoint_finalizes_without_restoring_provider(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "complete-checkpoint.db"
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=21)
+    tournament = asyncio.run(resume_round_robin(game, players, checkpoint))
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(checkpoint)
+    lease = store.claim_tournament_runner(checkpoint.tournament_id).lease
+    complete = checkpoint
+    for pairing in tournament.pairings:
+        complete = checkpoint_with_series(complete, pairing.series)
+        store.save_tournament_checkpoint(complete, lease=lease)
+    assert store.release_tournament_runner(lease)
+
+    def fail_if_restored(*args, **kwargs):
+        raise AssertionError("complete checkpoint must not reconstruct Provider")
+
+    monkeypatch.setattr("llmolympic.cli.main._restore_round_robin", fail_if_restored)
+    result = runner.invoke(
+        app,
+        ["round-robin", "--resume", checkpoint.tournament_id, "--db", str(path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "最终档案与 ELO 已原子封存" in result.output
+    assert store.get_verified_tournament(checkpoint.tournament_id) is not None
+    assert all(entry.games_played == 4 for entry in store.leaderboard())
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM tournament_runner_leases").fetchone()[0] == 0
+        )
+        history_count = connection.execute("SELECT count(*) FROM rating_history").fetchone()[0]
+
+    repeated = runner.invoke(
+        app,
+        ["round-robin", "--resume", checkpoint.tournament_id, "--db", str(path)],
+    )
+    assert repeated.exit_code == 0, repeated.output
+    assert "已完成，无需恢复" in repeated.output
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == history_count
+        )
+
+
+def test_runner_heartbeat_retries_transient_sqlite_busy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "heartbeat-busy.db"
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=22)
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(checkpoint)
+    lease = store.claim_tournament_runner(checkpoint.tournament_id).lease
+    original_renew = store.renew_tournament_runner
+    calls = 0
+
+    async def exercise() -> None:
+        nonlocal calls
+        stop = asyncio.Event()
+
+        def flaky_renew(handle):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            renewed = original_renew(handle)
+            stop.set()
+            return renewed
+
+        monkeypatch.setattr(store, "renew_tournament_runner", flaky_renew)
+        monkeypatch.setattr(
+            "llmolympic.cli.main.TOURNAMENT_RUNNER_HEARTBEAT_SECONDS",
+            0.001,
+        )
+        monkeypatch.setattr(
+            "llmolympic.cli.main.TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS",
+            0.001,
+        )
+        await asyncio.wait_for(_runner_lease_heartbeat(store, lease, stop), timeout=1)
+
+    asyncio.run(exercise())
+
+    assert calls == 2
+    with pytest.raises(TournamentRunnerLeaseBusyError) as exc_info:
+        SQLiteStore(path, create=False).claim_tournament_runner(checkpoint.tournament_id)
+    assert "另一个执行者" in str(exc_info.value)
+    assert store.release_tournament_runner(lease)
+
+
+def test_real_runner_heartbeat_extends_short_initial_lease(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "heartbeat-renewal.db"
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=24)
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(checkpoint)
+    lease = store.claim_tournament_runner(
+        checkpoint.tournament_id,
+        lease_seconds=2,
+    ).lease
+    monkeypatch.setattr(
+        "llmolympic.cli.main.TOURNAMENT_RUNNER_HEARTBEAT_SECONDS",
+        0.01,
+    )
+
+    async def exercise() -> None:
+        stop = asyncio.Event()
+        heartbeat = asyncio.create_task(_runner_lease_heartbeat(store, lease, stop))
+        await asyncio.sleep(2.1)
+        with pytest.raises(TournamentRunnerLeaseBusyError) as exc_info:
+            SQLiteStore(path, create=False).claim_tournament_runner(checkpoint.tournament_id)
+        assert "另一个执行者" in str(exc_info.value)
+        stop.set()
+        await heartbeat
+
+    asyncio.run(exercise())
+
+    assert store.release_tournament_runner(lease)
+
+
+def test_runner_heartbeat_loss_cancels_tournament_before_checkpoint_write(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "lost-heartbeat.db"
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=23)
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(checkpoint)
+    lease = store.claim_tournament_runner(checkpoint.tournament_id).lease
+    started: asyncio.Event | None = None
+    cancelled = False
+
+    async def stalled_tournament(*args, **kwargs):
+        nonlocal started, cancelled
+        started = asyncio.Event()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async def lost_heartbeat(*args, **kwargs):
+        while started is None:
+            await asyncio.sleep(0)
+        await started.wait()
+        raise TournamentRunnerLeaseLostError("injected lease loss")
+
+    monkeypatch.setattr("llmolympic.cli.main.resume_round_robin", stalled_tournament)
+    monkeypatch.setattr("llmolympic.cli.main._runner_lease_heartbeat", lost_heartbeat)
+
+    with pytest.raises(TournamentRunnerLeaseLostError, match="injected lease loss"):
+        asyncio.run(_run_round_robin(game, players, checkpoint, store, lease))
+
+    assert cancelled
+    persisted = store.get_tournament_checkpoint(checkpoint.tournament_id)
+    assert persisted is not None
+    assert persisted.completed_series == ()
+    assert store.get_tournament(checkpoint.tournament_id) is None
+    assert store.release_tournament_runner(lease)
+
+
 def test_round_robin_ctrl_c_saves_complete_prefix_and_resume_skips_it(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -356,9 +603,9 @@ def test_round_robin_ctrl_c_saves_complete_prefix_and_resume_skips_it(
     original_save = SQLiteStore.save_tournament_checkpoint
     interrupted = False
 
-    def save_then_interrupt(self, checkpoint):
+    def save_then_interrupt(self, checkpoint, **kwargs):
         nonlocal interrupted
-        result = original_save(self, checkpoint)
+        result = original_save(self, checkpoint, **kwargs)
         if len(checkpoint.completed_series) == 1 and not interrupted:
             interrupted = True
             raise KeyboardInterrupt
@@ -396,6 +643,14 @@ def test_round_robin_ctrl_c_saves_complete_prefix_and_resume_skips_it(
     assert len(checkpoint.completed_series) == 1
     assert store.list_matches() == []
     assert store.leaderboard() == []
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute(
+                "SELECT token_digest FROM tournament_runner_leases WHERE tournament_id = ?",
+                (tournament_id,),
+            ).fetchone()[0]
+            is None
+        )
 
     resumed = runner.invoke(
         app,

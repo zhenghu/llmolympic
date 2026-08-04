@@ -530,6 +530,7 @@ def test_resume_round_robin_skips_checkpointed_prefix_without_replaying_events()
 
     resumed_events = []
     resumed_checkpoints = []
+    resumed_pairing_starts = []
     resumed = asyncio.run(
         resume_round_robin(
             create_game("knowledge_quiz", rounds=1),
@@ -537,6 +538,7 @@ def test_resume_round_robin_skips_checkpointed_prefix_without_replaying_events()
             checkpoint,
             on_event=lambda pairing, leg, event: resumed_events.append((pairing, leg, event)),
             on_checkpoint=resumed_checkpoints.append,
+            on_pairing_start=lambda spec: resumed_pairing_starts.append(spec.pairing_number),
         )
     )
     baseline = asyncio.run(
@@ -548,6 +550,7 @@ def test_resume_round_robin_skips_checkpointed_prefix_without_replaying_events()
     )
 
     assert {pairing for pairing, _, _ in resumed_events} == {2, 3}
+    assert resumed_pairing_starts == [2, 3]
     assert [len(item.completed_series) for item in resumed_checkpoints] == [2, 3]
     assert resumed.tournament_id == "resumed-tournament"
     assert resumed.pairings[0].series.series_id == preserved_series_id

@@ -36,9 +36,10 @@
   schema v1；三者的新档案均记录 `source`：引擎生成为 `local_engine`，外部构造
   为 `external`。只有旧 match/series schema v1（包括历史上省略版本号的 JSON）
   读入时标为 `legacy`；tournament schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 5`，以 `entrants`、`entrant_id` 和展示名快照
-  持久化对局、系列赛、循环赛、循环赛检查点、榜单及评分历史。v1–v4 数据库升级在单一事务
-  内完成，失败时回滚且不提升版本号。
+- SQLite 使用 `PRAGMA user_version = 6`，以 `entrants`、`entrant_id` 和展示名快照
+  持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v5
+  数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表。所有升级失败时都回滚且
+  不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
   Profile 身份隔离，不能根据旧显示名猜测为新的模型身份。
@@ -54,7 +55,7 @@
 ### 1.3 严格只读赛事审计
 
 - `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
-  `integrity_check`、当前 schema v5 必需列和已声明外键检查覆盖整个文件，业务语义深验
+  `integrity_check`、当前 schema v6 必需列和已声明外键检查覆盖整个文件，业务语义深验
   则限定在目标赛事。当前不对 PK/UNIQUE/CHECK/FK/必要索引做完整结构指纹；后续应基于
   `table_xinfo` / `index_list` / `foreign_key_list` 建立兼容迁移库的 manifest，不能逐字匹配 DDL。
 - 审计连接使用 `mode=ro&immutable=1` 与 `query_only`，不构造 `SQLiteStore`、不迁移、
@@ -68,16 +69,25 @@
 - 已计分赛事还会核对正式档案身份与全局 `entrants.identity_json` 的绑定，并重算赛事内的
   冻结 ELO、逐局 contribution/history 和聚合 snapshot，
   以及全局榜单的局数/胜平负汇总。若同一选手和作用域存在目标赛事外的其他计分操作，
-  schema v5 缺少全局评分操作序号，不能由事件时间证明相对提交顺序或唯一重放当前 rating；
+  schema v6 缺少全局评分操作序号，不能由事件时间证明相对提交顺序或唯一重放当前 rating；
   报告必须把 leaderboard 覆盖标为 `partial`，不能宣称完整 PASS。`partial` 仍须验证目标
   赛前分来自默认值或既有 history 的 `rating_after`、当前分等于某条已知 `rating_after`
   候选，并按单局、系列赛和循环赛三类评分操作核对排行榜更新时间。未来若要求任意历史状态
   都可唯一重放，应提升 schema 并引入单调 rating operation sequence。
 - 运行期的 `round-robin --resume` 在把正式赛事视为完成前也使用正式档案深验，避免顶层
   JSON 尚可解析但关系索引或 ELO 已损坏时错误跳过恢复。
-- checkpoint 目前没有 runner lease；并行恢复同一 ID 时，事务可防止重复落库/ELO，但不能
-  防止两个执行者在冲突被发现前重复调用 Provider。部署层必须保证单执行者；后续 lease
-  设计应使用短事务 claim/renew/expire，绝不能跨网络调用持有 SQLite 写事务。
+- checkpoint 使用 SQLite v6 跨进程 runner lease。claim 在 `BEGIN IMMEDIATE` 短事务内
+  重载 checkpoint、拒绝活动 owner，并分配随机 capability token 与单调递增 generation；
+  SQLite 只持久化 token 摘要。resume 必须先 claim，再重建 Provider，避免冲突进程产生调用。
+- 租约默认 60 秒、后台每 15 秒续租，每组对阵开始前也主动续租；append 与 finalize 在各自
+  原子事务中校验 token + generation + 过期时间。心跳对临时 SQLite `BUSY`/`LOCKED` 在
+  当前租约有效窗口内退避重试。已过期或被接管的 v6 runner 即使仍有在途 Provider 请求，
+  也会被 fencing 拒绝继续保存 checkpoint、封存赛事或更新 ELO。
+- release 使用 compare-and-set，不能释放后来执行者的 generation；崩溃后由过期接管惰性
+  清理，显式 expiry 也保留 generation 单调性。任何 lease 事务都不跨 Provider 网络调用；
+  只实现同步 `chat()` 的旧适配器在线程中发出的单次请求仍可能无法立即取消。
+- v5→v6 升级前必须停止旧版 runner；已加载的 v5 代码没有 lease 写入校验，新版 schema
+  无法反向为旧进程注入 fencing。
 
 ## 2. 统一 Game 接口（核心设计）
 
@@ -218,7 +228,8 @@ CLI（今天）          WebSocket（将来）
    ELO ✅；逻辑推理与结构化猜谜项目 ✅；标准国际象棋与换色双局赛 ✅；
    稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；
    公平循环赛与 SQLite v4 迁移 ✅；逐对阵 checkpoint/resume 与 SQLite v5 迁移 ✅；
-   循环赛严格只读深度审计与恢复完成态校验 ✅。
+   循环赛严格只读深度审计与恢复完成态校验 ✅；跨进程 runner lease、fencing 与
+   SQLite v6 迁移 ✅。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。

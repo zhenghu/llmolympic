@@ -8,6 +8,7 @@ import json
 import math
 import shlex
 import sqlite3
+import time
 from collections import Counter
 from collections.abc import Callable
 from itertools import combinations
@@ -48,6 +49,7 @@ from llmolympic.core.player import (
 )
 from llmolympic.core.series import SeriesArchive, play_two_leg_series
 from llmolympic.core.storage import (
+    DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
     SQLITE_INT_MAX,
     SQLITE_INT_MIN,
     SaveResult,
@@ -55,6 +57,8 @@ from llmolympic.core.storage import (
     StorageError,
     TournamentAuditError,
     TournamentAuditReport,
+    TournamentRunnerLease,
+    TournamentRunnerLeaseLostError,
     TournamentSaveResult,
     audit_tournament,
 )
@@ -82,6 +86,8 @@ TOURNAMENT_MOVE_ATTEMPTS = 3
 DEFAULT_TOURNAMENT_GAME = "knowledge_quiz"
 DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
 DEFAULT_TOURNAMENT_SEED = 0
+TOURNAMENT_RUNNER_HEARTBEAT_SECONDS = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS / 4
+TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS = 1.0
 
 
 def _version_callback(value: bool) -> None:
@@ -968,11 +974,68 @@ def _render_tournament_interrupted(
     console.print(line)
 
 
+def _is_sqlite_busy_or_locked(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int) and code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+async def _renew_runner_lease_with_retry(
+    store: SQLiteStore,
+    lease: TournamentRunnerLease,
+    stop: asyncio.Event,
+) -> TournamentRunnerLease:
+    while True:
+        try:
+            return await asyncio.to_thread(store.renew_tournament_runner, lease)
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy_or_locked(exc):
+                raise
+            remaining = lease.expires_at_epoch - time.time()
+            if remaining <= 0:
+                raise TournamentRunnerLeaseLostError(
+                    "循环赛 runner lease 心跳未能在过期前取得 SQLite 写锁"
+                ) from exc
+            if stop.is_set():
+                return lease
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=min(TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS, remaining),
+                )
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                return lease
+
+
+async def _runner_lease_heartbeat(
+    store: SQLiteStore,
+    lease: TournamentRunnerLease,
+    stop: asyncio.Event,
+) -> None:
+    current = lease
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=TOURNAMENT_RUNNER_HEARTBEAT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        if stop.is_set():
+            return
+        current = await _renew_runner_lease_with_retry(store, current, stop)
+
+
 async def _run_round_robin(
     game: Game,
     players: list[Player],
     checkpoint: TournamentCheckpoint,
     store: SQLiteStore,
+    lease: TournamentRunnerLease,
 ) -> None:
     pairing_count, match_count, turns, max_calls = _tournament_workload(game, len(players))
     intro = Text("项目 ")
@@ -1015,17 +1078,46 @@ async def _run_round_robin(
         _render(event)
 
     def save_checkpoint(updated: TournamentCheckpoint) -> None:
-        store.save_tournament_checkpoint(updated)
+        store.save_tournament_checkpoint(updated, lease=lease)
         _best_effort_render(_render_checkpoint_saved, updated)
 
-    tournament = await resume_round_robin(
-        game,
-        players,
-        checkpoint,
-        on_event=_guard_renderer(render_pairing),
-        on_checkpoint=save_checkpoint,
+    def renew_before_pairing(_spec: object) -> None:
+        store.renew_tournament_runner(lease)
+
+    tournament_task = asyncio.create_task(
+        resume_round_robin(
+            game,
+            players,
+            checkpoint,
+            on_event=_guard_renderer(render_pairing),
+            on_checkpoint=save_checkpoint,
+            on_pairing_start=renew_before_pairing,
+        )
     )
-    result = store.finalize_tournament_checkpoint(checkpoint.tournament_id)
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task = asyncio.create_task(_runner_lease_heartbeat(store, lease, heartbeat_stop))
+    try:
+        done, _ = await asyncio.wait(
+            {tournament_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            heartbeat_error = heartbeat_task.exception()
+            if heartbeat_error is None:
+                raise StorageError("循环赛 runner lease 心跳意外停止")
+            raise heartbeat_error
+        tournament = tournament_task.result()
+    finally:
+        heartbeat_stop.set()
+        if not tournament_task.done():
+            tournament_task.cancel()
+        await asyncio.gather(tournament_task, heartbeat_task, return_exceptions=True)
+
+    renewed_lease = store.renew_tournament_runner(lease)
+    result = store.finalize_tournament_checkpoint(
+        checkpoint.tournament_id,
+        lease=renewed_lease,
+    )
     _best_effort_render(_render_tournament_summary, tournament)
     _best_effort_render(_render_tournament_saved, tournament, store, result)
 
@@ -1232,7 +1324,8 @@ def round_robin(
 ) -> None:
     """新建或恢复 3–16 名非人类选手的交换顺序循环赛。"""
 
-    if resume is not None:
+    resumed = resume is not None
+    if resumed:
         conflicts = [
             option
             for option, supplied in (
@@ -1264,28 +1357,11 @@ def round_robin(
                 line.append(" 已完成，无需恢复，也不会重复更新 ELO。")
                 console.print(line)
                 return
-            checkpoint = store.get_tournament_checkpoint(resume)
-            if checkpoint is None:
-                line = Text("未找到可恢复的循环赛 ", style="red")
-                line.append(literal_text(repr(resume), max_chars=NAME_DISPLAY_LIMIT))
-                line.append("。请确认赛事 ID 与 --db。")
-                console.print(line)
-                raise typer.Exit(code=1)
         except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
             line = Text("无法读取循环赛检查点：", style="red")
             line.append(literal_text(exc))
             console.print(line)
             raise typer.Exit(code=1) from exc
-        try:
-            selected_game, selected_players = _restore_round_robin(checkpoint)
-        except typer.BadParameter:
-            raise
-        except (TypeError, ValueError) as exc:
-            raise typer.BadParameter(
-                f"无法从检查点恢复比赛配置: {exc}",
-                param_hint="--resume",
-            ) from exc
-        _best_effort_render(_render_checkpoint_ready, checkpoint, store, True)
     else:
         selected_game, selected_players = _prepare_round_robin(
             game_name=DEFAULT_TOURNAMENT_GAME if game is None else game,
@@ -1314,10 +1390,51 @@ def round_robin(
             line.append(literal_text(exc))
             console.print(line)
             raise typer.Exit(code=1) from exc
-        _best_effort_render(_render_checkpoint_ready, checkpoint, store, False)
+
+    tournament_id = resume if resume is not None else checkpoint.tournament_id
+    try:
+        claim = store.claim_tournament_runner(tournament_id)
+    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+        line = Text("无法取得循环赛执行权：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+
+    checkpoint = claim.checkpoint
+    lease = claim.lease
 
     try:
-        asyncio.run(_run_round_robin(selected_game, selected_players, checkpoint, store))
+        _best_effort_render(_render_checkpoint_ready, checkpoint, store, resumed)
+        if checkpoint.is_complete:
+            result = store.finalize_tournament_checkpoint(
+                checkpoint.tournament_id,
+                lease=lease,
+            )
+            tournament = store.get_verified_tournament(checkpoint.tournament_id)
+            if tournament is None:  # pragma: no cover - transaction contract guard
+                raise StorageError("循环赛 checkpoint 已封存，但正式档案无法读取")
+            _best_effort_render(_render_tournament_summary, tournament)
+            _best_effort_render(_render_tournament_saved, tournament, store, result)
+            return
+        if resumed:
+            try:
+                selected_game, selected_players = _restore_round_robin(checkpoint)
+            except typer.BadParameter:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise typer.BadParameter(
+                    f"无法从检查点恢复比赛配置: {exc}",
+                    param_hint="--resume",
+                ) from exc
+        asyncio.run(
+            _run_round_robin(
+                selected_game,
+                selected_players,
+                checkpoint,
+                store,
+                lease,
+            )
+        )
     except KeyboardInterrupt as exc:
         try:
             latest = store.get_tournament_checkpoint(checkpoint.tournament_id) or checkpoint
@@ -1336,6 +1453,13 @@ def round_robin(
         if latest is not None:
             _best_effort_render(_render_tournament_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
+    finally:
+        try:
+            store.release_tournament_runner(lease)
+        except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+            line = Text("警告：未能立即释放循环赛执行权；租约过期后可恢复：", style="yellow")
+            line.append(literal_text(exc))
+            console.print(line)
 
 
 @app.command(name="games")
