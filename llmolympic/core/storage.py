@@ -387,6 +387,14 @@ class UnsupportedSchemaError(StorageError):
     """The database was created by a newer, unsupported schema version."""
 
 
+class TournamentAuditError(StorageError):
+    """A stable, disclosure-safe failure from strict tournament auditing."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class RatingChange:
     """One player's ELO movement caused by a persisted match."""
@@ -498,6 +506,22 @@ class DatabaseInspection:
     migration_required: bool = False
     private_permissions: bool = True
     limited_by_active_journal: bool = False
+
+
+@dataclass(frozen=True)
+class TournamentAuditReport:
+    """Disclosure-safe result of deeply auditing one tournament."""
+
+    tournament_id: str
+    state: Literal["in_progress", "finalized"]
+    game: str
+    completed_pairings: int
+    pairing_count: int
+    technical_losses: int
+    rated: bool
+    resumable: bool
+    checkpoint_present: bool
+    leaderboard_replay_complete: bool | None
 
 
 @dataclass(frozen=True)
@@ -628,6 +652,185 @@ def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
         private_permissions=private_permissions,
         limited_by_active_journal=limited_by_active_journal,
     )
+
+
+def audit_tournament(
+    tournament_id: str,
+    path: str | Path | None = None,
+) -> TournamentAuditReport:
+    """Deeply audit one tournament without creating, migrating, or chmodding SQLite.
+
+    The database is opened as an immutable, query-only snapshot.  Active
+    rollback journals or WAL files fail closed because a correct snapshot would
+    require SQLite sidecar coordination.  Only the current schema is audited;
+    callers must explicitly migrate older databases through the normal writer
+    path before using this command.
+    """
+
+    if not isinstance(tournament_id, str) or not tournament_id.strip():
+        raise ValueError("tournament_id must be a non-empty string")
+
+    try:
+        # Audit output is a disclosure-safe diagnostics boundary.  Config
+        # permission warnings include local paths and would corrupt --json.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            resolved = database_path(path)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise TournamentAuditError("database_invalid") from exc
+
+    try:
+        if not resolved.exists():
+            raise TournamentAuditError("database_missing")
+        if not resolved.is_file():
+            raise TournamentAuditError("database_invalid")
+        database_stat = resolved.stat()
+        journal_paths = (Path(f"{resolved}-journal"), Path(f"{resolved}-wal"))
+        active_sidecar = any(sidecar.exists() for sidecar in journal_paths)
+    except TournamentAuditError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise TournamentAuditError("database_invalid") from exc
+    if active_sidecar:
+        raise TournamentAuditError("database_active_writer")
+
+    uri = f"{resolved.as_uri()}?mode=ro&immutable=1"
+    try:
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    except sqlite3.Error as exc:
+        raise TournamentAuditError("database_invalid") from exc
+
+    report: TournamentAuditReport | None = None
+    audit_error: TournamentAuditError | None = None
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        integrity_rows = connection.execute("PRAGMA integrity_check").fetchall()
+        if [row[0] for row in integrity_rows] != ["ok"]:
+            raise TournamentAuditError("database_invalid")
+
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > SCHEMA_VERSION:
+            raise TournamentAuditError("database_unsupported_schema")
+        if version == 0:
+            raise TournamentAuditError("database_invalid")
+        if version < SCHEMA_VERSION:
+            raise TournamentAuditError("database_migration_required")
+        try:
+            SQLiteStore._verify_schema(connection)
+            SQLiteStore._verify_foreign_keys(connection)
+        except StorageError as exc:
+            raise TournamentAuditError("database_invalid") from exc
+
+        verifier = object.__new__(SQLiteStore)
+        try:
+            loaded_checkpoint = verifier._load_tournament_checkpoint(
+                connection,
+                tournament_id,
+            )
+            loaded_tournament = verifier._load_verified_tournament(
+                connection,
+                tournament_id,
+            )
+            if loaded_checkpoint is None and loaded_tournament is None:
+                raise TournamentAuditError("tournament_not_found")
+
+            if loaded_checkpoint is not None:
+                checkpoint, state = loaded_checkpoint
+                checkpoint_present = True
+                if state == "in_progress":
+                    if loaded_tournament is not None:
+                        raise StorageError("in-progress checkpoint has a formal archive")
+                    for series in checkpoint.completed_series:
+                        if connection.execute(
+                            "SELECT 1 FROM series_archives WHERE series_id = ?",
+                            (series.series_id,),
+                        ).fetchone():
+                            raise StorageError("in-progress checkpoint series is formally stored")
+                        for leg in series.legs:
+                            if connection.execute(
+                                "SELECT 1 FROM matches WHERE match_id = ?",
+                                (leg.match_id,),
+                            ).fetchone():
+                                raise StorageError(
+                                    "in-progress checkpoint match is formally stored"
+                                )
+                    tournament = None
+                    rated = False
+                    leaderboard_replay_complete = None
+                    completed_series = checkpoint.completed_series
+                    game = checkpoint.game
+                    pairing_count = len(checkpoint.schedule)
+                else:
+                    if loaded_tournament is None:
+                        raise StorageError("finalized checkpoint has no formal archive")
+                    tournament, rated, leaderboard_replay_complete = loaded_tournament
+                    completed_series = tuple(pairing.series for pairing in tournament.pairings)
+                    game = tournament.game
+                    pairing_count = len(tournament.pairings)
+            else:
+                if loaded_tournament is None:
+                    raise StorageError("formal tournament disappeared during audit")
+                tournament, rated, leaderboard_replay_complete = loaded_tournament
+                state = "finalized"
+                checkpoint_present = False
+                completed_series = tuple(pairing.series for pairing in tournament.pairings)
+                game = tournament.game
+                pairing_count = len(tournament.pairings)
+
+            technical_losses = sum(
+                standing.technical_losses
+                for series in completed_series
+                for standing in series.standings.values()
+            )
+            report = TournamentAuditReport(
+                tournament_id=tournament_id,
+                state=state,
+                game=game,
+                completed_pairings=len(completed_series),
+                pairing_count=pairing_count,
+                technical_losses=technical_losses,
+                rated=rated,
+                resumable=state == "in_progress",
+                checkpoint_present=checkpoint_present,
+                leaderboard_replay_complete=leaderboard_replay_complete,
+            )
+        except TournamentAuditError:
+            raise
+        except (KeyError, TypeError, ValueError, StorageError) as exc:
+            raise TournamentAuditError("tournament_inconsistent") from exc
+    except TournamentAuditError as exc:
+        audit_error = exc
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        audit_error = TournamentAuditError("database_invalid")
+        audit_error.__cause__ = exc
+    finally:
+        connection.close()
+
+    try:
+        after_stat = resolved.stat()
+        active_sidecar = any(sidecar.exists() for sidecar in journal_paths)
+    except (OSError, ValueError) as exc:
+        raise TournamentAuditError("database_active_writer") from exc
+    changed = (
+        database_stat.st_dev,
+        database_stat.st_ino,
+        database_stat.st_size,
+        database_stat.st_mtime_ns,
+    ) != (
+        after_stat.st_dev,
+        after_stat.st_ino,
+        after_stat.st_size,
+        after_stat.st_mtime_ns,
+    )
+    if changed or active_sidecar:
+        raise TournamentAuditError("database_active_writer")
+    if audit_error is not None:
+        raise audit_error
+    if report is None:  # pragma: no cover - defensive exhaustiveness guard
+        raise TournamentAuditError("database_invalid")
+    return report
 
 
 def _canonical_json(value: object) -> str:
@@ -1540,6 +1743,58 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _has_trusted_entrant_observation(
+        connection: sqlite3.Connection,
+        entrant_id: str,
+    ) -> bool:
+        return bool(
+            connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM match_players AS mp
+                    JOIN matches AS m ON m.match_id = mp.match_id
+                    WHERE mp.entrant_id = ?
+                      AND m.schema_version = 2
+                      AND m.archive_source = 'local_engine'
+                      AND m.rating_source = 'engine'
+                )
+                """,
+                (entrant_id,),
+            ).fetchone()[0]
+        )
+
+    def _verify_checkpoint_entrant_bindings(
+        self,
+        connection: sqlite3.Connection,
+        checkpoint: TournamentCheckpoint,
+    ) -> None:
+        """Reject checkpoints that cannot become trusted tournament entrants."""
+
+        for descriptor in checkpoint.players:
+            entrant = self._entrant_ref(descriptor, legacy=False)
+            existing = connection.execute(
+                """
+                SELECT identity_json, updated_at
+                FROM entrants WHERE entrant_id = ?
+                """,
+                (entrant.entrant_id,),
+            ).fetchone()
+            if existing is None:
+                continue
+            try:
+                observed_at = datetime.fromisoformat(existing["updated_at"])
+            except (TypeError, ValueError) as exc:
+                raise StorageError(f"entrant_id {entrant.entrant_id!r} 的观察时间已损坏") from exc
+            if observed_at.utcoffset() is None:
+                raise StorageError(f"entrant_id {entrant.entrant_id!r} 的观察时间已损坏")
+            if (
+                self._has_trusted_entrant_observation(connection, entrant.entrant_id)
+                and existing["identity_json"] != entrant.identity_json
+            ):
+                raise StorageError(f"entrant_id {entrant.entrant_id!r} 已绑定到另一份身份元数据")
+
+    @staticmethod
     def _upsert_entrant(
         connection: sqlite3.Connection,
         entrant: _EntrantRef,
@@ -1578,20 +1833,10 @@ class SQLiteStore:
         if existing_observed_at.utcoffset() is None:
             raise StorageError(f"entrant_id {entrant.entrant_id!r} 的观察时间已损坏")
         is_newer_observation = observed_at.astimezone(UTC) > existing_observed_at.astimezone(UTC)
-        has_trusted_observation = connection.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM match_players AS mp
-                JOIN matches AS m ON m.match_id = mp.match_id
-                WHERE mp.entrant_id = ?
-                  AND m.schema_version = 2
-                  AND m.archive_source = 'local_engine'
-                  AND m.rating_source = 'engine'
-            )
-            """,
-            (entrant.entrant_id,),
-        ).fetchone()[0]
+        has_trusted_observation = SQLiteStore._has_trusted_entrant_observation(
+            connection,
+            entrant.entrant_id,
+        )
         if trusted_engine and not has_trusted_observation:
             # The first trusted engine observation establishes both identity and
             # presentation. An imported archive may carry a forged future
@@ -1970,7 +2215,8 @@ class SQLiteStore:
         if series_id is not None:
             row = connection.execute(
                 """
-                SELECT ta.tournament_json, ta.archive_source, ta.rating_source,
+                SELECT ta.tournament_id AS stored_tournament_id,
+                       ta.tournament_json, ta.archive_source, ta.rating_source,
                        ta.rated, ta.rating_policy, ta.pairing_count
                 FROM tournament_pairings AS tp
                 JOIN tournament_archives AS ta
@@ -1985,7 +2231,8 @@ class SQLiteStore:
         else:
             row = connection.execute(
                 """
-                SELECT ta.tournament_json, ta.archive_source, ta.rating_source,
+                SELECT ta.tournament_id AS stored_tournament_id,
+                       ta.tournament_json, ta.archive_source, ta.rating_source,
                        ta.rated, ta.rating_policy, ta.pairing_count
                 FROM series_matches AS sm
                 JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
@@ -2007,6 +2254,8 @@ class SQLiteStore:
             raise StorageError(
                 f"数据库中 {identifier_name} {identifier!r} 所属循环赛档案已损坏"
             ) from exc
+        if tournament.tournament_id != row["stored_tournament_id"]:
+            raise StorageError(f"数据库中 {identifier_name} {identifier!r} 所属循环赛档案已损坏")
         stored_rated = bool(row["rated"])
         expected_rated = (
             row["rating_source"] == "engine" and row["archive_source"] == "local_engine"
@@ -2051,7 +2300,8 @@ class SQLiteStore:
             return SaveResult(inserted=False, rated=tournament_result.rated)
         row = connection.execute(
             """
-            SELECT sa.series_json, sa.archive_source, sa.rating_source,
+            SELECT sa.series_id AS stored_series_id,
+                   sa.series_json, sa.archive_source, sa.rating_source,
                    sa.rated, sa.rating_policy
             FROM series_matches AS sm
             JOIN series_archives AS sa ON sa.series_id = sm.series_id
@@ -2068,6 +2318,8 @@ class SQLiteStore:
             raise StorageError(
                 f"数据库中 match_id {archive.match_id!r} 所属系列赛档案已损坏"
             ) from exc
+        if series.series_id != row["stored_series_id"]:
+            raise StorageError(f"数据库中 match_id {archive.match_id!r} 所属系列赛档案已损坏")
         stored_rated = bool(row["rated"])
         expected_policy = "elo_batch_v1" if stored_rated else "unrated"
         expected_rated = row["rating_source"] == "engine" and row["archive_source"] in (
@@ -2468,7 +2720,7 @@ class SQLiteStore:
         entrants: tuple[_EntrantRef, ...],
         *,
         rated: bool,
-    ) -> None:
+    ) -> bool:
         history_rows = connection.execute(
             """
             SELECT rh.match_id, rh.rating_scope, rh.game, rh.entrant_id,
@@ -2507,7 +2759,7 @@ class SQLiteStore:
                 raise StorageError(
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的未计分状态已损坏"
                 )
-            return
+            return True
 
         snapshot_map = {
             (row["rating_scope"], row["game"], row["entrant_id"]): row for row in snapshot_rows
@@ -2634,7 +2886,7 @@ class SQLiteStore:
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的 ELO 快照已损坏"
                 )
 
-        self._verify_current_tournament_ratings_if_latest(
+        return self._verify_current_tournament_ratings_if_latest(
             connection,
             tournament,
             expected_aggregates,
@@ -2645,16 +2897,18 @@ class SQLiteStore:
         connection: sqlite3.Connection,
         tournament: TournamentArchive,
         expected_aggregates: list[_TournamentAggregate],
-    ) -> None:
-        """Verify the materialized leaderboard when this tournament is still latest.
+    ) -> bool:
+        """Verify the materialized leaderboard when this is its only known operation.
 
-        A historical tournament cannot reconstruct leaderboard rows after later
-        rated matches.  Only compare the materialized rating when its timestamp
-        still names this tournament and there is no same-or-later tournament
-        snapshot or history row outside this tournament.
+        Schema v5 has event timestamps but no global rating-operation sequence.
+        Another history/snapshot row may therefore have been committed before or
+        after this tournament regardless of its event time.  Counts can always be
+        checked; the current numeric rating is only replay-complete when no other
+        operation for this entrant and scope exists.
         """
 
         tournament_finished_at = tournament.finished_at.astimezone(UTC)
+        replay_complete = True
         for expected in expected_aggregates:
             row = connection.execute(
                 """
@@ -2678,15 +2932,9 @@ class SQLiteStore:
                 raise StorageError(
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
                 ) from exc
-            history_totals = connection.execute(
+            leaderboard_history_rows = connection.execute(
                 """
-                SELECT count(*) AS games_played,
-                       coalesce(sum(CASE WHEN outcome = 1.0 THEN 1 ELSE 0 END), 0)
-                           AS wins,
-                       coalesce(sum(CASE WHEN outcome = 0.5 THEN 1 ELSE 0 END), 0)
-                           AS draws,
-                       coalesce(sum(CASE WHEN outcome = 0.0 THEN 1 ELSE 0 END), 0)
-                           AS losses
+                SELECT outcome, rating_after, created_at
                 FROM rating_history
                 WHERE rating_scope = ? AND game = ? AND entrant_id = ?
                 """,
@@ -2695,9 +2943,34 @@ class SQLiteStore:
                     expected.game_key,
                     expected.player.entrant_id,
                 ),
-            ).fetchone()
-            count_columns = ("games_played", "wins", "draws", "losses")
-            if any(row[column] != history_totals[column] for column in count_columns):
+            ).fetchall()
+            try:
+                history_outcomes = tuple(
+                    self._finite_database_float(history_row["outcome"])
+                    for history_row in leaderboard_history_rows
+                )
+                history_after_values = tuple(
+                    self._finite_database_float(history_row["rating_after"])
+                    for history_row in leaderboard_history_rows
+                )
+                history_created_at = tuple(
+                    datetime.fromisoformat(history_row["created_at"])
+                    for history_row in leaderboard_history_rows
+                )
+            except (TypeError, ValueError) as exc:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                ) from exc
+            if (
+                not leaderboard_history_rows
+                or any(outcome not in (0.0, 0.5, 1.0) for outcome in history_outcomes)
+                or any(timestamp.utcoffset() is None for timestamp in history_created_at)
+                or row["games_played"] != len(history_outcomes)
+                or row["wins"] != history_outcomes.count(1.0)
+                or row["draws"] != history_outcomes.count(0.5)
+                or row["losses"] != history_outcomes.count(0.0)
+                or current_rating not in history_after_values
+            ):
                 raise StorageError(
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
                 )
@@ -2712,23 +2985,69 @@ class SQLiteStore:
                 raise StorageError(
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
                 ) from exc
-            if updated_at.utcoffset() is None:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            if updated_at.astimezone(UTC) != tournament_finished_at:
-                continue
-
-            other_tournament_rows = connection.execute(
+            operation_time_rows = connection.execute(
                 """
+                SELECT m.finished_at
+                FROM rating_history AS rh
+                JOIN matches AS m ON m.match_id = rh.match_id
+                LEFT JOIN series_matches AS sm ON sm.match_id = rh.match_id
+                WHERE rh.rating_scope = ? AND rh.game = ? AND rh.entrant_id = ?
+                  AND sm.match_id IS NULL
+                UNION
+                SELECT sa.finished_at
+                FROM rating_history AS rh
+                JOIN series_matches AS sm ON sm.match_id = rh.match_id
+                JOIN series_archives AS sa ON sa.series_id = sm.series_id
+                LEFT JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
+                WHERE rh.rating_scope = ? AND rh.game = ? AND rh.entrant_id = ?
+                  AND tp.series_id IS NULL
+                UNION
                 SELECT ta.finished_at
                 FROM tournament_rating_snapshots AS trs
                 JOIN tournament_archives AS ta
                   ON ta.tournament_id = trs.tournament_id
+                WHERE trs.rating_scope = ? AND trs.game = ? AND trs.entrant_id = ?
+                """,
+                (
+                    expected.rating_scope,
+                    expected.game_key,
+                    expected.player.entrant_id,
+                    expected.rating_scope,
+                    expected.game_key,
+                    expected.player.entrant_id,
+                    expected.rating_scope,
+                    expected.game_key,
+                    expected.player.entrant_id,
+                ),
+            ).fetchall()
+            try:
+                operation_finished_at = tuple(
+                    datetime.fromisoformat(operation_row["finished_at"])
+                    for operation_row in operation_time_rows
+                )
+            except (TypeError, ValueError) as exc:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                ) from exc
+            if (
+                updated_at.utcoffset() is None
+                or not operation_finished_at
+                or any(timestamp.utcoffset() is None for timestamp in operation_finished_at)
+                or updated_at.astimezone(UTC)
+                != max(timestamp.astimezone(UTC) for timestamp in operation_finished_at)
+            ):
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                )
+            other_tournament = connection.execute(
+                """
+                SELECT 1
+                FROM tournament_rating_snapshots AS trs
                 WHERE trs.rating_scope = ?
                   AND trs.game = ?
                   AND trs.entrant_id = ?
                   AND trs.tournament_id <> ?
+                LIMIT 1
                 """,
                 (
                     expected.rating_scope,
@@ -2736,30 +3055,10 @@ class SQLiteStore:
                     expected.player.entrant_id,
                     tournament.tournament_id,
                 ),
-            ).fetchall()
-            has_same_or_later_tournament = False
-            for other_tournament_row in other_tournament_rows:
-                raw_finished_at = other_tournament_row["finished_at"]
-                if not isinstance(raw_finished_at, str):
-                    has_same_or_later_tournament = True
-                    break
-                try:
-                    finished_at = datetime.fromisoformat(raw_finished_at)
-                except ValueError:
-                    has_same_or_later_tournament = True
-                    break
-                if finished_at.utcoffset() is None:
-                    has_same_or_later_tournament = True
-                    break
-                if finished_at.astimezone(UTC) >= tournament_finished_at:
-                    has_same_or_later_tournament = True
-                    break
-            if has_same_or_later_tournament:
-                continue
-
+            ).fetchone()
             outside_history_rows = connection.execute(
                 """
-                SELECT rh.created_at
+                SELECT rh.rating_after
                 FROM rating_history AS rh
                 WHERE rh.rating_scope = ?
                   AND rh.game = ?
@@ -2780,30 +3079,35 @@ class SQLiteStore:
                     tournament.tournament_id,
                 ),
             ).fetchall()
-            has_same_or_later_outside_history = False
-            for outside_row in outside_history_rows:
-                raw_created_at = outside_row["created_at"]
-                if not isinstance(raw_created_at, str):
-                    has_same_or_later_outside_history = True
-                    break
-                try:
-                    created_at = datetime.fromisoformat(raw_created_at)
-                except ValueError:
-                    has_same_or_later_outside_history = True
-                    break
-                if created_at.utcoffset() is None:
-                    has_same_or_later_outside_history = True
-                    break
-                if created_at.astimezone(UTC) >= tournament_finished_at:
-                    has_same_or_later_outside_history = True
-                    break
-            if has_same_or_later_outside_history:
-                continue
-
-            if current_rating != expected.after:
+            try:
+                outside_after_values = {
+                    self._finite_database_float(history_row["rating_after"])
+                    for history_row in outside_history_rows
+                }
+            except (TypeError, ValueError) as exc:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                ) from exc
+            if other_tournament is not None and not outside_history_rows:
                 raise StorageError(
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
                 )
+            if expected.before not in {DEFAULT_RATING, *outside_after_values}:
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                )
+            if outside_history_rows:
+                replay_complete = False
+                continue
+
+            if (
+                updated_at.astimezone(UTC) != tournament_finished_at
+                or current_rating != expected.after
+            ):
+                raise StorageError(
+                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
+                )
+        return replay_complete
 
     def _verify_existing_tournament(
         self,
@@ -2813,7 +3117,7 @@ class SQLiteStore:
         rating_source: str,
         rated: bool,
         rating_policy: str,
-    ) -> None:
+    ) -> bool:
         expected_rated = rating_source == "engine" and tournament.source == "local_engine"
         expected_policy = "elo_tournament_batch_v1" if rated else "unrated"
         if rated != expected_rated or rating_policy != expected_policy:
@@ -2908,6 +3212,37 @@ class SQLiteStore:
                     f"数据库中 tournament_id {tournament.tournament_id!r} 的参赛者索引已损坏"
                 )
 
+        if rated:
+            for entrant in entrants:
+                identity_row = connection.execute(
+                    """
+                    SELECT display_name, identity_json, created_at, updated_at
+                    FROM entrants WHERE entrant_id = ?
+                    """,
+                    (entrant.entrant_id,),
+                ).fetchone()
+                if identity_row is None:
+                    raise StorageError(
+                        f"数据库中 tournament_id {tournament.tournament_id!r} 的全局选手身份已损坏"
+                    )
+                try:
+                    created_at = datetime.fromisoformat(identity_row["created_at"])
+                    updated_at = datetime.fromisoformat(identity_row["updated_at"])
+                except (TypeError, ValueError) as exc:
+                    raise StorageError(
+                        f"数据库中 tournament_id {tournament.tournament_id!r} 的全局选手身份已损坏"
+                    ) from exc
+                if (
+                    not isinstance(identity_row["display_name"], str)
+                    or not identity_row["display_name"]
+                    or identity_row["identity_json"] != entrant.identity_json
+                    or created_at.utcoffset() is None
+                    or updated_at.utcoffset() is None
+                ):
+                    raise StorageError(
+                        f"数据库中 tournament_id {tournament.tournament_id!r} 的全局选手身份已损坏"
+                    )
+
         pairing_rows = connection.execute(
             """
             SELECT pairing_number, series_id, entrant_a_id, entrant_b_id
@@ -2941,12 +3276,48 @@ class SQLiteStore:
                 rating_policy=rating_policy,
             )
 
-        self._verify_tournament_ratings(
+        return self._verify_tournament_ratings(
             connection,
             tournament,
             entrants,
             rated=rated,
         )
+
+    def _load_verified_tournament(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+    ) -> tuple[TournamentArchive, bool, bool | None] | None:
+        """Load one formal tournament and deeply verify all relational state."""
+
+        row = connection.execute(
+            """
+            SELECT tournament_json, rating_source, rated, rating_policy
+            FROM tournament_archives
+            WHERE tournament_id = ?
+            """,
+            (tournament_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            tournament = TournamentArchive.model_validate_json(row["tournament_json"])
+            tournament, _ = self._validate_tournament(tournament)
+        except (TypeError, ValueError, StorageError) as exc:
+            raise StorageError(
+                f"数据库中 tournament_id {tournament_id!r} 的正式循环赛档案已损坏"
+            ) from exc
+        if tournament.tournament_id != tournament_id:
+            raise StorageError(f"数据库中 tournament_id {tournament_id!r} 的正式循环赛档案已损坏")
+        rated = bool(row["rated"])
+        replay_complete = self._verify_existing_tournament(
+            connection,
+            tournament,
+            rating_source=row["rating_source"],
+            rated=rated,
+            rating_policy=row["rating_policy"],
+        )
+        return tournament, rated, replay_complete if rated else None
 
     def _load_tournament_checkpoint(
         self,
@@ -3059,7 +3430,9 @@ class SQLiteStore:
                 raise StorageError(
                     f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
                 ) from exc
-            if finalized_at.utcoffset() is None:
+            if finalized_at.utcoffset() is None or finalized_at.astimezone(
+                UTC
+            ) < checkpoint.updated_at.astimezone(UTC):
                 raise StorageError(
                     f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏"
                 )
@@ -3092,6 +3465,7 @@ class SQLiteStore:
                 )
         else:
             raise StorageError(f"数据库中 tournament_id {tournament_id!r} 的 checkpoint 状态已损坏")
+        self._verify_checkpoint_entrant_bindings(connection, checkpoint)
         return checkpoint, status
 
     def save_tournament_checkpoint(
@@ -3109,6 +3483,7 @@ class SQLiteStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._verify_checkpoint_entrant_bindings(connection, checkpoint)
             loaded = self._load_tournament_checkpoint(
                 connection,
                 checkpoint.tournament_id,
@@ -3320,6 +3695,10 @@ class SQLiteStore:
             if status == "in_progress":
                 if not result.inserted:
                     raise StorageError("进行中的 checkpoint 未能创建正式循环赛档案")
+                finalized_at = max(
+                    datetime.now(UTC),
+                    checkpoint.updated_at.astimezone(UTC),
+                )
                 updated = connection.execute(
                     """
                     UPDATE tournament_checkpoints
@@ -3328,7 +3707,7 @@ class SQLiteStore:
                     WHERE tournament_id = ? AND status = 'in_progress'
                     """,
                     (
-                        datetime.now(UTC).isoformat(),
+                        finalized_at.isoformat(),
                         tournament_id,
                         tournament_id,
                     ),
@@ -4693,6 +5072,26 @@ class SQLiteStore:
         return (
             None if row is None else TournamentArchive.model_validate_json(row["tournament_json"])
         )
+
+    def get_verified_tournament(self, tournament_id: str) -> TournamentArchive | None:
+        """Load one formal tournament and checkpoint from one consistent snapshot."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            loaded_checkpoint = self._load_tournament_checkpoint(connection, tournament_id)
+            loaded = self._load_verified_tournament(connection, tournament_id)
+            if loaded is not None and (
+                loaded_checkpoint is not None and loaded_checkpoint[1] != "finalized"
+            ):
+                raise StorageError("进行中的 checkpoint 已存在同 ID 正式循环赛档案")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return None if loaded is None else loaded[0]
 
     def list_matches(self, *, limit: int = 20, game: str | None = None) -> list[MatchSummary]:
         """Return recent persisted matches, newest first."""

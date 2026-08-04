@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import shlex
 import sqlite3
@@ -52,7 +53,10 @@ from llmolympic.core.storage import (
     SaveResult,
     SQLiteStore,
     StorageError,
+    TournamentAuditError,
+    TournamentAuditReport,
     TournamentSaveResult,
+    audit_tournament,
 )
 from llmolympic.core.tournament import (
     MAX_TOURNAMENT_PLAYERS,
@@ -118,6 +122,117 @@ def doctor(
         console.print(line)
     if any(check.status == "FAIL" for check in checks):
         raise typer.Exit(code=1)
+
+
+def _audit_report_payload(report: TournamentAuditReport) -> dict[str, object]:
+    finalized = report.state == "finalized"
+    leaderboard_status = (
+        "not_applicable"
+        if not finalized or not report.rated
+        else "pass"
+        if report.leaderboard_replay_complete
+        else "partial"
+    )
+    return {
+        "report_schema_version": 1,
+        "result": "pass",
+        "tournament_id": report.tournament_id,
+        "state": report.state,
+        "game": report.game,
+        "progress": {
+            "completed_pairings": report.completed_pairings,
+            "pairing_count": report.pairing_count,
+            "completed_matches": report.completed_pairings * 2,
+            "match_count": report.pairing_count * 2,
+        },
+        "technical_losses": report.technical_losses,
+        "rated": report.rated,
+        "resumable": report.resumable,
+        "checks": {
+            "database": "pass",
+            "checkpoint": "pass" if report.checkpoint_present else "not_applicable",
+            "archive": "pass" if finalized else "not_applicable",
+            "ratings": "pass" if finalized and report.rated else "not_applicable",
+            "leaderboard": leaderboard_status,
+        },
+    }
+
+
+@app.command(name="audit-tournament")
+def audit_tournament_command(
+    tournament_id: Annotated[str, typer.Argument(help="循环赛或 checkpoint ID")],
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="输出稳定、无 ANSI 的单行 JSON 报告"),
+    ] = False,
+) -> None:
+    """严格只读审计一项循环赛、checkpoint、关系索引与 ELO 账本。"""
+
+    if not tournament_id.strip():
+        raise typer.BadParameter("循环赛 ID 不能为空", param_hint="TOURNAMENT_ID")
+    try:
+        report = audit_tournament(tournament_id, database)
+    except TournamentAuditError as exc:
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "report_schema_version": 1,
+                        "result": "fail",
+                        "error_code": exc.code,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            messages = {
+                "database_missing": "SQLite 数据库不存在",
+                "database_active_writer": "SQLite 正在写入，无法取得一致的只读快照",
+                "database_migration_required": "SQLite schema 需要先备份并升级",
+                "database_unsupported_schema": "SQLite schema 高于当前支持版本",
+                "database_invalid": "SQLite 数据库无法读取、结构无效或已损坏",
+                "tournament_not_found": "未找到该循环赛或 checkpoint",
+                "tournament_inconsistent": "赛事档案、关系索引或 ELO 账本不一致",
+            }
+            line = Text("FAIL 循环赛 ", style="bold red")
+            line.append(literal_text(tournament_id, max_chars=256))
+            line.append(" 审计未通过：")
+            line.append(messages.get(exc.code, "赛事审计失败"))
+            console.print(line)
+        raise typer.Exit(code=1) from exc
+
+    payload = _audit_report_payload(report)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return
+
+    line = Text("PASS 循环赛 ", style="bold green")
+    line.append(literal_text(report.tournament_id, max_chars=256))
+    line.append(" 深度审计通过")
+    console.print(line)
+    console.print(
+        "状态 "
+        f"{report.state} · 进度 {report.completed_pairings}/{report.pairing_count} 组 · "
+        f"{report.completed_pairings * 2}/{report.pairing_count * 2} 局 · "
+        f"技术负 {report.technical_losses}"
+    )
+    checks = payload["checks"]
+    if not isinstance(checks, dict):  # pragma: no cover - internal contract guard
+        raise typer.Exit(code=1)
+    console.print("检查 " + " · ".join(f"{name}={status}" for name, status in checks.items()))
 
 
 def _render_warning() -> None:
@@ -1141,7 +1256,7 @@ def round_robin(
             raise typer.BadParameter("恢复赛事 ID 不能为空", param_hint="--resume")
         store = _open_store(database, create=False)
         try:
-            completed = store.get_tournament(resume)
+            completed = store.get_verified_tournament(resume)
             if completed is not None:
                 _best_effort_render(_render_tournament_summary, completed)
                 line = Text("循环赛 ", style="yellow")
