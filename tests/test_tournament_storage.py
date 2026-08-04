@@ -1,8 +1,10 @@
-"""SQLite v5 round-robin persistence, checkpoints, and frozen-ELO tests."""
+"""SQLite v6 round-robin persistence, checkpoints, leases, and frozen-ELO tests."""
 
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from itertools import combinations
@@ -13,12 +15,15 @@ from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.series import series_from_legs
 from llmolympic.core.storage import (
+    SCHEMA_VERSION,
     MatchIdCollisionError,
     SeriesIdCollisionError,
     SQLiteStore,
     StorageError,
     TournamentCheckpointCollisionError,
     TournamentIdCollisionError,
+    TournamentRunnerLeaseBusyError,
+    TournamentRunnerLeaseLostError,
 )
 from llmolympic.core.tournament import (
     TournamentArchive,
@@ -204,7 +209,7 @@ def test_tournament_save_round_trip_and_frozen_rating_ledger(tmp_path) -> None:
     assert all(entry.games_played == 4 for entry in store.leaderboard())
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("SELECT count(*) FROM tournament_archives").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM tournament_pairings").fetchone()[0] == 3
         assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 3
@@ -227,6 +232,7 @@ def test_checkpoint_prefix_reopens_finalizes_and_rates_exactly_once(tmp_path) ->
     store = SQLiteStore(path)
 
     created = store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
 
     assert created.inserted
     assert created.completed_pairing_count == 0
@@ -243,7 +249,8 @@ def test_checkpoint_prefix_reopens_finalizes_and_rates_exactly_once(tmp_path) ->
 
     for completed_count in range(1, 4):
         result = SQLiteStore(path, create=False).save_tournament_checkpoint(
-            _checkpoint(tournament, completed_count)
+            _checkpoint(tournament, completed_count),
+            lease=lease,
         )
         assert result.inserted
         assert result.completed_pairing_count == completed_count
@@ -257,7 +264,8 @@ def test_checkpoint_prefix_reopens_finalizes_and_rates_exactly_once(tmp_path) ->
         ).model_dump(mode="json")
 
     finalized = SQLiteStore(path, create=False).finalize_tournament_checkpoint(
-        tournament.tournament_id
+        tournament.tournament_id,
+        lease=lease,
     )
 
     assert finalized.inserted and finalized.rated
@@ -300,6 +308,206 @@ def test_checkpoint_prefix_reopens_finalizes_and_rates_exactly_once(tmp_path) ->
         } == counts_before
 
 
+def test_runner_lease_claim_is_exclusive_fenced_and_secret(tmp_path) -> None:
+    path = tmp_path / "runner-lease.db"
+    tournament = _tournament(tournament_id="runner-lease")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+
+    first = store.claim_tournament_runner(tournament.tournament_id).lease
+
+    assert first.generation == 1
+    assert first.token not in repr(first)
+    assert first.expires_at_epoch > first.renewed_at_epoch
+    with pytest.raises(TournamentRunnerLeaseBusyError, match="另一个执行者"):
+        SQLiteStore(path, create=False).claim_tournament_runner(tournament.tournament_id)
+    with sqlite3.connect(path) as connection:
+        generation, digest = connection.execute(
+            """
+            SELECT generation, token_digest FROM tournament_runner_leases
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        ).fetchone()
+    assert generation == 1
+    assert isinstance(digest, bytes) and len(digest) == 32
+    assert first.token.encode() not in path.read_bytes()
+
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1), lease=first)
+    assert store.release_tournament_runner(first)
+    assert not store.release_tournament_runner(first)
+    second_claim = store.claim_tournament_runner(tournament.tournament_id)
+    second = second_claim.lease
+    assert len(second_claim.checkpoint.completed_series) == 1
+    assert second.generation == first.generation + 1
+    assert second.token != first.token
+    assert store.release_tournament_runner(second)
+
+
+def test_concurrent_runner_claims_have_exactly_one_winner(tmp_path) -> None:
+    path = tmp_path / "concurrent-runner-lease.db"
+    tournament = _tournament(tournament_id="concurrent-runner-lease")
+    SQLiteStore(path).save_tournament_checkpoint(_checkpoint(tournament))
+
+    def claim(_: int):
+        try:
+            return (
+                SQLiteStore(path, create=False)
+                .claim_tournament_runner(tournament.tournament_id)
+                .lease
+            )
+        except TournamentRunnerLeaseBusyError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(claim, range(8)))
+
+    winners = [lease for lease in results if lease is not None]
+    assert len(winners) == 1
+    assert SQLiteStore(path, create=False).release_tournament_runner(winners[0])
+
+
+def test_runner_lease_blocks_a_separate_process_until_release(tmp_path) -> None:
+    path = tmp_path / "cross-process-runner-lease.db"
+    tournament = _tournament(tournament_id="cross-process-runner-lease")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    active = store.claim_tournament_runner(tournament.tournament_id).lease
+    script = """
+import sys
+from llmolympic.core.storage import SQLiteStore, TournamentRunnerLeaseBusyError
+
+store = SQLiteStore(sys.argv[1], create=False)
+try:
+    claim = store.claim_tournament_runner(sys.argv[2])
+except TournamentRunnerLeaseBusyError:
+    print("busy")
+    raise SystemExit(23)
+else:
+    print("claimed")
+    store.release_tournament_runner(claim.lease)
+"""
+
+    blocked = subprocess.run(  # noqa: S603 - fixed interpreter and local test script
+        [sys.executable, "-c", script, str(path), tournament.tournament_id],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert blocked.returncode == 23
+    assert blocked.stdout.strip() == "busy"
+    assert active.token not in blocked.stdout + blocked.stderr
+
+    assert store.release_tournament_runner(active)
+    claimed = subprocess.run(  # noqa: S603 - fixed interpreter and local test script
+        [sys.executable, "-c", script, str(path), tournament.tournament_id],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert claimed.returncode == 0, claimed.stderr
+    assert claimed.stdout.strip() == "claimed"
+
+
+def test_expired_lease_takeover_fences_every_stale_write(tmp_path) -> None:
+    path = tmp_path / "expired-runner-lease.db"
+    tournament = _tournament(tournament_id="expired-runner-lease")
+    store = SQLiteStore(path)
+    empty = _checkpoint(tournament)
+    store.save_tournament_checkpoint(empty)
+    stale = store.claim_tournament_runner(tournament.tournament_id).lease
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE tournament_runner_leases
+            SET acquired_at_epoch = 0, renewed_at_epoch = 0, expires_at_epoch = 1
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        )
+
+    active = SQLiteStore(path, create=False).claim_tournament_runner(tournament.tournament_id).lease
+
+    assert active.generation == stale.generation + 1
+    with pytest.raises(TournamentRunnerLeaseLostError):
+        store.renew_tournament_runner(stale)
+    with pytest.raises(TournamentRunnerLeaseLostError):
+        store.save_tournament_checkpoint(empty, lease=stale)
+    assert not store.release_tournament_runner(stale)
+
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=active,
+        )
+    with pytest.raises(TournamentRunnerLeaseLostError):
+        store.finalize_tournament_checkpoint(tournament.tournament_id, lease=stale)
+
+    renewed = store.renew_tournament_runner(active)
+    finalized = store.finalize_tournament_checkpoint(
+        tournament.tournament_id,
+        lease=renewed,
+    )
+    assert finalized.inserted and finalized.rated
+    with sqlite3.connect(path) as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM tournament_runner_leases").fetchone()[0] == 0
+        )
+
+
+def test_expire_runner_leases_preserves_generation_for_next_claim(tmp_path) -> None:
+    path = tmp_path / "expire-runner-lease.db"
+    tournament = _tournament(tournament_id="expire-runner-lease")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    first = store.claim_tournament_runner(tournament.tournament_id).lease
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE tournament_runner_leases
+            SET acquired_at_epoch = 0, renewed_at_epoch = 0, expires_at_epoch = 1
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        )
+
+    assert store.expire_tournament_runner_leases() == 1
+    assert store.expire_tournament_runner_leases() == 0
+    with pytest.raises(TournamentRunnerLeaseLostError):
+        store.renew_tournament_runner(first)
+    second = store.claim_tournament_runner(tournament.tournament_id).lease
+    assert second.generation == first.generation + 1
+    assert store.release_tournament_runner(second)
+
+
+def test_failed_checkpoint_append_rolls_back_lease_renewal(tmp_path) -> None:
+    path = tmp_path / "lease-append-rollback.db"
+    tournament = _tournament(tournament_id="lease-append-rollback")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    with sqlite3.connect(path) as connection:
+        expires_before = connection.execute(
+            "SELECT expires_at_epoch FROM tournament_runner_leases"
+        ).fetchone()[0]
+
+    with pytest.raises(TournamentCheckpointCollisionError, match="连续追加"):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, 2),
+            lease=lease,
+            lease_seconds=3600,
+        )
+
+    with sqlite3.connect(path) as connection:
+        expires_after = connection.execute(
+            "SELECT expires_at_epoch FROM tournament_runner_leases"
+        ).fetchone()[0]
+    assert expires_after == expires_before
+    assert store.release_tournament_runner(lease)
+
+
 def test_checkpoint_append_is_idempotent_and_rejects_non_contiguous_progress(
     tmp_path,
 ) -> None:
@@ -308,15 +516,21 @@ def test_checkpoint_append_is_idempotent_and_rejects_non_contiguous_progress(
     empty = _checkpoint(tournament)
 
     assert store.save_tournament_checkpoint(empty).inserted
-    assert not store.save_tournament_checkpoint(empty).inserted
+    with pytest.raises(TournamentRunnerLeaseLostError, match="有效的 runner lease"):
+        store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    assert not store.save_tournament_checkpoint(empty, lease=lease).inserted
     with pytest.raises(TournamentCheckpointCollisionError, match="连续追加"):
-        store.save_tournament_checkpoint(_checkpoint(tournament, 2))
+        store.save_tournament_checkpoint(_checkpoint(tournament, 2), lease=lease)
     with pytest.raises(TournamentCheckpointCollisionError, match="另一份 checkpoint 配置"):
-        store.save_tournament_checkpoint(_checkpoint(tournament, game_config={"rounds": 99}))
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, game_config={"rounds": 99}),
+            lease=lease,
+        )
 
     first = _checkpoint(tournament, 1)
-    assert store.save_tournament_checkpoint(first).inserted
-    assert not store.save_tournament_checkpoint(first).inserted
+    assert store.save_tournament_checkpoint(first, lease=lease).inserted
+    assert not store.save_tournament_checkpoint(first, lease=lease).inserted
     with pytest.raises(MatchIdCollisionError, match="checkpoint 保留"):
         store.save_match(tournament.pairings[0].series.legs[0], rating_source="engine")
     with pytest.raises(SeriesIdCollisionError, match="checkpoint 保留"):
@@ -341,10 +555,11 @@ def test_incomplete_checkpoint_cannot_finalize(tmp_path) -> None:
     tournament = _tournament(tournament_id="incomplete-checkpoint")
     store = SQLiteStore(path)
     store.save_tournament_checkpoint(_checkpoint(tournament))
-    store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1), lease=lease)
 
     with pytest.raises(StorageError, match="尚未完成"):
-        store.finalize_tournament_checkpoint(tournament.tournament_id)
+        store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
     assert store.get_tournament(tournament.tournament_id) is None
     assert store.leaderboard() == []
@@ -353,6 +568,12 @@ def test_incomplete_checkpoint_cannot_finalize(tmp_path) -> None:
         assert (
             connection.execute("SELECT status FROM tournament_checkpoints").fetchone()[0]
             == "in_progress"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM tournament_runner_leases WHERE token_digest IS NOT NULL"
+            ).fetchone()[0]
+            == 1
         )
 
 
@@ -365,16 +586,27 @@ def test_checkpoint_finalize_failure_rolls_back_archive_elo_and_status(tmp_path)
     path = tmp_path / "checkpoint-finalize-rollback.db"
     tournament = _tournament(tournament_id="rollback-checkpoint")
     store = FailingStore(path)
-    for completed_count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=lease,
+        )
 
     with pytest.raises(RuntimeError, match="injected checkpoint finalize failure"):
-        store.finalize_tournament_checkpoint(tournament.tournament_id)
+        store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
     with sqlite3.connect(path) as connection:
         assert (
             connection.execute("SELECT status FROM tournament_checkpoints").fetchone()[0]
             == "in_progress"
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM tournament_runner_leases WHERE token_digest IS NOT NULL"
+            ).fetchone()[0]
+            == 1
         )
         for table in (
             "tournament_archives",
@@ -394,7 +626,8 @@ def test_checkpoint_finalize_failure_rolls_back_archive_elo_and_status(tmp_path)
             )
 
     recovered = SQLiteStore(path, create=False).finalize_tournament_checkpoint(
-        tournament.tournament_id
+        tournament.tournament_id,
+        lease=lease,
     )
     assert recovered.inserted and recovered.rated
 
@@ -403,12 +636,18 @@ def test_concurrent_checkpoint_finalize_rates_exactly_once(tmp_path) -> None:
     path = tmp_path / "concurrent-checkpoint-finalize.db"
     tournament = _tournament(tournament_id="concurrent-checkpoint")
     store = SQLiteStore(path)
-    for completed_count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=lease,
+        )
 
     def finalize(_: int):
         return SQLiteStore(path, create=False).finalize_tournament_checkpoint(
-            tournament.tournament_id
+            tournament.tournament_id,
+            lease=lease,
         )
 
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -423,8 +662,13 @@ def test_checkpoint_finalize_freezes_ratings_at_finalization_time(tmp_path) -> N
     path = tmp_path / "checkpoint-finalization-ratings.db"
     tournament = _tournament(tournament_id="finalization-ratings-checkpoint")
     store = SQLiteStore(path)
-    for completed_count in range(4):
-        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count))
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=lease,
+        )
 
     store.save_match(
         _match(
@@ -442,7 +686,7 @@ def test_checkpoint_finalize_freezes_ratings_at_finalization_time(tmp_path) -> N
         entrant_id: entry.rating for entrant_id, entry in leaderboard_before_finalize.items()
     }
 
-    store.finalize_tournament_checkpoint(tournament.tournament_id)
+    store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
     leaderboard_after_finalize = {entry.entrant_id: entry for entry in store.leaderboard()}
     for entrant_id, entry in leaderboard_before_finalize.items():
@@ -473,7 +717,8 @@ def test_corrupt_checkpoint_series_is_rejected_on_reopen(tmp_path) -> None:
     tournament = _tournament(tournament_id="corrupt-checkpoint")
     store = SQLiteStore(path)
     store.save_tournament_checkpoint(_checkpoint(tournament))
-    store.save_tournament_checkpoint(_checkpoint(tournament, 1))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.save_tournament_checkpoint(_checkpoint(tournament, 1), lease=lease)
     with sqlite3.connect(path) as connection:
         connection.execute(
             """
@@ -761,7 +1006,190 @@ def test_concurrent_duplicate_tournament_saves_rate_exactly_once(tmp_path) -> No
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 24
 
 
-def test_v3_database_migrates_to_v5_without_rewriting_existing_data(tmp_path) -> None:
+def test_v5_database_migrates_to_v6_without_rewriting_checkpoint(tmp_path) -> None:
+    path = tmp_path / "migrate-v5.db"
+    tournament = _tournament(tournament_id="before-v6")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    checkpoint = _checkpoint(tournament, 1)
+    store.save_tournament_checkpoint(checkpoint, lease=lease)
+    assert store.release_tournament_runner(lease)
+    with sqlite3.connect(path) as connection:
+        config_before = connection.execute(
+            "SELECT config_json FROM tournament_checkpoints"
+        ).fetchone()[0]
+        prefix_before = connection.execute(
+            """
+            SELECT pairing_number, series_id, match_1_id, match_2_id,
+                   completed_at, series_json
+            FROM tournament_checkpoint_series
+            ORDER BY pairing_number
+            """
+        ).fetchall()
+        connection.executescript(
+            """
+            DROP TABLE tournament_runner_leases;
+            PRAGMA user_version = 5;
+            """
+        )
+
+    migrated = SQLiteStore(path, create=False)
+
+    loaded = migrated.get_tournament_checkpoint(tournament.tournament_id)
+    assert loaded is not None
+    assert loaded.model_dump(mode="json") == checkpoint.model_dump(mode="json")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert (
+            connection.execute("SELECT config_json FROM tournament_checkpoints").fetchone()[0]
+            == config_before
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT pairing_number, series_id, match_1_id, match_2_id,
+                       completed_at, series_json
+                FROM tournament_checkpoint_series
+                ORDER BY pairing_number
+                """
+            ).fetchall()
+            == prefix_before
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM tournament_runner_leases").fetchone()[0] == 0
+        )
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_failed_v5_to_v6_migration_rolls_back_schema_and_version(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "failed-v5-migration.db"
+    SQLiteStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE tournament_runner_leases;
+            PRAGMA user_version = 5;
+            """
+        )
+    original_create = SQLiteStore._create_runner_lease_schema
+
+    def fail_after_create(connection: sqlite3.Connection) -> None:
+        original_create(connection)
+        raise RuntimeError("injected runner lease migration failure")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_create_runner_lease_schema",
+        staticmethod(fail_after_create),
+    )
+
+    with pytest.raises(RuntimeError, match="injected runner lease migration failure"):
+        SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert (
+            connection.execute(
+                """
+                SELECT count(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'tournament_runner_leases'
+                """
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("lease_schema", "extra_schema", "message"),
+    (
+        (
+            """
+            CREATE TABLE tournament_runner_leases (
+                tournament_id TEXT UNIQUE REFERENCES tournament_checkpoints(tournament_id)
+                    ON DELETE RESTRICT,
+                generation INTEGER NOT NULL,
+                token_digest BLOB UNIQUE,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER
+            )
+            """,
+            None,
+            "主键无效",
+        ),
+        (
+            """
+            CREATE TABLE tournament_runner_leases (
+                tournament_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                token_digest BLOB UNIQUE,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER
+            )
+            """,
+            None,
+            "外键无效",
+        ),
+        (
+            """
+            CREATE TABLE tournament_runner_leases (
+                tournament_id TEXT PRIMARY KEY
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                generation INTEGER NOT NULL,
+                token_digest BLOB,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER
+            )
+            """,
+            None,
+            "缺少 token 唯一约束",
+        ),
+        (
+            """
+            CREATE TABLE tournament_runner_leases (
+                tournament_id TEXT PRIMARY KEY
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                generation INTEGER NOT NULL,
+                token_digest BLOB,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX partial_runner_token_unique
+            ON tournament_runner_leases(token_digest)
+            WHERE token_digest IS NULL
+            """,
+            "缺少 token 唯一约束",
+        ),
+    ),
+)
+def test_v6_rejects_runner_lease_table_without_fencing_constraints(
+    tmp_path,
+    lease_schema: str,
+    extra_schema: str | None,
+    message: str,
+) -> None:
+    path = tmp_path / "invalid-runner-lease-schema.db"
+    SQLiteStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE tournament_runner_leases")
+        connection.execute(lease_schema)
+        if extra_schema is not None:
+            connection.execute(extra_schema)
+
+    with pytest.raises(StorageError, match=message):
+        SQLiteStore(path, create=False)
+
+
+def test_v3_database_migrates_to_v6_without_rewriting_existing_data(tmp_path) -> None:
     path = tmp_path / "migrate-v3.db"
     store = SQLiteStore(path)
     archive = _match(
@@ -789,6 +1217,7 @@ def test_v3_database_migrates_to_v5_without_rewriting_existing_data(tmp_path) ->
         ).fetchall()
         connection.executescript(
             """
+            DROP TABLE tournament_runner_leases;
             DROP TABLE tournament_checkpoint_series;
             DROP TABLE tournament_checkpoints;
             DROP TABLE tournament_rating_contributions;
@@ -804,7 +1233,7 @@ def test_v3_database_migrates_to_v5_without_rewriting_existing_data(tmp_path) ->
 
     assert migrated.get_match(archive.match_id) is not None
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             connection.execute(
                 "SELECT archive_json FROM matches WHERE match_id = ?",
@@ -830,7 +1259,7 @@ def test_v3_database_migrates_to_v5_without_rewriting_existing_data(tmp_path) ->
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_v4_database_migrates_to_v5_without_rewriting_tournament_or_elo(
+def test_v4_database_migrates_to_v6_without_rewriting_tournament_or_elo(
     tmp_path,
 ) -> None:
     path = tmp_path / "migrate-v4.db"
@@ -851,6 +1280,7 @@ def test_v4_database_migrates_to_v5_without_rewriting_tournament_or_elo(
         ).fetchall()
         connection.executescript(
             """
+            DROP TABLE tournament_runner_leases;
             DROP TABLE tournament_checkpoint_series;
             DROP TABLE tournament_checkpoints;
             PRAGMA user_version = 4;
@@ -861,7 +1291,7 @@ def test_v4_database_migrates_to_v5_without_rewriting_tournament_or_elo(
 
     assert migrated.get_tournament(tournament.tournament_id) is not None
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             connection.execute("SELECT tournament_json FROM tournament_archives").fetchone()[0]
             == tournament_json
@@ -885,7 +1315,7 @@ def test_v4_database_migrates_to_v5_without_rewriting_tournament_or_elo(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_failed_v4_to_v5_migration_rolls_back_schema_and_version(
+def test_failed_v4_to_v6_migration_rolls_back_schema_and_version(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "failed-v4-migration.db"
@@ -893,6 +1323,7 @@ def test_failed_v4_to_v5_migration_rolls_back_schema_and_version(
     with sqlite3.connect(path) as connection:
         connection.executescript(
             """
+            DROP TABLE tournament_runner_leases;
             DROP TABLE tournament_checkpoint_series;
             DROP TABLE tournament_checkpoints;
             PRAGMA user_version = 4;
@@ -928,7 +1359,7 @@ def test_failed_v4_to_v5_migration_rolls_back_schema_and_version(
             )
 
 
-def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
+def test_failed_v3_to_v6_migration_rolls_back_schema_and_version(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "failed-v3-migration.db"
@@ -936,6 +1367,7 @@ def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
     with sqlite3.connect(path) as connection:
         connection.executescript(
             """
+            DROP TABLE tournament_runner_leases;
             DROP TABLE tournament_checkpoint_series;
             DROP TABLE tournament_checkpoints;
             DROP TABLE tournament_rating_contributions;
@@ -950,7 +1382,7 @@ def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
 
     def fail_after_create(connection: sqlite3.Connection) -> None:
         original_create(connection)
-        raise RuntimeError("injected v5 migration failure")
+        raise RuntimeError("injected v6 migration failure")
 
     monkeypatch.setattr(
         SQLiteStore,
@@ -958,7 +1390,7 @@ def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
         staticmethod(fail_after_create),
     )
 
-    with pytest.raises(RuntimeError, match="injected v5 migration failure"):
+    with pytest.raises(RuntimeError, match="injected v6 migration failure"):
         SQLiteStore(path, create=False)
 
     with sqlite3.connect(path) as connection:
@@ -974,8 +1406,8 @@ def test_failed_v3_to_v5_migration_rolls_back_schema_and_version(
         )
 
 
-def test_opening_v5_database_rejects_broken_foreign_keys(tmp_path) -> None:
-    path = tmp_path / "broken-v5-foreign-key.db"
+def test_opening_v6_database_rejects_broken_foreign_keys(tmp_path) -> None:
+    path = tmp_path / "broken-v6-foreign-key.db"
     tournament = _tournament()
     SQLiteStore(path).save_tournament(tournament, rating_source="engine")
     contribution = tournament.pairings[0].series.legs[0]

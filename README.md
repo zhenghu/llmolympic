@@ -117,10 +117,10 @@ chmod 600 config.toml
 
 ### 升级已有数据库
 
-首次用 v0.1.0 或更高版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
-v5 并保留既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用
-SQLite 备份机制
-制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和 `-shm` 文件。升级后的
+首次用当前源码版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
+v6 并保留既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用
+SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和 `-shm`
+文件。升级后的
 数据库不应再交给只支持旧 schema 的版本打开。可先运行 `llmolympic doctor --db 路径`
 进行只读检查；`doctor` 不执行迁移。
 
@@ -277,20 +277,39 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 创建和恢复 checkpoint 时会先核对已有可信 `entrant_id` 的身份绑定；若同一稳定 ID 已绑定
 到不同模型/Profile 身份，会在首次或下一次 Provider 调用前拒绝，避免跑完整场后才封存失败。
 
-当前 checkpoint 尚未提供跨进程 runner lease。同一赛事 ID 不要同时启动两个
-`round-robin --resume`：SQLite 的前缀比较与事务会阻止重复落库和重复 ELO，但两个进程仍
-可能在其中一个保存失败前重复调用 Provider、产生额外费用。一次只保留一个恢复进程。
+每个进行中的 checkpoint 都由 SQLite 跨进程 runner lease 保护。新赛事会在首次模型调用前
+创建空 checkpoint 并领取执行权；恢复进程则会先在短写事务中原子领取执行权并重载 checkpoint。
+恢复时若已有未过期执行者，会在重建 Provider 和发起任何模型调用前退出；如果 checkpoint
+已经完整，则无需重建 Provider，直接原子封存并结算 ELO。租约默认有效 60 秒，每 15 秒
+后台续租，并在每组双局赛开赛前再次续租；checkpoint 追加也会在同一事务中校验并延长租约。
+租约 token 只在领取进程内持有，
+数据库仅保存摘要；单调递增的 generation 会 fencing 已过期或已被接管的旧执行者，使其不能
+继续保存进度、封存赛事或更新 ELO。
+
+`Ctrl-C` 和正常错误路径会尽力立即释放租约；进程或机器崩溃后，其他进程可在租约过期后接管，
+无需手工清理。心跳丢失会中止当前循环赛任务；临时 SQLite `BUSY`/`LOCKED` 会在当前租约
+有效窗口内退避重试。所有领取、续租、保存和封存操作都只使用短 SQLite 事务，不会跨
+Provider 网络调用持有数据库写锁。只实现同步 `chat()` 的旧第三方
+Provider 请求在线程中开始后无法被 Python 强制终止，因此极端情况下已在途的一次请求可能
+短暂继续；旧 runner 仍会被 generation 阻止写入任何 checkpoint 或 ELO。
+
+从 SQLite v5 升级前应先停止仍在运行的旧版 `round-robin` 进程；旧进程本身不理解 v6 lease，
+不能依靠升级后的数据库反向约束已经加载的旧代码。
 
 ### 严格只读赛事审计
 
 `audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
 权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
-schema v5 必需列和已声明外键检查，再深度核对指定赛事的 checkpoint 连续前缀、正式赛事、
+schema v6 必需列和已声明外键检查，再深度核对指定赛事的 checkpoint 连续前缀、正式赛事、
 参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分赛事的稳定
 身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
 已封存赛事会验证正式档案。命令只报告、不修复数据。当前版本不对
-PK/UNIQUE/CHECK/FK/索引定义做完整结构指纹；这类结构级篡改
-需要后续基于 SQLite introspection manifest 补充，不能把本命令当作 DDL 取证工具。
+PK/UNIQUE/CHECK/FK/索引定义做完整结构指纹；runner lease 表的主键、token 唯一约束和
+checkpoint 外键会额外核验。其他结构级篡改需要后续基于 SQLite introspection manifest
+补充，不能把本命令当作 DDL 取证工具。
+
+活动 runner 持有未过期租约时，进行中 checkpoint 仍会展示已保存进度，但
+`resumable=false`；租约释放或过期后才会报告为可恢复。审计不会顺手释放或过期租约。
 
 为避免把不一致快照误报为健康，审计前或审计过程中出现同名 `-journal` / `-wal`、主文件
 发生变化时会退出失败；请先停止写入该数据库的比赛进程再重试。旧 schema 也只报告需要
@@ -298,7 +317,7 @@ PK/UNIQUE/CHECK/FK/索引定义做完整结构指纹；这类结构级篡改
 Typer 参数错误使用退出码 `2`；`--json` 输出不包含选手、模型、题面、端点或原始异常。
 
 赛事自身的 ELO 快照、贡献和 history 始终逐项验证。若同一选手和榜单作用域还存在该赛事
-之外的其他计分操作，schema v5 没有全局 rating operation sequence，无法仅凭事件时间证明
+之外的其他计分操作，schema v6 没有全局 rating operation sequence，无法仅凭事件时间证明
 这些操作与目标赛事的相对提交顺序；此时 `checks.leaderboard` 会是 `partial`，而不是把
 覆盖范围夸大为完整 PASS。即使标记为 `partial`，审计仍会验证排行榜胜平负汇总、目标赛事
 赛前分的历史来源、当前分等于某条已知 history 的 `rating_after` 候选，以及更新时间对应

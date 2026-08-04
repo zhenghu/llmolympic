@@ -459,6 +459,7 @@ class TournamentCheckpoint(BaseModel):
 
 
 TournamentCheckpointCallback = Callable[[TournamentCheckpoint], None]
+TournamentPairingStartCallback = Callable[[RoundRobinPairingSpec], None]
 
 
 class TournamentArchive(BaseModel):
@@ -723,6 +724,7 @@ async def resume_round_robin(
     *,
     on_event: TournamentEventCallback | None = None,
     on_checkpoint: TournamentCheckpointCallback | None = None,
+    on_pairing_start: TournamentPairingStartCallback | None = None,
 ) -> TournamentArchive:
     """Continue only the unfinished suffix of a validated tournament checkpoint."""
 
@@ -743,6 +745,8 @@ async def resume_round_robin(
 
     current = checkpoint
     for spec in current.schedule[len(current.completed_series) :]:
+        if on_pairing_start is not None:
+            on_pairing_start(spec)
         first_index, second_index = spec.player_indices
         event_callback: Callable[[int, MatchEvent], None] | None = None
         if on_event is not None:
@@ -783,6 +787,7 @@ async def play_round_robin(
     *,
     tournament_id: str | None = None,
     on_checkpoint: TournamentCheckpointCallback | None = None,
+    on_pairing_start: TournamentPairingStartCallback | None = None,
 ) -> TournamentArchive:
     """Play one swapped-order two-leg series for every entrant pair."""
 
@@ -801,4 +806,5 @@ async def play_round_robin(
         checkpoint,
         on_event=on_event,
         on_checkpoint=on_checkpoint,
+        on_pairing_start=on_pairing_start,
     )

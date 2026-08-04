@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 
 from llmolympic import __version__, config
 from llmolympic.cli.main import app
-from llmolympic.core.storage import SQLiteStore
+from llmolympic.core.storage import SCHEMA_VERSION, SQLiteStore
 
 runner = CliRunner()
 
@@ -242,7 +242,7 @@ def test_doctor_reports_corrupt_and_future_databases_without_raw_content(tmp_pat
     future_output = _plain(future_result.output)
 
     assert future_result.exit_code == 1
-    assert "FAIL SQLite schema 高于当前支持版本 v5" in future_output
+    assert f"FAIL SQLite schema 高于当前支持版本 v{SCHEMA_VERSION}" in future_output
 
 
 def test_doctor_inspects_current_database_without_modifying_it(tmp_path: Path) -> None:
@@ -256,7 +256,7 @@ def test_doctor_inspects_current_database_without_modifying_it(tmp_path: Path) -
     after_stat = database.stat()
 
     assert result.exit_code == 0
-    assert "PASS SQLite schema v5 兼容" in output
+    assert f"PASS SQLite schema v{SCHEMA_VERSION} 兼容" in output
     assert database.read_bytes() == before
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
     assert after_stat.st_mode == before_stat.st_mode
@@ -285,7 +285,7 @@ def test_doctor_does_not_migrate_or_chmod_v4_database(tmp_path: Path) -> None:
     after_stat = database.stat()
 
     assert result.exit_code == 0
-    assert "WARN SQLite schema v4 可迁移至 v5（doctor 未迁移）" in output
+    assert f"WARN SQLite schema v4 可迁移至 v{SCHEMA_VERSION}（doctor 未迁移）" in output
     assert database.read_bytes() == before
     assert after_stat.st_mtime_ns == before_stat.st_mtime_ns
     assert after_stat.st_mode == before_stat.st_mode
