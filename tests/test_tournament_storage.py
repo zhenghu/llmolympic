@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from itertools import combinations
@@ -409,6 +410,154 @@ else:
     )
     assert claimed.returncode == 0, claimed.stderr
     assert claimed.stdout.strip() == "claimed"
+
+
+def test_killed_runner_expires_and_takeover_finalizes_exactly_once(tmp_path) -> None:
+    path = tmp_path / "killed-runner-takeover.db"
+    ready_path = tmp_path / "runner-ready"
+    checkpoint_path = tmp_path / "first-checkpoint.json"
+    tournament = _tournament(tournament_id="killed-runner-takeover")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    checkpoint_path.write_text(
+        _checkpoint(tournament, 1).model_dump_json(),
+        encoding="utf-8",
+    )
+    script = """
+import sys
+import time
+from pathlib import Path
+
+from llmolympic.core.storage import SQLiteStore
+from llmolympic.core.tournament import TournamentCheckpoint
+
+store = SQLiteStore(sys.argv[1], create=False)
+claim = store.claim_tournament_runner(sys.argv[2], lease_seconds=1)
+checkpoint = TournamentCheckpoint.model_validate_json(
+    Path(sys.argv[3]).read_text(encoding="utf-8")
+)
+store.save_tournament_checkpoint(checkpoint, lease=claim.lease, lease_seconds=1)
+ready_path = Path(sys.argv[4])
+ready_tmp_path = ready_path.with_suffix(".tmp")
+ready_tmp_path.write_text(str(claim.lease.generation), encoding="ascii")
+ready_tmp_path.replace(ready_path)
+while True:
+    time.sleep(60)
+"""
+    process = subprocess.Popen(  # noqa: S603 - fixed interpreter and local test script
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(path),
+            tournament.tournament_id,
+            str(checkpoint_path),
+            str(ready_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready_deadline = time.monotonic() + 10
+        while not ready_path.exists() and time.monotonic() < ready_deadline:
+            assert process.poll() is None, process.stderr.read()
+            time.sleep(0.02)
+        assert ready_path.exists(), "runner subprocess did not acquire its lease in time"
+        first_generation = int(ready_path.read_text(encoding="ascii"))
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        _, stderr = process.communicate(timeout=5)
+
+    assert process.returncode != 0, stderr
+    orphaned_checkpoint = store.get_tournament_checkpoint(tournament.tournament_id)
+    assert orphaned_checkpoint is not None
+    assert len(orphaned_checkpoint.completed_series) == 1
+    with sqlite3.connect(path) as connection:
+        orphaned_generation, orphaned_digest = connection.execute(
+            """
+            SELECT generation, token_digest FROM tournament_runner_leases
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        ).fetchone()
+    assert orphaned_generation == first_generation
+    assert orphaned_digest is not None
+
+    takeover_deadline = time.monotonic() + 5
+    while True:
+        try:
+            takeover = SQLiteStore(path, create=False).claim_tournament_runner(
+                tournament.tournament_id
+            )
+            break
+        except TournamentRunnerLeaseBusyError:
+            if time.monotonic() >= takeover_deadline:
+                pytest.fail("killed runner lease did not expire in time")
+            time.sleep(0.05)
+
+    assert takeover.lease.generation == first_generation + 1
+    assert len(takeover.checkpoint.completed_series) == 1
+    for completed_count in range(2, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=takeover.lease,
+        )
+
+    finalized = store.finalize_tournament_checkpoint(
+        tournament.tournament_id,
+        lease=takeover.lease,
+    )
+
+    assert finalized.inserted and finalized.rated
+    archived = store.get_tournament(tournament.tournament_id)
+    assert archived is not None
+    assert archived.model_dump(mode="json") == tournament.model_dump(mode="json")
+    with sqlite3.connect(path) as connection:
+        counts_before = {
+            table: connection.execute(
+                f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed allowlist
+            ).fetchone()[0]
+            for table in (
+                "tournament_archives",
+                "matches",
+                "series_archives",
+                "rating_history",
+                "tournament_rating_snapshots",
+                "tournament_rating_contributions",
+            )
+        }
+        status = connection.execute(
+            "SELECT status FROM tournament_checkpoints WHERE tournament_id = ?",
+            (tournament.tournament_id,),
+        ).fetchone()[0]
+        lease_count = connection.execute(
+            "SELECT count(*) FROM tournament_runner_leases WHERE tournament_id = ?",
+            (tournament.tournament_id,),
+        ).fetchone()[0]
+    assert status == "finalized"
+    assert lease_count == 0
+    assert counts_before == {
+        "tournament_archives": 1,
+        "matches": 6,
+        "series_archives": 3,
+        "rating_history": 24,
+        "tournament_rating_snapshots": 6,
+        "tournament_rating_contributions": 24,
+    }
+
+    repeated = store.finalize_tournament_checkpoint(tournament.tournament_id)
+
+    assert not repeated.inserted and repeated.rated
+    with sqlite3.connect(path) as connection:
+        assert {
+            table: connection.execute(
+                f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed allowlist
+            ).fetchone()[0]
+            for table in counts_before
+        } == counts_before
 
 
 def test_expired_lease_takeover_fences_every_stale_write(tmp_path) -> None:

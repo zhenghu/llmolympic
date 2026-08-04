@@ -58,7 +58,7 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
-    assert metadata["Version"] == __version__ == "0.1.2"
+    assert metadata["Version"] == __version__ == "0.2.0"
     assert project["project"]["license"] == "MIT"
     assert project["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
     assert metadata["License-Expression"] == "MIT"
@@ -75,6 +75,25 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
     assert _plain(result.output) == f"llmolympic {__version__}\n"
+
+
+def test_release_documents_match_package_version() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert f"v{__version__} 通过 GitHub Release" in readme
+    assert (
+        f"releases/download/v{__version__}/"
+        f"llmolympic-{__version__}-py3-none-any.whl" in readme
+    )
+    assert f"`llmolympic-{__version__}-py3-none-any.whl`" in readme
+    assert f"`llmolympic-{__version__}.tar.gz`" in readme
+
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"## [{__version__}] - 2026-08-04" in changelog
+    assert changelog.index("## [Unreleased]") < changelog.index(f"## [{__version__}]")
+
+    supported_series = ".".join(__version__.split(".")[:2])
+    security = Path("SECURITY.md").read_text(encoding="utf-8")
+    assert f"| `{supported_series}.x` | 支持 |" in security
 
 
 def test_version_option_does_not_load_bad_config_or_create_database(
@@ -115,7 +134,7 @@ def test_doctor_missing_config_and_database_warns_without_creating_files(tmp_pat
     output = _plain(result.output)
 
     assert result.exit_code == 0
-    assert "PASS llmolympic 0.1.2" in output
+    assert f"PASS llmolympic {__version__}" in output
     assert "WARN 未找到配置文件" in output
     assert "WARN SQLite 数据库尚未创建" in output
     assert not database.exists()

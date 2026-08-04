@@ -110,3 +110,22 @@ jobs:
             --rounds 1 \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-smoke.db"
+
+      - name: Smoke-test source distribution outside the checkout
+        run: |
+          smoke_venv="${RUNNER_TEMP}/llmolympic-sdist-venv"
+          python -m venv "${smoke_venv}"
+          "${smoke_venv}/bin/python" -m pip install \
+            "pip==26.1.2" "setuptools==83.0.0"
+          "${smoke_venv}/bin/python" -m pip install \
+            "${GITHUB_WORKSPACE}"/dist/*.tar.gz
+          cd "${RUNNER_TEMP}"
+          "${smoke_venv}/bin/llmolympic" --version
+          "${smoke_venv}/bin/llmolympic" doctor
+          "${smoke_venv}/bin/llmolympic" games
+          "${smoke_venv}/bin/llmolympic" play \
+            --game math_quiz \
+            --players mock:fixed,mock:random \
+            --rounds 1 \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-smoke.db"

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
 ### 赛事审计与可靠性
 
 - 循环赛 checkpoint 新增 SQLite 跨进程 runner lease：恢复进程会在重建 Provider 和调用模型
@@ -31,6 +33,13 @@
   拒绝早于 checkpoint 最后更新时间的封存时间。
 - checkpoint 创建与恢复会预检既有可信 `entrant_id` 的身份绑定，在首次 Provider 调用前
   拒绝最终无法封存的身份冲突。
+
+### 发布与验证
+
+- 新增真实子进程强制终止、租约自然过期、接管、封存及 ELO 只结算一次的端到端回归测试；
+  已封存赛事恢复路径也会拒绝损坏的 ELO 快照。
+- GitHub Release 的 tag 流水线会重新执行依赖审计、Ruff 与完整测试；CI 和 Release 均分别
+  从 wheel 与 sdist 进行隔离安装和 CLI 冒烟，并检查版本、README、CHANGELOG 与安全支持线一致。
 
 ## [0.1.2] - 2026-08-03
 

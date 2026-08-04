@@ -1035,6 +1035,33 @@ def test_resume_deeply_verifies_completed_tournament_before_declaring_success(
     assert "已完成，无需恢复" not in output
 
 
+def test_resume_rejects_corrupt_completed_tournament_rating_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "resume-corrupt-rating.db"
+    tournament = _tournament("resume-corrupt-rating")
+    SQLiteStore(database).save_tournament(tournament, rating_source="engine")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE tournament_rating_snapshots
+            SET rating_after = rating_after + 1
+            WHERE tournament_id = ? AND rating_scope = 'overall'
+            """,
+            (tournament.tournament_id,),
+        )
+
+    result = runner.invoke(
+        app,
+        ["round-robin", "--resume", tournament.tournament_id, "--db", str(database)],
+    )
+    output = _plain(result.output)
+
+    assert result.exit_code == 1
+    assert "无法读取循环赛检查点" in output
+    assert "已完成，无需恢复" not in output
+
+
 def test_runtime_verified_tournament_uses_one_explicit_read_transaction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
