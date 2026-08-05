@@ -540,6 +540,12 @@ def test_schema_and_full_archive_round_trip(tmp_path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("SELECT count(*) FROM match_players").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+        assert connection.execute(
+            """
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations
+            """
+        ).fetchone() == (1, archive.match_id, None, None)
 
 
 def test_storage_dtos_keep_legacy_positional_construction() -> None:
@@ -775,6 +781,7 @@ def test_series_rating_failure_rolls_back_both_archives_and_all_ratings(tmp_path
     assert store.leaderboard() == []
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM rating_operations").fetchone()[0] == 0
 
 
 def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> None:
@@ -808,6 +815,24 @@ def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> Non
         assert connection.execute(
             "SELECT rating_source, rated, rating_policy FROM matches"
         ).fetchone() == ("engine", 1, "elo_v1")
+        assert connection.execute(
+            "SELECT match_id, series_id, tournament_id FROM rating_operations"
+        ).fetchone() == (payload["match_id"], None, None)
+        assert [row[1] for row in connection.execute("PRAGMA table_xinfo(matches)")] == [
+            "match_id",
+            "schema_version",
+            "game",
+            "seed",
+            "players_json",
+            "scores_json",
+            "started_at",
+            "finished_at",
+            "archive_source",
+            "rating_source",
+            "rated",
+            "rating_policy",
+            "archive_json",
+        ]
 
 
 def test_v2_series_migration_preserves_raw_json_and_backfills_legacy_identity(
@@ -865,6 +890,95 @@ def test_v2_series_migration_preserves_raw_json_and_backfills_legacy_identity(
             ).fetchall()
         ) == {("legacy", "engine", 1, "elo_batch_v1")}
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+        assert connection.execute(
+            "SELECT match_id, series_id, tournament_id FROM rating_operations"
+        ).fetchone() == (None, payload["series_id"], None)
+        assert [row[1] for row in connection.execute("PRAGMA table_xinfo(series_archives)")] == [
+            "series_id",
+            "schema_version",
+            "game",
+            "seed",
+            "players_json",
+            "points_json",
+            "rating_policy",
+            "started_at",
+            "finished_at",
+            "archive_source",
+            "rating_source",
+            "rated",
+            "series_json",
+        ]
+
+
+def test_failed_v2_v7_backfill_rolls_back_canonical_schema_and_data(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "rollback-v2-canonical-v7.db"
+    payload = _legacy_series_payload(_series_archive(series_id="rollback-v2-series"))
+    raw_archives, raw_series = _create_legacy_database(
+        path,
+        version=2,
+        series_payload=payload,
+    )
+    with sqlite3.connect(path) as connection:
+        before_schema = connection.execute(
+            """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+        before_ratings = connection.execute(
+            "SELECT * FROM ratings ORDER BY rating_scope, game, player"
+        ).fetchall()
+
+    original_backfill = SQLiteStore._backfill_rating_operations
+
+    def fail_after_backfill(connection: sqlite3.Connection) -> None:
+        original_backfill(connection)
+        raise RuntimeError("injected post-canonicalization failure")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_backfill_rating_operations",
+        staticmethod(fail_after_backfill),
+    )
+
+    with pytest.raises(RuntimeError, match="post-canonicalization failure"):
+        SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                """
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+            ).fetchall()
+            == before_schema
+        )
+        assert (
+            connection.execute(
+                "SELECT * FROM ratings ORDER BY rating_scope, game, player"
+            ).fetchall()
+            == before_ratings
+        )
+        assert (
+            connection.execute(
+                "SELECT series_json FROM series_archives WHERE series_id = ?",
+                (payload["series_id"],),
+            ).fetchone()[0]
+            == raw_series
+        )
+        assert (
+            dict(connection.execute("SELECT match_id, archive_json FROM matches").fetchall())
+            == raw_archives
+        )
 
 
 def test_missing_archive_schema_version_uses_legacy_identity_compatibility(tmp_path) -> None:
@@ -957,6 +1071,21 @@ def test_series_leg_resave_reuses_whole_series_integrity_check(tmp_path) -> None
         )
 
     with pytest.raises(StorageError, match="ELO 历史已损坏"):
+        store.save_match(series.legs[0])
+
+
+def test_series_leg_resave_rejects_missing_top_level_rating_operation(tmp_path) -> None:
+    path = tmp_path / "series-leg-missing-rating-operation.db"
+    series = _series_archive()
+    store = SQLiteStore(path)
+    store.save_series(series, rating_source="engine")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DELETE FROM rating_operations WHERE series_id = ?",
+            (series.series_id,),
+        )
+
+    with pytest.raises(StorageError, match="全局评分操作账本已损坏"):
         store.save_match(series.legs[0])
 
 
@@ -1372,6 +1501,7 @@ def test_imported_series_is_unrated_and_cannot_be_upgraded(tmp_path) -> None:
         store.save_match(series.legs[0], rating_source="engine")
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM rating_operations").fetchone()[0] == 0
         assert set(
             connection.execute("SELECT rating_source, rated, rating_policy FROM matches").fetchall()
         ) == {("imported", 0, "unrated")}
@@ -1777,6 +1907,8 @@ def test_failure_during_rating_update_rolls_back_archive(tmp_path) -> None:
 
     assert store.get_match(archive.match_id) is None
     assert store.leaderboard() == []
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM rating_operations").fetchone()[0] == 0
 
 
 def test_match_history_filter_and_order(tmp_path) -> None:
@@ -1826,6 +1958,13 @@ def test_concurrent_writers_do_not_lose_rating_updates(tmp_path) -> None:
     assert all(entry.games_played == 8 for entry in store.leaderboard())
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 32
+        sequences = [
+            row[0]
+            for row in connection.execute(
+                "SELECT rating_operation_seq FROM rating_operations ORDER BY rating_operation_seq"
+            )
+        ]
+        assert sequences == list(range(1, 9))
 
 
 def test_concurrent_duplicate_saves_update_elo_once(tmp_path) -> None:
@@ -1844,6 +1983,7 @@ def test_concurrent_duplicate_saves_update_elo_once(tmp_path) -> None:
     assert all(entry.games_played == 1 for entry in store.leaderboard())
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 4
+        assert connection.execute("SELECT count(*) FROM rating_operations").fetchone()[0] == 1
 
 
 def test_concurrent_duplicate_series_saves_update_batch_elo_once(tmp_path) -> None:
@@ -1863,6 +2003,118 @@ def test_concurrent_duplicate_series_saves_update_batch_elo_once(tmp_path) -> No
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT count(*) FROM series_archives").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+        assert connection.execute("SELECT count(*) FROM rating_operations").fetchone()[0] == 1
+
+
+def test_v6_migration_backfills_global_operation_order(tmp_path) -> None:
+    path = tmp_path / "v6-operation-backfill.db"
+    store = SQLiteStore(path)
+    match = _archive(match_id="before-series")
+    series = _series_archive(series_id="after-match")
+    store.save_match(match, rating_source="engine")
+    store.save_series(series, rating_source="engine")
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE rating_operations;
+            PRAGMA user_version = 6;
+            """
+        )
+
+    SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute(
+            """
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations
+            ORDER BY rating_operation_seq
+            """
+        ).fetchall() == [
+            (1, match.match_id, None, None),
+            (2, None, series.series_id, None),
+        ]
+
+
+def test_v6_migration_rejects_reordered_history_blocks_and_rolls_back(tmp_path) -> None:
+    path = tmp_path / "v6-reordered-history.db"
+    store = SQLiteStore(path)
+    first = _archive(match_id="first-committed")
+    second = _archive(match_id="second-committed")
+    store.save_match(first, rating_source="engine")
+    store.save_match(second, rating_source="engine")
+    with sqlite3.connect(path) as connection:
+        # Simulate a v6 database whose rowids no longer preserve commit order.
+        # Each operation remains a complete contiguous block, so coverage-only
+        # backfill checks cannot detect the reversal.
+        connection.execute(
+            "UPDATE rating_history SET rowid = rowid + 100 WHERE match_id = ?",
+            (first.match_id,),
+        )
+        connection.executescript(
+            """
+            DROP TABLE rating_operations;
+            PRAGMA user_version = 6;
+            """
+        )
+
+    with pytest.raises(StorageError, match="ELO 链已损坏"):
+        SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert (
+            connection.execute(
+                """
+            SELECT count(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'rating_operations'
+            """
+            ).fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT count(*) FROM rating_history").fetchone()[0] == 8
+
+
+def test_failed_v6_operation_backfill_rolls_back_schema_and_version(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "v6-operation-backfill-rollback.db"
+    SQLiteStore(path).save_match(_archive(), rating_source="engine")
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE rating_operations;
+            PRAGMA user_version = 6;
+            """
+        )
+    original_backfill = SQLiteStore._backfill_rating_operations
+
+    def fail_after_backfill(connection: sqlite3.Connection) -> None:
+        original_backfill(connection)
+        raise RuntimeError("injected v7 backfill failure")
+
+    monkeypatch.setattr(
+        SQLiteStore,
+        "_backfill_rating_operations",
+        staticmethod(fail_after_backfill),
+    )
+
+    with pytest.raises(RuntimeError, match="injected v7 backfill failure"):
+        SQLiteStore(path, create=False)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert (
+            connection.execute(
+                """
+            SELECT count(*) FROM sqlite_master
+            WHERE type = 'table' AND name = 'rating_operations'
+            """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_concurrent_v1_migration_is_serialized_and_idempotent(tmp_path) -> None:

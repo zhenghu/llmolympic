@@ -234,6 +234,19 @@ def test_audit_finalized_tournament_deeply_verifies_archive_and_ratings(tmp_path
     assert report.leaderboard_replay_complete is True
 
 
+def test_audit_rejects_missing_global_rating_operation(tmp_path: Path) -> None:
+    database = tmp_path / "missing-rating-operation.db"
+    tournament = _tournament("missing-rating-operation")
+    SQLiteStore(database).save_tournament(tournament, rating_source="engine")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM rating_operations WHERE tournament_id = ?",
+            (tournament.tournament_id,),
+        )
+
+    _assert_audit_error("tournament_inconsistent", tournament.tournament_id, database)
+
+
 def test_audit_rejects_unbacked_non_default_opening_rating(tmp_path: Path) -> None:
     database = tmp_path / "unbacked-opening-rating.db"
     tournament = _tournament("unbacked-opening-rating")
@@ -713,7 +726,57 @@ def test_audit_json_suppresses_shared_config_warning_on_success(
     assert str(config_path) not in _all_output(result)
 
 
-def test_audit_marks_current_leaderboard_replay_partial_after_later_match(tmp_path: Path) -> None:
+def test_audit_replays_interleaved_match_tournament_and_series_operations(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "interleaved-rating-operations.db"
+    tournament = _tournament("interleaved-rating-operations")
+    shared = _descriptor("secret-model-a")
+    outsider = _descriptor("D")
+    store = SQLiteStore(database)
+    warmup = _match(
+        match_id="interleaved-warmup",
+        seed=97,
+        players=(shared, outsider),
+        winner="secret-model-a",
+        started_at=tournament.started_at - timedelta(days=1),
+    )
+    store.save_match(warmup, rating_source="engine")
+    store.save_tournament(tournament, rating_source="engine")
+    first_leg = _match(
+        match_id="interleaved-series-1",
+        seed=98,
+        players=(shared, outsider),
+        winner="D",
+        started_at=tournament.finished_at + timedelta(seconds=10),
+    )
+    second_leg = _match(
+        match_id="interleaved-series-2",
+        seed=98,
+        players=(outsider, shared),
+        winner="secret-model-a",
+        started_at=tournament.finished_at + timedelta(seconds=12),
+    )
+    series = series_from_legs(first_leg, second_leg, series_id="interleaved-series")
+    store.save_series(series, rating_source="engine")
+
+    report = audit_tournament(tournament.tournament_id, database)
+
+    assert report.leaderboard_replay_complete is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            """
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations ORDER BY rating_operation_seq
+            """
+        ).fetchall() == [
+            (1, warmup.match_id, None, None),
+            (2, None, None, tournament.tournament_id),
+            (3, None, series.series_id, None),
+        ]
+
+
+def test_audit_replays_current_leaderboard_after_later_match(tmp_path: Path) -> None:
     database = tmp_path / "historical.db"
     tournament = _tournament("historical")
     store = SQLiteStore(database)
@@ -733,7 +796,7 @@ def test_audit_marks_current_leaderboard_replay_partial_after_later_match(tmp_pa
 
     assert report.state == "finalized"
     assert report.rated
-    assert report.leaderboard_replay_complete is False
+    assert report.leaderboard_replay_complete is True
 
 
 @pytest.mark.parametrize(
@@ -743,18 +806,18 @@ def test_audit_marks_current_leaderboard_replay_partial_after_later_match(tmp_pa
         ("updated_at", "2099-01-01T00:00:00+00:00"),
     ],
 )
-def test_audit_rejects_basic_leaderboard_corruption_when_replay_is_partial(
+def test_audit_rejects_basic_leaderboard_corruption_during_full_replay(
     tmp_path: Path,
     column: str,
     value: object,
 ) -> None:
-    database = tmp_path / f"partial-corrupt-{column}.db"
-    tournament = _tournament(f"partial-corrupt-{column}")
+    database = tmp_path / f"replay-corrupt-{column}.db"
+    tournament = _tournament(f"replay-corrupt-{column}")
     store = SQLiteStore(database)
     store.save_tournament(tournament, rating_source="engine")
     store.save_match(
         _match(
-            match_id=f"partial-corrupt-{column}-later",
+            match_id=f"replay-corrupt-{column}-later",
             seed=102,
             players=(_descriptor("secret-model-a"), _descriptor("D")),
             winner="D",
@@ -769,6 +832,38 @@ def test_audit_rejects_basic_leaderboard_corruption_when_replay_is_partial(
             WHERE rating_scope = 'overall' AND game = '' AND entrant_id = ?
             """,  # noqa: S608 - column is constrained by the test parameter above
             (value, "test:secret-model-a"),
+        )
+
+    _assert_audit_error("tournament_inconsistent", tournament.tournament_id, database)
+
+
+def test_audit_rejects_epsilon_tamper_in_later_rating_history(tmp_path: Path) -> None:
+    database = tmp_path / "epsilon-rating-tamper.db"
+    tournament = _tournament("epsilon-rating-tamper")
+    store = SQLiteStore(database)
+    store.save_tournament(tournament, rating_source="engine")
+    later = _match(
+        match_id="epsilon-rating-tamper-later",
+        seed=103,
+        players=(_descriptor("secret-model-a"), _descriptor("D")),
+        winner="D",
+        started_at=tournament.finished_at + timedelta(seconds=10),
+    )
+    store.save_match(later, rating_source="engine")
+    with sqlite3.connect(database) as connection:
+        # This is below the old replay tolerance.  Updating both history and the
+        # materialized leaderboard used to let the modified value propagate and
+        # still produce a false PASS.
+        connection.execute(
+            "UPDATE rating_history SET rating_after = rating_after + 5e-10 WHERE match_id = ?",
+            (later.match_id,),
+        )
+        connection.execute(
+            """
+            UPDATE ratings SET rating = rating + 5e-10
+            WHERE entrant_id IN (?, ?)
+            """,
+            ("test:secret-model-a", "test:D"),
         )
 
     _assert_audit_error("tournament_inconsistent", tournament.tournament_id, database)
@@ -800,7 +895,7 @@ def test_audit_rejects_orphaned_other_tournament_snapshot(tmp_path: Path) -> Non
     _assert_audit_error("tournament_inconsistent", tournament.tournament_id, database)
 
 
-def test_audit_uses_partial_not_failure_for_later_commit_with_older_event_time(
+def test_audit_replays_commit_order_when_later_operation_has_older_event_time(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "historical-commit-order.db"
@@ -821,10 +916,10 @@ def test_audit_uses_partial_not_failure_for_later_commit_with_older_event_time(
     report = audit_tournament(tournament.tournament_id, database)
 
     assert report.state == "finalized"
-    assert report.leaderboard_replay_complete is False
+    assert report.leaderboard_replay_complete is True
 
 
-def test_audit_marks_replay_partial_when_other_rating_operation_was_saved_first(
+def test_audit_replays_other_rating_operation_saved_before_tournament(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "prior-rating-operation.db"
@@ -845,7 +940,7 @@ def test_audit_marks_replay_partial_when_other_rating_operation_was_saved_first(
     report = audit_tournament(tournament.tournament_id, database)
 
     assert report.state == "finalized"
-    assert report.leaderboard_replay_complete is False
+    assert report.leaderboard_replay_complete is True
 
 
 def test_audit_rejects_finalization_before_checkpoint_completion(tmp_path: Path) -> None:

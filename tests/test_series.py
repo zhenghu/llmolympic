@@ -248,14 +248,14 @@ def test_series_rejects_legs_with_different_game_configuration() -> None:
         series_from_legs(first, second)
 
 
-def test_series_event_callback_receives_prompt_before_player_move() -> None:
+def test_series_event_callback_receives_all_batch_prompts_before_player_moves() -> None:
     prompts_seen = 0
     moves_started = 0
 
     class _ObservingPlayer(Player):
         async def get_move(self, prompt: str) -> str:
             nonlocal moves_started
-            assert prompts_seen == moves_started + 1
+            assert prompts_seen == (moves_started // 2 + 1) * 2
             moves_started += 1
             return "A"
 

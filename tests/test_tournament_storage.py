@@ -224,6 +224,12 @@ def test_tournament_save_round_trip_and_frozen_rating_ledger(tmp_path) -> None:
             connection.execute("SELECT count(*) FROM tournament_rating_contributions").fetchone()[0]
             == 24
         )
+        assert connection.execute(
+            """
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations
+            """
+        ).fetchone() == (1, None, None, tournament.tournament_id)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -1098,6 +1104,7 @@ def test_tournament_failure_rolls_back_every_child_and_rating(tmp_path) -> None:
             "SELECT count(*) FROM rating_history",
             "SELECT count(*) FROM tournament_rating_snapshots",
             "SELECT count(*) FROM tournament_rating_contributions",
+            "SELECT count(*) FROM rating_operations",
         ):
             assert connection.execute(count_query).fetchone()[0] == 0
 
@@ -1268,7 +1275,7 @@ def test_failed_v5_to_v6_migration_rolls_back_schema_and_version(
             )
             """,
             None,
-            "主键无效",
+            "column definitions",
         ),
         (
             """
@@ -1282,7 +1289,7 @@ def test_failed_v5_to_v6_migration_rolls_back_schema_and_version(
             )
             """,
             None,
-            "外键无效",
+            "foreign keys",
         ),
         (
             """
@@ -1297,7 +1304,7 @@ def test_failed_v5_to_v6_migration_rolls_back_schema_and_version(
             )
             """,
             None,
-            "缺少 token 唯一约束",
+            "unique constraints",
         ),
         (
             """
@@ -1316,11 +1323,11 @@ def test_failed_v5_to_v6_migration_rolls_back_schema_and_version(
             ON tournament_runner_leases(token_digest)
             WHERE token_digest IS NULL
             """,
-            "缺少 token 唯一约束",
+            "unique constraints",
         ),
     ),
 )
-def test_v6_rejects_runner_lease_table_without_fencing_constraints(
+def test_v7_manifest_rejects_runner_lease_table_without_fencing_constraints(
     tmp_path,
     lease_schema: str,
     extra_schema: str | None,

@@ -19,6 +19,7 @@ import warnings
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -32,6 +33,13 @@ from llmolympic.core.archive import (
 from llmolympic.core.elo import DEFAULT_RATING, K_FACTOR, expected_score, update_ratings
 from llmolympic.core.events import EventType
 from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, head_to_head_point
+from llmolympic.core.sqlite_schema import (
+    SchemaManifest,
+    SchemaManifestError,
+    TableSpec,
+    introspect_schema,
+    verify_schema_manifest,
+)
 from llmolympic.core.tournament import (
     TOURNAMENT_CHECKPOINT_SCHEMA_VERSION,
     TOURNAMENT_SCHEMA_VERSION,
@@ -40,7 +48,7 @@ from llmolympic.core.tournament import (
     tournament_from_series,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 RatingSource = Literal["engine", "imported"]
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
@@ -308,7 +316,7 @@ _V5_REQUIRED_COLUMNS = {
     },
 }
 
-_REQUIRED_COLUMNS = {
+_V6_REQUIRED_COLUMNS = {
     **_V5_REQUIRED_COLUMNS,
     "tournament_runner_leases": {
         "tournament_id",
@@ -317,6 +325,16 @@ _REQUIRED_COLUMNS = {
         "acquired_at_epoch",
         "renewed_at_epoch",
         "expires_at_epoch",
+    },
+}
+
+_REQUIRED_COLUMNS = {
+    **_V6_REQUIRED_COLUMNS,
+    "rating_operations": {
+        "rating_operation_seq",
+        "match_id",
+        "series_id",
+        "tournament_id",
     },
 }
 
@@ -718,6 +736,8 @@ def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
                 SQLiteStore._verify_v4_schema(connection)
             elif version == 5:
                 SQLiteStore._verify_v5_schema(connection)
+            elif version == 6:
+                SQLiteStore._verify_v6_schema(connection)
             else:
                 SQLiteStore._verify_schema(connection)
             SQLiteStore._verify_foreign_keys(connection)
@@ -1074,6 +1094,13 @@ class SQLiteStore:
                 self._verify_foreign_keys(connection)
                 return
 
+            # Rebuilding the two archive parent tables into one canonical v7 shape
+            # requires foreign-key enforcement to be disabled before the transaction
+            # starts.  The migration still runs a full foreign_key_check before commit
+            # and enforcement is restored in ``finally`` on every path.
+            foreign_keys_disabled = 1 <= version < SCHEMA_VERSION
+            if foreign_keys_disabled:
+                connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 locked_version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -1097,20 +1124,37 @@ class SQLiteStore:
                     self._verify_v4_schema(connection)
                 elif locked_version == 5:
                     self._verify_v5_schema(connection)
+                elif locked_version == 6:
+                    self._verify_v6_schema(connection)
                 if locked_version < 4:
                     self._create_tournament_schema(connection)
                 if locked_version < 5:
                     self._create_checkpoint_schema(connection)
                 if locked_version < 6:
                     self._create_runner_lease_schema(connection)
+                if locked_version < 7:
+                    if locked_version > 0:
+                        self._canonicalize_archive_tables(connection)
+                    self._create_rating_operation_schema(connection)
+                    self._backfill_rating_operations(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
+                if 0 < locked_version < SCHEMA_VERSION:
+                    # A v1-v6 database has no durable operation sequence.  Rowid
+                    # order is the best available backfill source, but it is not
+                    # itself an integrity guarantee (rowids can be rewritten).
+                    # Refuse to publish v7 unless that inferred order reproduces
+                    # the complete materialized leaderboard.
+                    self._verify_global_rating_operation_replay(connection)
                 if locked_version < SCHEMA_VERSION:
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
+            finally:
+                if foreign_keys_disabled:
+                    connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _verify_legacy_schema(connection: sqlite3.Connection, *, include_series: bool) -> None:
@@ -1125,21 +1169,18 @@ class SQLiteStore:
                 raise StorageError(f"SQLite 数据库结构不完整：{table} 缺少 {names}")
 
     @staticmethod
-    def _create_base_schema(connection: sqlite3.Connection) -> None:
+    def _create_matches_table(
+        connection: sqlite3.Connection,
+        *,
+        table_name: str = "matches",
+        if_not_exists: bool = True,
+    ) -> None:
+        if table_name not in {"matches", "matches_v7_canonical"}:
+            raise ValueError("不安全的 matches 表名")
+        conditional = "IF NOT EXISTS " if if_not_exists else ""
         connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS entrants (
-                entrant_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                identity_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS matches (
+            f"""
+            CREATE TABLE {conditional}{table_name} (
                 match_id TEXT PRIMARY KEY,
                 schema_version INTEGER NOT NULL,
                 game TEXT NOT NULL,
@@ -1158,6 +1199,9 @@ class SQLiteStore:
             )
             """
         )
+
+    @staticmethod
+    def _create_match_indexes(connection: sqlite3.Connection) -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS matches_finished_at_idx ON matches(finished_at DESC)"
         )
@@ -1167,6 +1211,69 @@ class SQLiteStore:
             ON matches(game, finished_at DESC)
             """
         )
+
+    @staticmethod
+    def _create_series_archives_table(
+        connection: sqlite3.Connection,
+        *,
+        table_name: str = "series_archives",
+        if_not_exists: bool = True,
+    ) -> None:
+        if table_name not in {"series_archives", "series_archives_v7_canonical"}:
+            raise ValueError("不安全的 series_archives 表名")
+        conditional = "IF NOT EXISTS " if if_not_exists else ""
+        connection.execute(
+            f"""
+            CREATE TABLE {conditional}{table_name} (
+                series_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                points_json TEXT NOT NULL,
+                rating_policy TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                archive_source TEXT NOT NULL
+                    CHECK (archive_source IN ('local_engine', 'external', 'legacy')),
+                rating_source TEXT NOT NULL
+                    CHECK (rating_source IN ('engine', 'imported')),
+                rated INTEGER NOT NULL CHECK (rated IN (0, 1)),
+                series_json TEXT NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_series_archive_indexes(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS series_archives_finished_at_idx
+            ON series_archives(finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS series_archives_game_finished_at_idx
+            ON series_archives(game, finished_at DESC)
+            """
+        )
+
+    @staticmethod
+    def _create_base_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entrants (
+                entrant_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                identity_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        SQLiteStore._create_matches_table(connection)
+        SQLiteStore._create_match_indexes(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS match_players (
@@ -1237,39 +1344,8 @@ class SQLiteStore:
 
     @staticmethod
     def _create_series_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS series_archives (
-                series_id TEXT PRIMARY KEY,
-                schema_version INTEGER NOT NULL,
-                game TEXT NOT NULL,
-                seed INTEGER NOT NULL,
-                players_json TEXT NOT NULL,
-                points_json TEXT NOT NULL,
-                rating_policy TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                archive_source TEXT NOT NULL
-                    CHECK (archive_source IN ('local_engine', 'external', 'legacy')),
-                rating_source TEXT NOT NULL
-                    CHECK (rating_source IN ('engine', 'imported')),
-                rated INTEGER NOT NULL CHECK (rated IN (0, 1)),
-                series_json TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS series_archives_finished_at_idx
-            ON series_archives(finished_at DESC)
-            """
-        )
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS series_archives_game_finished_at_idx
-            ON series_archives(game, finished_at DESC)
-            """
-        )
+        SQLiteStore._create_series_archives_table(connection)
+        SQLiteStore._create_series_archive_indexes(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS series_matches (
@@ -1530,6 +1606,360 @@ class SQLiteStore:
             WHERE token_digest IS NOT NULL
             """
         )
+
+    @staticmethod
+    def _create_rating_operation_schema(connection: sqlite3.Connection) -> None:
+        """Create the global commit-order ledger for top-level ELO writes."""
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rating_operations (
+                rating_operation_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id TEXT UNIQUE REFERENCES matches(match_id) ON DELETE RESTRICT,
+                series_id TEXT UNIQUE
+                    REFERENCES series_archives(series_id) ON DELETE RESTRICT,
+                tournament_id TEXT UNIQUE
+                    REFERENCES tournament_archives(tournament_id) ON DELETE RESTRICT,
+                CHECK (
+                    (match_id IS NOT NULL)
+                    + (series_id IS NOT NULL)
+                    + (tournament_id IS NOT NULL) = 1
+                )
+            )
+            """
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _archive_table_manifest_variants() -> dict[str, frozenset[TableSpec]]:
+        """Return the exact fresh and historical ALTER-based archive shapes."""
+
+        fresh: dict[str, TableSpec] = {}
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as connection:
+            SQLiteStore._create_matches_table(connection)
+            SQLiteStore._create_match_indexes(connection)
+            fresh["matches"] = introspect_schema(connection).tables_by_name()["matches"]
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as connection:
+            SQLiteStore._create_series_archives_table(connection)
+            SQLiteStore._create_series_archive_indexes(connection)
+            fresh["series_archives"] = introspect_schema(connection).tables_by_name()[
+                "series_archives"
+            ]
+
+        legacy: dict[str, TableSpec] = {}
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE matches (
+                    match_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    seed INTEGER NOT NULL,
+                    players_json TEXT NOT NULL,
+                    scores_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    archive_json TEXT NOT NULL,
+                    archive_source TEXT NOT NULL DEFAULT 'legacy',
+                    rating_source TEXT NOT NULL DEFAULT 'imported',
+                    rated INTEGER NOT NULL DEFAULT 0,
+                    rating_policy TEXT NOT NULL DEFAULT 'unrated'
+                );
+                CREATE INDEX matches_finished_at_idx ON matches(finished_at DESC);
+                CREATE INDEX matches_game_finished_at_idx
+                    ON matches(game, finished_at DESC);
+                """
+            )
+            legacy["matches"] = introspect_schema(connection).tables_by_name()["matches"]
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE series_archives (
+                    series_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    game TEXT NOT NULL,
+                    seed INTEGER NOT NULL,
+                    players_json TEXT NOT NULL,
+                    points_json TEXT NOT NULL,
+                    rating_policy TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    series_json TEXT NOT NULL,
+                    archive_source TEXT NOT NULL DEFAULT 'legacy',
+                    rating_source TEXT NOT NULL DEFAULT 'imported',
+                    rated INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX series_archives_finished_at_idx
+                    ON series_archives(finished_at DESC);
+                CREATE INDEX series_archives_game_finished_at_idx
+                    ON series_archives(game, finished_at DESC);
+                """
+            )
+            legacy["series_archives"] = introspect_schema(connection).tables_by_name()[
+                "series_archives"
+            ]
+        return {
+            table: frozenset((fresh[table], legacy[table]))
+            for table in ("matches", "series_archives")
+        }
+
+    @staticmethod
+    def _verify_archive_tables_before_canonicalization(connection: sqlite3.Connection) -> None:
+        """Reject tampering instead of silently repairing it during the v7 rebuild."""
+
+        try:
+            manifest = introspect_schema(connection)
+        except SchemaManifestError as exc:
+            raise StorageError("SQLite v7 迁移前结构无法安全审计") from exc
+        if manifest.auxiliary_objects:
+            raise StorageError("SQLite v7 迁移前存在非预期 view 或 trigger")
+        tables = manifest.tables_by_name()
+        for table, variants in SQLiteStore._archive_table_manifest_variants().items():
+            if tables.get(table) not in variants:
+                raise StorageError(f"SQLite v7 迁移前 {table} 结构不受支持")
+
+    @staticmethod
+    def _canonicalize_archive_tables(connection: sqlite3.Connection) -> None:
+        """Rebuild archive parents into the single canonical v7 table shape.
+
+        v1/v2 databases gained source/rating columns through ``ALTER TABLE``.
+        Their column order, defaults, and CHECK constraints therefore differ
+        from a fresh database even after later migrations.  A complete schema
+        manifest cannot safely allow that weaker shape, so v7 normalizes both
+        parent tables while preserving every value through explicit columns.
+        """
+
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+            raise StorageError("SQLite v7 规范化必须在事务外暂时关闭外键约束")
+        SQLiteStore._verify_archive_tables_before_canonicalization(connection)
+
+        SQLiteStore._create_matches_table(
+            connection,
+            table_name="matches_v7_canonical",
+            if_not_exists=False,
+        )
+        connection.execute(
+            """
+            INSERT INTO matches_v7_canonical (
+                match_id, schema_version, game, seed, players_json, scores_json,
+                started_at, finished_at, archive_source, rating_source, rated,
+                rating_policy, archive_json
+            )
+            SELECT match_id, schema_version, game, seed, players_json, scores_json,
+                   started_at, finished_at, archive_source, rating_source, rated,
+                   rating_policy, archive_json
+            FROM matches
+            """
+        )
+        connection.execute("DROP TABLE matches")
+        connection.execute("ALTER TABLE matches_v7_canonical RENAME TO matches")
+        SQLiteStore._create_match_indexes(connection)
+
+        SQLiteStore._create_series_archives_table(
+            connection,
+            table_name="series_archives_v7_canonical",
+            if_not_exists=False,
+        )
+        connection.execute(
+            """
+            INSERT INTO series_archives_v7_canonical (
+                series_id, schema_version, game, seed, players_json, points_json,
+                rating_policy, started_at, finished_at, archive_source,
+                rating_source, rated, series_json
+            )
+            SELECT series_id, schema_version, game, seed, players_json, points_json,
+                   rating_policy, started_at, finished_at, archive_source,
+                   rating_source, rated, series_json
+            FROM series_archives
+            """
+        )
+        connection.execute("DROP TABLE series_archives")
+        connection.execute("ALTER TABLE series_archives_v7_canonical RENAME TO series_archives")
+        SQLiteStore._create_series_archive_indexes(connection)
+
+    @staticmethod
+    def _rating_operation_candidates(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+        """Return every rated top-level archive and its first history row."""
+
+        return connection.execute(
+            """
+            SELECT operation_kind, operation_id, first_history_row,
+                   last_history_row, history_row_count
+            FROM (
+                SELECT 'match' AS operation_kind,
+                       m.match_id AS operation_id,
+                       MIN(rh.rowid) AS first_history_row,
+                       MAX(rh.rowid) AS last_history_row,
+                       COUNT(rh.rowid) AS history_row_count
+                FROM matches AS m
+                LEFT JOIN series_matches AS sm ON sm.match_id = m.match_id
+                LEFT JOIN rating_history AS rh ON rh.match_id = m.match_id
+                WHERE m.rated = 1 AND sm.match_id IS NULL
+                GROUP BY m.match_id
+
+                UNION ALL
+
+                SELECT 'series' AS operation_kind,
+                       sa.series_id AS operation_id,
+                       MIN(rh.rowid) AS first_history_row,
+                       MAX(rh.rowid) AS last_history_row,
+                       COUNT(rh.rowid) AS history_row_count
+                FROM series_archives AS sa
+                LEFT JOIN tournament_pairings AS tp ON tp.series_id = sa.series_id
+                LEFT JOIN series_matches AS sm ON sm.series_id = sa.series_id
+                LEFT JOIN rating_history AS rh ON rh.match_id = sm.match_id
+                WHERE sa.rated = 1 AND tp.series_id IS NULL
+                GROUP BY sa.series_id
+
+                UNION ALL
+
+                SELECT 'tournament' AS operation_kind,
+                       ta.tournament_id AS operation_id,
+                       MIN(rh.rowid) AS first_history_row,
+                       MAX(rh.rowid) AS last_history_row,
+                       COUNT(rh.rowid) AS history_row_count
+                FROM tournament_archives AS ta
+                LEFT JOIN tournament_pairings AS tp
+                  ON tp.tournament_id = ta.tournament_id
+                LEFT JOIN series_matches AS sm ON sm.series_id = tp.series_id
+                LEFT JOIN rating_history AS rh ON rh.match_id = sm.match_id
+                WHERE ta.rated = 1
+                GROUP BY ta.tournament_id
+            )
+            ORDER BY first_history_row, operation_kind, operation_id
+            """
+        ).fetchall()
+
+    @classmethod
+    def _backfill_rating_operations(cls, connection: sqlite3.Connection) -> None:
+        """Backfill v1-v6 commit order from SQLite's historical insert order."""
+
+        candidates = cls._rating_operation_candidates(connection)
+        if any(row["first_history_row"] is None for row in candidates):
+            raise StorageError("SQLite ELO 操作缺少评分历史，无法迁移至 v7")
+        if any(
+            row["last_history_row"] - row["first_history_row"] + 1 != row["history_row_count"]
+            for row in candidates
+        ):
+            raise StorageError("SQLite ELO 操作历史发生交错或断裂，无法迁移至 v7")
+        orphaned_history = connection.execute(
+            """
+            SELECT 1
+            FROM rating_history AS rh
+            JOIN matches AS m ON m.match_id = rh.match_id
+            LEFT JOIN series_matches AS sm ON sm.match_id = rh.match_id
+            LEFT JOIN series_archives AS sa ON sa.series_id = sm.series_id
+            LEFT JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
+            LEFT JOIN tournament_archives AS ta
+              ON ta.tournament_id = tp.tournament_id
+            WHERE CASE
+                WHEN ta.tournament_id IS NOT NULL THEN ta.rated
+                WHEN sa.series_id IS NOT NULL THEN sa.rated
+                ELSE m.rated
+            END <> 1
+            LIMIT 1
+            """
+        ).fetchone()
+        if orphaned_history is not None:
+            raise StorageError("SQLite ELO 历史没有对应的已计分顶层档案，无法迁移至 v7")
+
+        for row in candidates:
+            columns = {
+                "match": ("match_id", row["operation_id"]),
+                "series": ("series_id", row["operation_id"]),
+                "tournament": ("tournament_id", row["operation_id"]),
+            }
+            column, operation_id = columns[row["operation_kind"]]
+            connection.execute(
+                f"INSERT OR IGNORE INTO rating_operations ({column}) VALUES (?)",  # noqa: S608
+                (operation_id,),
+            )
+        actual_rows = connection.execute(
+            """
+            SELECT match_id, series_id, tournament_id
+            FROM rating_operations
+            """
+        ).fetchall()
+        actual_keys = {
+            (kind, identifier)
+            for row in actual_rows
+            for kind, identifier in (
+                ("match", row["match_id"]),
+                ("series", row["series_id"]),
+                ("tournament", row["tournament_id"]),
+            )
+            if identifier is not None
+        }
+        expected_keys = {(row["operation_kind"], row["operation_id"]) for row in candidates}
+        if len(actual_rows) != len(actual_keys) or actual_keys != expected_keys:
+            raise StorageError("SQLite 全局评分操作账本无法安全回填")
+
+    @staticmethod
+    def _record_rating_operation(
+        connection: sqlite3.Connection,
+        *,
+        match_id: str | None = None,
+        series_id: str | None = None,
+        tournament_id: str | None = None,
+    ) -> int:
+        identifiers = {
+            "match_id": match_id,
+            "series_id": series_id,
+            "tournament_id": tournament_id,
+        }
+        populated = [(column, value) for column, value in identifiers.items() if value is not None]
+        if len(populated) != 1:
+            raise ValueError("评分操作必须且只能关联一个顶层档案")
+        column, operation_id = populated[0]
+        cursor = connection.execute(
+            f"INSERT INTO rating_operations ({column}) VALUES (?)",  # noqa: S608
+            (operation_id,),
+        )
+        sequence = cursor.lastrowid
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+            raise StorageError("SQLite 无法分配全局评分操作序号")
+        return sequence
+
+    @staticmethod
+    def _verify_top_level_rating_operation(
+        connection: sqlite3.Connection,
+        *,
+        rated: bool,
+        match_id: str | None = None,
+        series_id: str | None = None,
+        tournament_id: str | None = None,
+    ) -> None:
+        identifiers = {
+            "match_id": match_id,
+            "series_id": series_id,
+            "tournament_id": tournament_id,
+        }
+        populated = [(column, value) for column, value in identifiers.items() if value is not None]
+        if len(populated) != 1:
+            raise ValueError("评分操作必须且只能关联一个顶层档案")
+        column, operation_id = populated[0]
+        rows = connection.execute(
+            f"""
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations
+            WHERE {column} = ?
+            """,  # noqa: S608
+            (operation_id,),
+        ).fetchall()
+        expected_count = 1 if rated else 0
+        if len(rows) != expected_count:
+            raise StorageError("SQLite 顶层档案的全局评分操作账本已损坏")
+        if rows:
+            row = rows[0]
+            sequence = row["rating_operation_seq"]
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence < 1
+                or row[column] != operation_id
+                or sum(row[name] is not None for name in identifiers) != 1
+            ):
+                raise StorageError("SQLite 顶层档案的全局评分操作账本已损坏")
 
     @staticmethod
     def _migrate_to_v3(connection: sqlite3.Connection, *, include_series: bool) -> None:
@@ -1823,6 +2253,11 @@ class SQLiteStore:
         SQLiteStore._verify_required_columns(connection, _V5_REQUIRED_COLUMNS)
 
     @staticmethod
+    def _verify_v6_schema(connection: sqlite3.Connection) -> None:
+        SQLiteStore._verify_required_columns(connection, _V6_REQUIRED_COLUMNS)
+        SQLiteStore._verify_runner_lease_schema(connection)
+
+    @staticmethod
     def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
         table_info = connection.execute("PRAGMA table_info(tournament_runner_leases)").fetchall()
         primary_key = [row["name"] for row in table_info if row["pk"]]
@@ -1861,9 +2296,25 @@ class SQLiteStore:
             )
 
     @staticmethod
+    @lru_cache(maxsize=1)
+    def _expected_schema_manifest() -> SchemaManifest:
+        """Build the canonical current-schema manifest with the same SQLite runtime."""
+
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
+            SQLiteStore._create_base_schema(reference)
+            SQLiteStore._create_series_schema(reference)
+            SQLiteStore._create_tournament_schema(reference)
+            SQLiteStore._create_checkpoint_schema(reference)
+            SQLiteStore._create_runner_lease_schema(reference)
+            SQLiteStore._create_rating_operation_schema(reference)
+            return introspect_schema(reference)
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
-        SQLiteStore._verify_required_columns(connection, _REQUIRED_COLUMNS)
-        SQLiteStore._verify_runner_lease_schema(connection)
+        try:
+            verify_schema_manifest(connection, SQLiteStore._expected_schema_manifest())
+        except SchemaManifestError as exc:
+            raise StorageError(f"SQLite 数据库结构与 v7 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:
@@ -2537,6 +2988,11 @@ class SQLiteStore:
             archive_source=row["archive_source"],
             rating_source=row["rating_source"],
         )
+        self._verify_top_level_rating_operation(
+            connection,
+            rated=stored_rated,
+            series_id=series.series_id,
+        )
         return SaveResult(inserted=False, rated=stored_rated)
 
     def save_match(
@@ -2663,6 +3119,11 @@ class SQLiteStore:
                     rated=stored_rated,
                     rating_policy=existing["rating_policy"],
                 )
+                self._verify_top_level_rating_operation(
+                    connection,
+                    rated=stored_rated,
+                    match_id=archive.match_id,
+                )
                 connection.commit()
                 return SaveResult(inserted=False, rated=stored_rated)
 
@@ -2687,6 +3148,7 @@ class SQLiteStore:
 
             changes: list[RatingChange] = []
             if rated:
+                self._record_rating_operation(connection, match_id=archive.match_id)
                 score_a = archive.scores[entrants[0].display_name]
                 score_b = archive.scores[entrants[1].display_name]
                 outcome_a = 1.0 if score_a > score_b else 0.0 if score_a < score_b else 0.5
@@ -3087,222 +3549,357 @@ class SQLiteStore:
             expected_aggregates,
         )
 
+    def _verify_global_rating_operation_replay(
+        self,
+        connection: sqlite3.Connection,
+    ) -> bool:
+        """Replay every committed ELO operation in its v7 sequence."""
+
+        operation_rows = connection.execute(
+            """
+            SELECT rating_operation_seq, match_id, series_id, tournament_id
+            FROM rating_operations
+            ORDER BY rating_operation_seq
+            """
+        ).fetchall()
+        expected_candidates = self._rating_operation_candidates(connection)
+        if any(row["first_history_row"] is None for row in expected_candidates):
+            raise StorageError("SQLite 全局评分操作账本缺少 ELO 历史")
+        expected_keys = {
+            (row["operation_kind"], row["operation_id"]) for row in expected_candidates
+        }
+
+        actual_keys: list[tuple[str, str]] = []
+        sequences: list[int] = []
+        for row in operation_rows:
+            sequence = row["rating_operation_seq"]
+            identifiers = [
+                ("match", row["match_id"]),
+                ("series", row["series_id"]),
+                ("tournament", row["tournament_id"]),
+            ]
+            populated = [(kind, identifier) for kind, identifier in identifiers if identifier]
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence < 1
+                or len(populated) != 1
+                or not isinstance(populated[0][1], str)
+            ):
+                raise StorageError("SQLite 全局评分操作账本已损坏")
+            sequences.append(sequence)
+            actual_keys.append((populated[0][0], populated[0][1]))
+        if (
+            sequences != list(range(1, len(sequences) + 1))
+            or len(actual_keys) != len(set(actual_keys))
+            or set(actual_keys) != expected_keys
+        ):
+            raise StorageError("SQLite 全局评分操作账本覆盖不完整")
+        orphaned_tournament_rating_data = connection.execute(
+            """
+            SELECT 1
+            FROM tournament_rating_snapshots AS trs
+            JOIN tournament_archives AS ta
+              ON ta.tournament_id = trs.tournament_id
+            LEFT JOIN rating_operations AS ro
+              ON ro.tournament_id = trs.tournament_id
+            WHERE ta.rated <> 1 OR ro.rating_operation_seq IS NULL
+
+            UNION ALL
+
+            SELECT 1
+            FROM tournament_rating_contributions AS trc
+            JOIN tournament_archives AS ta
+              ON ta.tournament_id = trc.tournament_id
+            LEFT JOIN rating_operations AS ro
+              ON ro.tournament_id = trc.tournament_id
+            WHERE ta.rated <> 1 OR ro.rating_operation_seq IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if orphaned_tournament_rating_data is not None:
+            raise StorageError("SQLite 循环赛 ELO 数据没有对应的全局评分操作")
+
+        replay: dict[tuple[str, str, str], dict[str, object]] = {}
+        replayed_history_rows = 0
+        for operation_kind, operation_id in actual_keys:
+            if operation_kind == "match":
+                operation_metadata = connection.execute(
+                    """
+                    SELECT game, finished_at, 1 AS expected_steps
+                    FROM matches WHERE match_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                history_rows = connection.execute(
+                    """
+                    SELECT 1 AS step, rh.rating_scope, rh.game, rh.entrant_id,
+                           rh.opponent_entrant_id, rh.outcome, rh.rating_before,
+                           rh.rating_after,
+                           CASE WHEN mp.position = 0 THEN 1 ELSE 0 END AS is_player_a
+                    FROM rating_history AS rh
+                    JOIN match_players AS mp
+                      ON mp.match_id = rh.match_id
+                     AND mp.entrant_id = rh.entrant_id
+                    WHERE rh.match_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchall()
+            elif operation_kind == "series":
+                operation_metadata = connection.execute(
+                    """
+                    SELECT game, finished_at, 2 AS expected_steps
+                    FROM series_archives WHERE series_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                history_rows = connection.execute(
+                    """
+                    SELECT sm.leg_number AS step, rh.rating_scope, rh.game,
+                           rh.entrant_id, rh.opponent_entrant_id, rh.outcome,
+                           rh.rating_before, rh.rating_after,
+                           CASE WHEN rh.entrant_id = first_mp.entrant_id
+                                THEN 1 ELSE 0 END AS is_player_a
+                    FROM series_matches AS sm
+                    JOIN rating_history AS rh ON rh.match_id = sm.match_id
+                    JOIN series_matches AS first_sm
+                      ON first_sm.series_id = sm.series_id
+                     AND first_sm.leg_number = 1
+                    JOIN match_players AS first_mp
+                      ON first_mp.match_id = first_sm.match_id
+                     AND first_mp.position = 0
+                    WHERE sm.series_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchall()
+            else:
+                operation_metadata = connection.execute(
+                    """
+                    SELECT game, finished_at, pairing_count * 2 AS expected_steps
+                    FROM tournament_archives WHERE tournament_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                history_rows = connection.execute(
+                    """
+                    SELECT trc.sequence AS step, rh.rating_scope, rh.game,
+                           rh.entrant_id, rh.opponent_entrant_id, rh.outcome,
+                           rh.rating_before, rh.rating_after,
+                           CASE WHEN rh.entrant_id = tp.entrant_a_id
+                                THEN 1 ELSE 0 END AS is_player_a
+                    FROM tournament_rating_contributions AS trc
+                    JOIN rating_history AS rh
+                      ON rh.match_id = trc.match_id
+                     AND rh.rating_scope = trc.rating_scope
+                     AND rh.game = trc.game
+                     AND rh.entrant_id = trc.entrant_id
+                    JOIN series_matches AS sm ON sm.match_id = trc.match_id
+                    JOIN tournament_pairings AS tp
+                      ON tp.tournament_id = trc.tournament_id
+                     AND tp.series_id = sm.series_id
+                    WHERE trc.tournament_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchall()
+            if operation_metadata is None or not history_rows:
+                raise StorageError("SQLite 全局评分操作账本关联的档案或历史已损坏")
+            game = operation_metadata["game"]
+            expected_step_count = operation_metadata["expected_steps"]
+            if (
+                not isinstance(game, str)
+                or not game
+                or isinstance(expected_step_count, bool)
+                or not isinstance(expected_step_count, int)
+                or expected_step_count < 1
+            ):
+                raise StorageError("SQLite 全局评分操作账本关联的档案已损坏")
+            try:
+                finished_at = datetime.fromisoformat(operation_metadata["finished_at"])
+            except (TypeError, ValueError) as exc:
+                raise StorageError("SQLite 全局评分操作账本关联的时间已损坏") from exc
+            if finished_at.utcoffset() is None:
+                raise StorageError("SQLite 全局评分操作账本关联的时间已损坏")
+            finished_at = finished_at.astimezone(UTC)
+
+            scope_rows: dict[tuple[str, str], list[sqlite3.Row]] = {}
+            for history_row in history_rows:
+                scope_rows.setdefault(
+                    (history_row["rating_scope"], history_row["game"]),
+                    [],
+                ).append(history_row)
+            if set(scope_rows) != {("overall", ""), ("game", game)}:
+                raise StorageError("SQLite 全局评分操作的榜单范围已损坏")
+
+            for (rating_scope, game_key), rows in scope_rows.items():
+                step_rows: dict[int, list[sqlite3.Row]] = {}
+                for history_row in rows:
+                    step = history_row["step"]
+                    if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+                        raise StorageError("SQLite 全局评分操作的步骤已损坏")
+                    step_rows.setdefault(step, []).append(history_row)
+                if sorted(step_rows) != list(range(1, expected_step_count + 1)):
+                    raise StorageError("SQLite 全局评分操作的步骤覆盖不完整")
+
+                entrants = {
+                    history_row["entrant_id"]
+                    for history_row in rows
+                    if isinstance(history_row["entrant_id"], str) and history_row["entrant_id"]
+                }
+                if len(entrants) < 2:
+                    raise StorageError("SQLite 全局评分操作的参赛者已损坏")
+                frozen = {
+                    entrant_id: float(
+                        replay.get(
+                            (rating_scope, game_key, entrant_id),
+                            {"rating": DEFAULT_RATING},
+                        )["rating"]
+                    )
+                    for entrant_id in entrants
+                }
+                running = dict(frozen)
+                deltas: dict[str, list[float]] = {entrant_id: [] for entrant_id in entrants}
+                operation_outcomes: dict[str, list[float]] = {
+                    entrant_id: [] for entrant_id in entrants
+                }
+                for step in range(1, expected_step_count + 1):
+                    paired_rows = step_rows[step]
+                    if len(paired_rows) != 2:
+                        raise StorageError("SQLite 全局评分操作的对手配对已损坏")
+                    player_a_rows = [row for row in paired_rows if row["is_player_a"] == 1]
+                    player_b_rows = [row for row in paired_rows if row["is_player_a"] == 0]
+                    if len(player_a_rows) != 1 or len(player_b_rows) != 1:
+                        raise StorageError("SQLite 全局评分操作的玩家顺序已损坏")
+                    player_a_row = player_a_rows[0]
+                    player_b_row = player_b_rows[0]
+                    player_a_id = player_a_row["entrant_id"]
+                    player_b_id = player_b_row["entrant_id"]
+                    if (
+                        player_a_id == player_b_id
+                        or player_a_id not in entrants
+                        or player_b_id not in entrants
+                        or player_a_row["opponent_entrant_id"] != player_b_id
+                        or player_b_row["opponent_entrant_id"] != player_a_id
+                    ):
+                        raise StorageError("SQLite 全局评分操作的对手配对已损坏")
+                    try:
+                        player_a_outcome = self._finite_database_float(player_a_row["outcome"])
+                        player_b_outcome = self._finite_database_float(player_b_row["outcome"])
+                        player_a_before = self._finite_database_float(player_a_row["rating_before"])
+                        player_b_before = self._finite_database_float(player_b_row["rating_before"])
+                        player_a_after = self._finite_database_float(player_a_row["rating_after"])
+                        player_b_after = self._finite_database_float(player_b_row["rating_after"])
+                    except (TypeError, ValueError) as exc:
+                        raise StorageError("SQLite 全局评分操作的 ELO 数值已损坏") from exc
+                    if (
+                        player_a_outcome not in (0.0, 0.5, 1.0)
+                        or player_b_outcome != 1.0 - player_a_outcome
+                        or player_a_before != running[player_a_id]
+                        or player_b_before != running[player_b_id]
+                    ):
+                        raise StorageError("SQLite 全局评分操作的 ELO 链已损坏")
+
+                    player_a_delta = K_FACTOR * (
+                        player_a_outcome - expected_score(frozen[player_a_id], frozen[player_b_id])
+                    )
+                    if operation_kind == "match":
+                        expected_player_a_after, expected_player_b_after = update_ratings(
+                            running[player_a_id],
+                            running[player_b_id],
+                            player_a_outcome,
+                        )
+                    elif operation_kind == "series":
+                        expected_player_a_after = running[player_a_id] + player_a_delta
+                        expected_player_b_after = running[player_b_id] - player_a_delta
+                    else:
+                        deltas[player_a_id].append(player_a_delta)
+                        deltas[player_b_id].append(-player_a_delta)
+                        expected_player_a_after = frozen[player_a_id] + math.fsum(
+                            deltas[player_a_id]
+                        )
+                        expected_player_b_after = frozen[player_b_id] + math.fsum(
+                            deltas[player_b_id]
+                        )
+                    if (
+                        player_a_after != expected_player_a_after
+                        or player_b_after != expected_player_b_after
+                    ):
+                        raise StorageError("SQLite 全局评分操作的 ELO 算法重放失败")
+                    # Continue from the canonical recomputation, never from a
+                    # tolerance-accepted database value.  Otherwise small changes
+                    # can be propagated through history and into the leaderboard.
+                    running[player_a_id] = expected_player_a_after
+                    running[player_b_id] = expected_player_b_after
+                    operation_outcomes[player_a_id].append(player_a_outcome)
+                    operation_outcomes[player_b_id].append(player_b_outcome)
+
+                for entrant_id, outcomes in operation_outcomes.items():
+                    key = (rating_scope, game_key, entrant_id)
+                    state = replay.setdefault(
+                        key,
+                        {
+                            "rating": DEFAULT_RATING,
+                            "games_played": 0,
+                            "wins": 0,
+                            "draws": 0,
+                            "losses": 0,
+                            "updated_at": None,
+                        },
+                    )
+                    state["rating"] = running[entrant_id]
+                    state["games_played"] = int(state["games_played"]) + len(outcomes)
+                    state["wins"] = int(state["wins"]) + outcomes.count(1.0)
+                    state["draws"] = int(state["draws"]) + outcomes.count(0.5)
+                    state["losses"] = int(state["losses"]) + outcomes.count(0.0)
+                    previous_updated_at = state["updated_at"]
+                    if previous_updated_at is None or finished_at > previous_updated_at:
+                        state["updated_at"] = finished_at
+            replayed_history_rows += len(history_rows)
+
+        total_history_rows = connection.execute("SELECT count(*) FROM rating_history").fetchone()[0]
+        if replayed_history_rows != total_history_rows:
+            raise StorageError("SQLite ELO 历史没有被全局评分操作账本完整覆盖")
+
+        rating_rows = connection.execute(
+            """
+            SELECT rating_scope, game, entrant_id, rating, games_played,
+                   wins, draws, losses, updated_at
+            FROM ratings
+            """
+        ).fetchall()
+        materialized = {
+            (row["rating_scope"], row["game"], row["entrant_id"]): row for row in rating_rows
+        }
+        if len(materialized) != len(rating_rows) or set(materialized) != set(replay):
+            raise StorageError("SQLite 当前 ELO 排行榜已损坏：与全局评分操作账本不一致")
+        for key, state in replay.items():
+            row = materialized[key]
+            try:
+                rating = self._finite_database_float(row["rating"])
+            except (TypeError, ValueError) as exc:
+                raise StorageError("SQLite 当前 ELO 排行榜已损坏：数值无效") from exc
+            updated_at = state["updated_at"]
+            if (
+                rating != state["rating"]
+                or row["games_played"] != state["games_played"]
+                or row["wins"] != state["wins"]
+                or row["draws"] != state["draws"]
+                or row["losses"] != state["losses"]
+                or not isinstance(updated_at, datetime)
+                or not self._timestamp_matches(row["updated_at"], updated_at)
+            ):
+                raise StorageError("SQLite 当前 ELO 排行榜已损坏：与全局评分操作账本不一致")
+        return True
+
     def _verify_current_tournament_ratings_if_latest(
         self,
         connection: sqlite3.Connection,
         tournament: TournamentArchive,
         expected_aggregates: list[_TournamentAggregate],
     ) -> bool:
-        """Verify the materialized leaderboard when this is its only known operation.
+        """Verify the materialized leaderboard by replaying every v7 operation."""
 
-        Schema v6 has event timestamps but no global rating-operation sequence.
-        Another history/snapshot row may therefore have been committed before or
-        after this tournament regardless of its event time.  Counts can always be
-        checked; the current numeric rating is only replay-complete when no other
-        operation for this entrant and scope exists.
-        """
-
-        tournament_finished_at = tournament.finished_at.astimezone(UTC)
-        replay_complete = True
-        for expected in expected_aggregates:
-            row = connection.execute(
-                """
-                SELECT rating, games_played, wins, draws, losses, updated_at
-                FROM ratings
-                WHERE rating_scope = ? AND game = ? AND entrant_id = ?
-                """,
-                (
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                ),
-            ).fetchone()
-            if row is None:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            try:
-                current_rating = self._finite_database_float(row["rating"])
-            except (TypeError, ValueError) as exc:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                ) from exc
-            leaderboard_history_rows = connection.execute(
-                """
-                SELECT outcome, rating_after, created_at
-                FROM rating_history
-                WHERE rating_scope = ? AND game = ? AND entrant_id = ?
-                """,
-                (
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                ),
-            ).fetchall()
-            try:
-                history_outcomes = tuple(
-                    self._finite_database_float(history_row["outcome"])
-                    for history_row in leaderboard_history_rows
-                )
-                history_after_values = tuple(
-                    self._finite_database_float(history_row["rating_after"])
-                    for history_row in leaderboard_history_rows
-                )
-                history_created_at = tuple(
-                    datetime.fromisoformat(history_row["created_at"])
-                    for history_row in leaderboard_history_rows
-                )
-            except (TypeError, ValueError) as exc:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                ) from exc
-            if (
-                not leaderboard_history_rows
-                or any(outcome not in (0.0, 0.5, 1.0) for outcome in history_outcomes)
-                or any(timestamp.utcoffset() is None for timestamp in history_created_at)
-                or row["games_played"] != len(history_outcomes)
-                or row["wins"] != history_outcomes.count(1.0)
-                or row["draws"] != history_outcomes.count(0.5)
-                or row["losses"] != history_outcomes.count(0.0)
-                or current_rating not in history_after_values
-            ):
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            raw_updated_at = row["updated_at"]
-            if not isinstance(raw_updated_at, str):
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            try:
-                updated_at = datetime.fromisoformat(raw_updated_at)
-            except ValueError as exc:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                ) from exc
-            operation_time_rows = connection.execute(
-                """
-                SELECT m.finished_at
-                FROM rating_history AS rh
-                JOIN matches AS m ON m.match_id = rh.match_id
-                LEFT JOIN series_matches AS sm ON sm.match_id = rh.match_id
-                WHERE rh.rating_scope = ? AND rh.game = ? AND rh.entrant_id = ?
-                  AND sm.match_id IS NULL
-                UNION
-                SELECT sa.finished_at
-                FROM rating_history AS rh
-                JOIN series_matches AS sm ON sm.match_id = rh.match_id
-                JOIN series_archives AS sa ON sa.series_id = sm.series_id
-                LEFT JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
-                WHERE rh.rating_scope = ? AND rh.game = ? AND rh.entrant_id = ?
-                  AND tp.series_id IS NULL
-                UNION
-                SELECT ta.finished_at
-                FROM tournament_rating_snapshots AS trs
-                JOIN tournament_archives AS ta
-                  ON ta.tournament_id = trs.tournament_id
-                WHERE trs.rating_scope = ? AND trs.game = ? AND trs.entrant_id = ?
-                """,
-                (
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                ),
-            ).fetchall()
-            try:
-                operation_finished_at = tuple(
-                    datetime.fromisoformat(operation_row["finished_at"])
-                    for operation_row in operation_time_rows
-                )
-            except (TypeError, ValueError) as exc:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                ) from exc
-            if (
-                updated_at.utcoffset() is None
-                or not operation_finished_at
-                or any(timestamp.utcoffset() is None for timestamp in operation_finished_at)
-                or updated_at.astimezone(UTC)
-                != max(timestamp.astimezone(UTC) for timestamp in operation_finished_at)
-            ):
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            other_tournament = connection.execute(
-                """
-                SELECT 1
-                FROM tournament_rating_snapshots AS trs
-                WHERE trs.rating_scope = ?
-                  AND trs.game = ?
-                  AND trs.entrant_id = ?
-                  AND trs.tournament_id <> ?
-                LIMIT 1
-                """,
-                (
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                    tournament.tournament_id,
-                ),
-            ).fetchone()
-            outside_history_rows = connection.execute(
-                """
-                SELECT rh.rating_after
-                FROM rating_history AS rh
-                WHERE rh.rating_scope = ?
-                  AND rh.game = ?
-                  AND rh.entrant_id = ?
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM series_matches AS sm
-                      JOIN tournament_pairings AS tp
-                        ON tp.series_id = sm.series_id
-                      WHERE sm.match_id = rh.match_id
-                        AND tp.tournament_id = ?
-                  )
-                """,
-                (
-                    expected.rating_scope,
-                    expected.game_key,
-                    expected.player.entrant_id,
-                    tournament.tournament_id,
-                ),
-            ).fetchall()
-            try:
-                outside_after_values = {
-                    self._finite_database_float(history_row["rating_after"])
-                    for history_row in outside_history_rows
-                }
-            except (TypeError, ValueError) as exc:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                ) from exc
-            if other_tournament is not None and not outside_history_rows:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            if expected.before not in {DEFAULT_RATING, *outside_after_values}:
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-            if outside_history_rows:
-                replay_complete = False
-                continue
-
-            if (
-                updated_at.astimezone(UTC) != tournament_finished_at
-                or current_rating != expected.after
-            ):
-                raise StorageError(
-                    f"数据库中 tournament_id {tournament.tournament_id!r} 的当前 ELO 排行榜已损坏"
-                )
-        return replay_complete
+        del tournament, expected_aggregates
+        return self._verify_global_rating_operation_replay(connection)
 
     def _verify_existing_tournament(
         self,
@@ -3471,12 +4068,18 @@ class SQLiteStore:
                 rating_policy=rating_policy,
             )
 
-        return self._verify_tournament_ratings(
+        replay_complete = self._verify_tournament_ratings(
             connection,
             tournament,
             entrants,
             rated=rated,
         )
+        self._verify_top_level_rating_operation(
+            connection,
+            rated=rated,
+            tournament_id=tournament.tournament_id,
+        )
+        return replay_complete
 
     def _load_verified_tournament(
         self,
@@ -4527,6 +5130,10 @@ class SQLiteStore:
 
             rating_changes: list[TournamentRatingChange] = []
             if rated:
+                self._record_rating_operation(
+                    connection,
+                    tournament_id=tournament.tournament_id,
+                )
                 rating_changes = self._record_tournament_ratings(
                     connection,
                     tournament,
@@ -4673,6 +5280,11 @@ class SQLiteStore:
                     archive_source=existing["archive_source"],
                     rating_source=existing["rating_source"],
                 )
+                self._verify_top_level_rating_operation(
+                    connection,
+                    rated=stored_rated,
+                    series_id=series.series_id,
+                )
                 connection.commit()
                 return SaveResult(inserted=False, rated=stored_rated)
 
@@ -4744,6 +5356,7 @@ class SQLiteStore:
             )
             changes: list[RatingChange] = []
             if rated:
+                self._record_rating_operation(connection, series_id=series.series_id)
                 changes.extend(
                     self._record_series_ratings(
                         connection,

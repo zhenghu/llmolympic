@@ -5,9 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import io
 import json
 import math
+import os
 import re
+import select
+import sys
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 
@@ -24,6 +29,11 @@ DEFAULT_MAX_RESPONSE_CHARS = 4096
 
 _REDACTED = "[REDACTED]"
 _SAFE_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_DEFAULT_INPUT = input
+_STDIN_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, weakref.ReferenceType[asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+_STDIN_BUFFERS: weakref.WeakKeyDictionary[object, list[str]] = weakref.WeakKeyDictionary()
 _ARCHIVE_SAFE_SAMPLING_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -37,6 +47,192 @@ _ARCHIVE_SAFE_SAMPLING_KEYS = frozenset(
         "top_p",
     }
 )
+
+
+class _CancellableStdinUnavailable(Exception):
+    """The active loop/stdin pair cannot provide a removable POSIX reader."""
+
+
+def _stdin_lock(loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+    lock_reference = _STDIN_LOCKS.get(loop)
+    lock = None if lock_reference is None else lock_reference()
+    if lock is None:
+        lock = asyncio.Lock()
+        # A contended asyncio.Lock retains its loop.  Storing the lock strongly as
+        # the value of a WeakKeyDictionary would therefore keep the weak loop key
+        # alive through a value -> key cycle.  Tasks using the lock already hold it
+        # strongly, so a weak value is sufficient between calls.
+        _STDIN_LOCKS[loop] = weakref.ref(lock)
+    return lock
+
+
+def _pop_stdin_line(buffer: list[str]) -> str | None:
+    text = "".join(buffer)
+    newline = text.find("\n")
+    if newline < 0:
+        return None
+    line = text[:newline]
+    remainder = text[newline + 1 :]
+    buffer.clear()
+    if remainder:
+        buffer.append(remainder)
+    return line.removesuffix("\r")
+
+
+def _fd_ready(fd: int) -> bool:
+    try:
+        return bool(select.select((fd,), (), (), 0)[0])
+    except (OSError, ValueError) as exc:
+        raise _CancellableStdinUnavailable from exc
+
+
+def _is_canonical_tty(fd: int) -> bool:
+    if not os.isatty(fd):
+        return False
+    try:
+        import termios
+
+        return bool(termios.tcgetattr(fd)[3] & termios.ICANON)
+    except (ImportError, OSError):
+        # A selectable POSIX tty is normally canonical.  If its attributes are
+        # unavailable, preserving Ctrl-D EOF semantics is safer than hanging.
+        return True
+
+
+def _read_text_stream_without_blocking(stream: object, fd: int) -> tuple[str, bool]:
+    """Drain one text line/fragment while preserving TextIOWrapper read-ahead.
+
+    ``TextIOWrapper`` can already hold a complete line even when the underlying
+    descriptor is not readable.  Temporarily making the descriptor non-blocking
+    lets ``readline`` consult that buffer without ever parking the event loop.
+    The boolean result distinguishes a real EOF from an empty would-block read.
+    """
+
+    readline = getattr(stream, "readline", None)
+    if not callable(readline):
+        raise _CancellableStdinUnavailable
+    try:
+        was_blocking = os.get_blocking(fd)
+        if was_blocking:
+            os.set_blocking(fd, False)
+    except OSError as exc:
+        raise _CancellableStdinUnavailable from exc
+    try:
+        ready_before = _fd_ready(fd)
+        canonical_tty = ready_before and _is_canonical_tty(fd)
+        try:
+            chunk = readline()
+        except (BlockingIOError, InterruptedError):
+            return "", False
+        except UnicodeDecodeError as exc:
+            # A strict TextIOWrapper may report a split multibyte character as
+            # an incomplete decode.  It retains those bytes internally; wait for
+            # more only for that exact condition.  Other malformed input must not
+            # be silently discarded.  Canonical tty readiness already represents
+            # a complete line or a Ctrl-D boundary, so it is never a split read.
+            if (
+                not canonical_tty
+                and exc.reason == "unexpected end of data"
+                and exc.end == len(exc.object)
+                and not _fd_ready(fd)
+            ):
+                return "", False
+            raise
+    finally:
+        if was_blocking:
+            try:
+                os.set_blocking(fd, True)
+            except OSError as exc:
+                raise _CancellableStdinUnavailable from exc
+    if not isinstance(chunk, str):
+        raise _CancellableStdinUnavailable
+    if chunk:
+        return chunk, canonical_tty and "\n" not in chunk
+    if canonical_tty:
+        return "", True
+    return "", ready_before and _fd_ready(fd)
+
+
+async def _read_default_stdin(prompt: str) -> str:
+    """Read one line without leaving a worker blocked after cancellation.
+
+    The descriptor is temporarily non-blocking while ``TextIOWrapper.readline``
+    drains either its own read-ahead buffer or currently available bytes.  Thus a
+    partial pipe line cannot block the event loop, while a line already prefetched
+    by earlier text I/O remains visible.  A per-loop lock prevents concurrent
+    ``HumanPlayer`` tasks from replacing each other's reader; it cannot make
+    multiple humans' answers private from one another.
+    """
+
+    if os.name != "posix":
+        raise _CancellableStdinUnavailable
+
+    loop = asyncio.get_running_loop()
+    stream = sys.stdin
+    if not isinstance(stream, io.TextIOBase):
+        raise _CancellableStdinUnavailable
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise _CancellableStdinUnavailable from exc
+    try:
+        buffer = _STDIN_BUFFERS.setdefault(stream, [])
+    except TypeError as exc:
+        raise _CancellableStdinUnavailable from exc
+
+    async with _stdin_lock(loop):
+        if "\n" in "".join(buffer):
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            line = _pop_stdin_line(buffer)
+            if line is None:  # pragma: no cover - guarded by the newline check
+                raise RuntimeError("stdin line buffer changed unexpectedly")
+            return line
+
+        result: asyncio.Future[str] = loop.create_future()
+
+        def read_ready() -> None:
+            if result.done():
+                return
+            try:
+                chunk, eof = _read_text_stream_without_blocking(stream, fd)
+            except (OSError, UnicodeError, _CancellableStdinUnavailable, ValueError) as exc:
+                result.set_exception(exc)
+                return
+            if chunk:
+                buffer.append(chunk)
+                if "\n" in "".join(buffer):
+                    result.set_result("line")
+                elif eof:
+                    result.set_result("eof")
+                return
+            if eof:
+                result.set_result("eof")
+
+        try:
+            loop.add_reader(fd, read_ready)
+        except (AttributeError, NotImplementedError, OSError, RuntimeError) as exc:
+            raise _CancellableStdinUnavailable from exc
+
+        try:
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            # ``add_reader`` only observes the descriptor.  Drain once eagerly so
+            # TextIOWrapper data prefetched by earlier input is not missed.
+            read_ready()
+            ready = await result
+            if ready == "line":
+                line = _pop_stdin_line(buffer)
+                if line is None:  # pragma: no cover - callback saw the newline
+                    raise RuntimeError("stdin line buffer changed unexpectedly")
+                return line
+            if buffer:
+                line = "".join(buffer)
+                buffer.clear()
+                return line
+            raise EOFError("EOF when reading a line")
+        finally:
+            loop.remove_reader(fd)
 
 
 def _archive_sampling_params(params: dict[str, object]) -> dict[str, object]:
@@ -323,7 +519,7 @@ class HumanPlayer(Player):
         self,
         name: str,
         timeout: float | None = 60.0,
-        input_fn: Callable[[str], str] = input,
+        input_fn: Callable[[str], str] = _DEFAULT_INPUT,
         *,
         entrant_id: str | None = None,
     ) -> None:
@@ -335,7 +531,18 @@ class HumanPlayer(Player):
 
     async def get_move(self, prompt: str) -> str:
         try:
-            coro = asyncio.to_thread(self._input_fn, f"{self.name}，请输入你的答案 > ")
+            input_prompt = f"{self.name}，请输入你的答案 > "
+            if self._input_fn is _DEFAULT_INPUT:
+
+                async def read_input() -> str:
+                    try:
+                        return await _read_default_stdin(input_prompt)
+                    except _CancellableStdinUnavailable:
+                        return await asyncio.to_thread(self._input_fn, input_prompt)
+
+                coro = read_input()
+            else:
+                coro = asyncio.to_thread(self._input_fn, input_prompt)
             return await asyncio.wait_for(coro, timeout=self.timeout)
         except TimeoutError as exc:  # 3.11+ 中 wait_for 超时抛内置 TimeoutError
             raise PlayerTimeoutError(
