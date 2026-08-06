@@ -4,10 +4,12 @@
 - ``random``：选择题随机选 A-D，棋类随机选择合法走法，其他题随机输出整数；
 - ``fixed``：选择题答 A，棋类使用确定性合法走法，其他题答 42；
 - ``illegal``：永远输出非法走法 "Z"，用于测试重试/判负逻辑。
+- ``strict`` / ``balanced`` / ``lenient``：创意项目的确定性算法评委。
 """
 
 from __future__ import annotations
 
+import json
 import random
 import re
 
@@ -20,6 +22,20 @@ _GOMOKU_ROW_RE = re.compile(
 )
 _CHESS_LEGAL_RE = re.compile(r"^LEGAL_MOVES_UCI:\s*([^\n]*)$", re.MULTILINE)
 _UCI_TOKEN_RE = re.compile(r"[a-h][1-8][a-h][1-8][qrbn]?")
+_JUDGE_INPUT_RE = re.compile(r"<judge-input>\s*(.*)\s*</judge-input>", re.DOTALL)
+_JUDGE_MARKER = "LLMOLYMPIC_JUDGE_REQUEST_V1"
+_CREATIVE_SUBMISSION_MARKER = "CREATIVE_WRITING_SUBMISSION_V1"
+_JUDGE_BASE_SCORES = {
+    "strict": 3.5,
+    "balanced": 6.0,
+    "lenient": 8.5,
+}
+_CREATIVE_RESPONSES = {
+    "fixed": "雨停以后，我把未寄出的信折成小船，让它沿着清晨的街道驶向那盏仍亮着的灯。",
+    "strict": "旧钟敲响第十三声时，我关掉屋里所有的灯，只留下窗边那颗缓慢发芽的种子。",
+    "balanced": "风从空荡的站台穿过，卷起一张旧车票；我追上它，也追上了那个迟到多年的春天。",
+    "lenient": "月光落进杯中，像一封没有署名的回信；我轻轻喝下，终于听见远方故乡的潮声。",
+}
 _CHESS_FIXED_PREFERENCES = (
     "e2e4",
     "e7e5",
@@ -60,11 +76,83 @@ def _chess_legal_moves(prompt: str) -> list[str]:
     return tokens
 
 
+def _judge_payload(prompt: str) -> dict | None:
+    """Extract the machine-delimited judge request without evaluating free text."""
+
+    if _JUDGE_MARKER not in prompt:
+        return None
+    match = _JUDGE_INPUT_RE.search(prompt)
+    if match is None:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _submission_items(value: object) -> list[tuple[str, str]]:
+    """Accept the canonical label->text object plus a conservative list fallback."""
+
+    if isinstance(value, dict):
+        return [
+            (label, text)
+            for label, text in value.items()
+            if isinstance(label, str) and label and isinstance(text, str)
+        ]
+    if not isinstance(value, list):
+        return []
+    items: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label")
+        text = item.get("submission", item.get("content"))
+        if isinstance(label, str) and label and isinstance(text, str):
+            items.append((label, text))
+    return items
+
+
+def _criterion_names(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [name for name in value if isinstance(name, str) and name]
+    if isinstance(value, list):
+        return [name for name in value if isinstance(name, str) and name]
+    return []
+
+
+def _mock_judge_response(strategy: str, payload: dict) -> str:
+    """Return a deterministic, strictly JSON-encoded multi-submission verdict."""
+
+    submissions = _submission_items(payload.get("submissions"))
+    criteria = _criterion_names(payload.get("criteria"))
+    if not submissions or not criteria:
+        return "Z"
+
+    base = _JUDGE_BASE_SCORES[strategy]
+    scores: dict[str, dict[str, float]] = {}
+    rationales: dict[str, str] = {}
+    for label, submission in submissions:
+        # Reward enough detail to make the three deterministic judge personalities
+        # useful in offline demos without pretending that Mock is an LLM.
+        detail_adjustment = min(max(len(submission) - 20, 0), 180) / 180
+        score = round(min(10.0, base + detail_adjustment), 4)
+        scores[label] = {criterion: score for criterion in criteria}
+        rationales[label] = f"{strategy} mock judge: deterministic offline score"
+
+    return json.dumps(
+        {"scores": scores, "rationales": rationales},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 class MockProvider(Provider):
     name = "mock"
 
     def __init__(self, strategy: str = "random", seed: int | None = None) -> None:
-        if strategy not in ("random", "fixed", "illegal"):
+        if strategy not in ("random", "fixed", "illegal", *tuple(_JUDGE_BASE_SCORES)):
             raise ValueError(f"未知 mock 策略: {strategy!r}")
         self.strategy = strategy
         self._rng = random.Random(seed)  # noqa: S311 - mock 策略需可复现，不用于安全令牌
@@ -80,6 +168,17 @@ class MockProvider(Provider):
         prompt = messages[-1]["content"]
         if self.strategy == "illegal":
             return "Z"
+
+        judge_payload = _judge_payload(prompt)
+        if judge_payload is not None and self.strategy in _JUDGE_BASE_SCORES:
+            return _mock_judge_response(self.strategy, judge_payload)
+
+        if _CREATIVE_SUBMISSION_MARKER in prompt:
+            if self.strategy == "random":
+                images = ("月光", "潮声", "旧车票", "纸船", "远方的灯")
+                first, second = self._rng.sample(images, 2)
+                return f"我在清晨拾起{first}留下的影子，把它写进信里，寄给仍在等待{second}的人。"
+            return _CREATIVE_RESPONSES.get(self.strategy, _CREATIVE_RESPONSES["fixed"])
 
         chess_moves = _chess_legal_moves(prompt)
         if chess_moves:

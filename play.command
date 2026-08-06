@@ -37,14 +37,15 @@ echo " 16) 逻辑推理    3 个 mock 循环赛"
 echo " 17) 猜谜竞答    3 个 mock 循环赛"
 echo " 18) 五子棋      3 个 mock 循环赛"
 echo " 19) 国际象棋    3 个 mock 循环赛"
+echo " 20) 创意写作    2 个 mock + 3 个匿名算法评委"
 if [ -n "$HAS_LLM" ]; then
     label=${LLM_MODEL:-未设默认模型}
-    echo " 20) 五子棋      你（黑）vs LLM ($label)"
-    echo " 21) 知识竞答    你 vs LLM ($label)"
-    echo " 22) 数学问答    你 vs LLM ($label)"
-    echo " 23) 逻辑推理    你 vs LLM ($label)"
-    echo " 24) 猜谜竞答    你 vs LLM ($label)"
-    echo " 25) 国际象棋    你（白）vs LLM ($label)"
+    echo " 21) 五子棋      你（黑）vs LLM ($label)"
+    echo " 22) 知识竞答    你 vs LLM ($label)"
+    echo " 23) 数学问答    你 vs LLM ($label)"
+    echo " 24) 逻辑推理    你 vs LLM ($label)"
+    echo " 25) 猜谜竞答    你 vs LLM ($label)"
+    echo " 26) 国际象棋    你（白）vs LLM ($label)"
 fi
 echo "=============================="
 read -r -p "请选择: " choice
@@ -69,12 +70,13 @@ case "$choice" in
    17) llmolympic round-robin --game riddle_quiz    --players mock:random,mock:fixed,mock:illegal --rounds 5 ;;
    18) llmolympic round-robin --game gomoku         --players mock:random,mock:fixed,mock:illegal ;;
    19) llmolympic round-robin --game chess          --players mock:random,mock:fixed,mock:illegal ;;
-   20) [ -n "$HAS_LLM" ] && llmolympic play --game gomoku         --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
-   21) [ -n "$HAS_LLM" ] && llmolympic play --game knowledge_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
-   22) [ -n "$HAS_LLM" ] && llmolympic play --game math_quiz      --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
-   23) [ -n "$HAS_LLM" ] && llmolympic play --game reasoning_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
-   24) [ -n "$HAS_LLM" ] && llmolympic play --game riddle_quiz    --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
-   25) [ -n "$HAS_LLM" ] && llmolympic play --game chess          --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
+   20) llmolympic play --game creative_writing --players mock:random,mock:fixed --judge mock:strict --judge mock:balanced --judge mock:lenient ;;
+   21) [ -n "$HAS_LLM" ] && llmolympic play --game gomoku         --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
+   22) [ -n "$HAS_LLM" ] && llmolympic play --game knowledge_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+   23) [ -n "$HAS_LLM" ] && llmolympic play --game math_quiz      --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+   24) [ -n "$HAS_LLM" ] && llmolympic play --game reasoning_quiz --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+   25) [ -n "$HAS_LLM" ] && llmolympic play --game riddle_quiz    --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" --rounds 5 ;;
+   26) [ -n "$HAS_LLM" ] && llmolympic play --game chess          --players "human:我,openai${LLM_MODEL:+:$LLM_MODEL}" ;;
     *) echo "无效选择" ;;
 esac
 

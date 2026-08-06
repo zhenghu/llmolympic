@@ -411,9 +411,11 @@ class LLMPlayer(Player):
         self.max_response_chars = max_response_chars
         self.sampling_params = sampling_params
 
-    async def get_move(self, prompt: str) -> str:
+    async def complete(self, prompt: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
+        """调用底层模型并执行与参赛走法相同的超时、错误和大小隔离。"""
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         try:
@@ -473,6 +475,9 @@ class LLMPlayer(Player):
                 },
             )
         return response
+
+    async def get_move(self, prompt: str) -> str:
+        return await self.complete(prompt)
 
     def _timeout_error(self) -> PlayerTimeoutError:
         details: dict[str, object] = {

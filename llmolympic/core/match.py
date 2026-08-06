@@ -27,6 +27,7 @@ from llmolympic.core.game import (
     describe_game_config,
     validate_players,
 )
+from llmolympic.core.judge import LLMJudgePanel
 from llmolympic.core.player import DEFAULT_MAX_RESPONSE_CHARS, Player, PlayerActionError
 
 _FEEDBACK_PREVIEW_LIMIT = 200
@@ -173,7 +174,12 @@ class Match:
     """
 
     def __init__(
-        self, game: Game, players: list[Player], seed: int = 0, max_attempts: int = 3
+        self,
+        game: Game,
+        players: list[Player],
+        seed: int = 0,
+        max_attempts: int = 3,
+        judge_panel: LLMJudgePanel | None = None,
     ) -> None:
         names = [p.name for p in players]
         validate_players(game, names)
@@ -188,6 +194,14 @@ class Match:
         self.players = {p.name: p for p in players}
         self.seed = seed
         self.max_attempts = max_attempts
+        requires_judge_panel = bool(getattr(game, "requires_judge_panel", False))
+        if requires_judge_panel and judge_panel is None:
+            raise ValueError(f"项目 {game.name!r} 需要 LLM 评审团")
+        if not requires_judge_panel and judge_panel is not None:
+            raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
+        if judge_panel is not None:
+            judge_panel.validate_contestants(players)
+        self.judge_panel = judge_panel
         self.forfeit_scope = getattr(game, "forfeit_scope", "turn")
         if self.forfeit_scope not in ("turn", "match"):
             raise ValueError("game.forfeit_scope 必须是 'turn' 或 'match'")
@@ -289,6 +303,8 @@ class Match:
                         continue
 
                     try:
+                        if move == FORFEIT_MOVE:
+                            raise IllegalMoveError("选手不能直接提交引擎保留的放弃标记")
                         self.game.apply_move(state, name, move)
                         yield emit(EventType.MOVE_RECEIVED, player=name, move=move)
                     except IllegalMoveError as exc:
@@ -343,16 +359,28 @@ class Match:
                 pending = next_pending
                 prompts = next_prompts
 
+        judging: dict[str, object] | None = None
         if termination is not None and override_scores:
             scores = _technical_loss_scores(self.players, str(termination["forfeited_by"]))
+        elif self.judge_panel is not None:
+            judging_request = getattr(self.game, "judging_request", None)
+            if not callable(judging_request):
+                raise TypeError("需要评审团的项目必须实现 judging_request(state)")
+            verdict = await self.judge_panel.adjudicate(judging_request(state), seed=self.seed)
+            scores = verdict.scores
+            judging = verdict.model_dump(mode="json")
         else:
             scores = self.game.score(state)
+        if set(scores) != set(self.players):
+            raise ValueError("终局分数必须恰好覆盖全部参赛者")
         finished_data: dict[str, object] = {
             "scores": scores,
             "termination": "completed",
         }
         if termination is not None:
             finished_data.update(termination)
+        if judging is not None:
+            finished_data["judging"] = judging
         yield emit(EventType.MATCH_FINISHED, **finished_data)
 
 
@@ -362,13 +390,20 @@ async def play_match(
     seed: int = 0,
     max_attempts: int = 3,
     on_event: Callable[[MatchEvent], None] | None = None,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> MatchArchive:
     """跑完一整场并返回对局档案。
 
     ``on_event`` 可用于实时渲染；回调收到的正是最终写入档案的同一批事件，
     因此界面无需为了存档而重跑一场对局。
     """
-    match = Match(game, players, seed=seed, max_attempts=max_attempts)
+    match = Match(
+        game,
+        players,
+        seed=seed,
+        max_attempts=max_attempts,
+        judge_panel=judge_panel,
+    )
     started = datetime.now(UTC)
     events: list[MatchEvent] = []
     async for event in match.run():

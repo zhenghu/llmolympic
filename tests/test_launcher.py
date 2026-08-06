@@ -41,7 +41,7 @@ def test_launcher_exposes_chess_human_demo_series_and_llm_modes() -> None:
     assert "--game chess          --players human:我,mock:random" in launcher
     assert "--game chess          --players mock:random,mock:fixed" in launcher
     assert "llmolympic series --game chess" in launcher
-    assert "25) 国际象棋    你（白）vs LLM" in launcher
+    assert "26) 国际象棋    你（白）vs LLM" in launcher
     assert '--game chess          --players "human:我,openai' in launcher
 
 
@@ -76,7 +76,7 @@ def test_launcher_exposes_all_three_mock_round_robin_modes() -> None:
         for line in command_lines
         if (match := re.search(r"--game ([a-z_]+)", line)) is not None
     ]
-    assert sorted(command_games) == list_games()
+    assert sorted(command_games) == list_games("round_robin")
     assert len(command_games) == len(set(command_games))
 
     for line in command_lines:
@@ -86,4 +86,16 @@ def test_launcher_exposes_all_three_mock_round_robin_modes() -> None:
         else:
             assert "--rounds 5" in line
 
-    assert "20) 五子棋      你（黑）vs LLM" in launcher
+    assert "21) 五子棋      你（黑）vs LLM" in launcher
+
+
+def test_launcher_exposes_offline_creative_writing_with_three_judges() -> None:
+    launcher = (Path(__file__).parent.parent / "play.command").read_text()
+
+    assert "20) 创意写作    2 个 mock + 3 个匿名算法评委" in launcher
+    command = next(
+        line for line in launcher.splitlines() if line.strip().startswith("20) llmolympic play")
+    )
+    assert "--game creative_writing" in command
+    assert "--players mock:random,mock:fixed" in command
+    assert command.count("--judge") == 3

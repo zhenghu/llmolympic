@@ -1,0 +1,100 @@
+name: Live Provider Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      judge_model_1:
+        description: "First OpenRouter judge model"
+        required: true
+        default: "openai/gpt-4o-mini-2024-07-18"
+        type: string
+      judge_model_2:
+        description: "Second OpenRouter judge model"
+        required: true
+        default: "google/gemini-2.5-flash-lite"
+        type: string
+      judge_model_3:
+        description: "Third OpenRouter judge model"
+        required: true
+        default: "anthropic/claude-haiku-4.5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-provider-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  require-main:
+    name: Require trusted main branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    env:
+      SELECTED_REF: "${{ github.ref }}"
+    steps:
+      - name: Reject non-main workflow refs
+        shell: bash
+        run: |
+          if [[ "${SELECTED_REF}" != "refs/heads/main" ]]; then
+            echo "Live provider smoke must be dispatched from main." >&2
+            exit 1
+          fi
+
+  smoke:
+    name: Creative writing with live judges
+    needs: require-main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: live-provider-smoke
+    env:
+      JUDGE_MODEL_1: "${{ inputs.judge_model_1 }}"
+      JUDGE_MODEL_2: "${{ inputs.judge_model_2 }}"
+      JUDGE_MODEL_3: "${{ inputs.judge_model_3 }}"
+      LLMOLYMPIC_RUN_LIVE: "1"
+      LLMOLYMPIC_LIVE_JUDGES: "openai:${{ inputs.judge_model_1 }},openai:${{ inputs.judge_model_2 }},openai:${{ inputs.judge_model_3 }}"
+      OPENAI_BASE_URL: https://openrouter.ai/api/v1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Validate judge model inputs
+        shell: bash
+        run: |
+          for model in "${JUDGE_MODEL_1}" "${JUDGE_MODEL_2}" "${JUDGE_MODEL_3}"; do
+            if [[ ! "${model}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:+-]*$ ]]; then
+              echo "Each judge input must be one OpenRouter provider/model identifier." >&2
+              exit 1
+            fi
+          done
+
+      - name: Require OpenRouter secret
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "The live-provider-smoke environment must define OPENROUTER_API_KEY." >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: |
+          python -m pip install "pip==26.1.2" "setuptools==83.0.0"
+          python -m pip install -e ".[dev]"
+
+      - name: Run live provider smoke test
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python -m pytest -m live_provider -q -s
