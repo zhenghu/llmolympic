@@ -273,8 +273,10 @@ async def play_two_leg_series(
 
     ``on_event`` 的第一个参数是从 1 开始的局号，便于界面实时区分两局。
     同一批 ``Player`` 实例会跨局复用且不重置；seed 只复现 Game 条件，不保证
-    外部模型输出相同。终端 ``HumanPlayer`` 超时后的输入线程不可可靠取消，
-    库调用者应只在输入可取消时把人类选手用于双局赛。
+    外部模型输出相同。POSIX 内置 stdin 的 ``HumanPlayer`` 会在超时或取消后移除
+    事件循环 reader；自定义输入及不支持 reader 的平台会回退到不可强制终止的
+    工作线程，库调用者应只在输入可取消时把人类选手用于双局赛。共享终端也不提供
+    多名人类之间的盲答隔离。
     """
 
     entrants = tuple(players)

@@ -8,6 +8,7 @@ import pytest
 
 from llmolympic.core.archive import MatchArchive, MoveRecord, legacy_entrant_id
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError
 from llmolympic.core.match import MAX_MOVE_CHARS, Match, play_match
 from llmolympic.core.player import (
     LLMPlayer,
@@ -69,6 +70,119 @@ class _SpoofingFailurePlayer(Player):
         )
 
 
+class _BlindBatchState:
+    def __init__(self, players: list[str], seed: int) -> None:
+        self.players = list(players)
+        self.seed = seed
+        self.moves: dict[str, str] = {}
+
+
+class _BlindBatchGame:
+    """题面显式包含已应用答案数，用于验证同轮状态不泄漏。"""
+
+    name = "blind_batch"
+    min_players = 2
+    max_players = 2
+
+    def __init__(self) -> None:
+        self.state: _BlindBatchState | None = None
+
+    def new_state(self, players: list[str], seed: int) -> _BlindBatchState:
+        self.state = _BlindBatchState(players, seed)
+        return self.state
+
+    def current_players(self, state: _BlindBatchState) -> list[str]:
+        # Deliberately return reverse order: Match must still archive in registration order.
+        return [name for name in reversed(state.players) if name not in state.moves]
+
+    def prompt_for(self, state: _BlindBatchState, player: str) -> str:
+        return f"{player}:seen={len(state.moves)}"
+
+    def apply_move(self, state: _BlindBatchState, player: str, move: str) -> None:
+        if move == "illegal":
+            raise IllegalMoveError("非法测试答案")
+        state.moves[player] = "" if move == FORFEIT_MOVE else move
+
+    def is_over(self, state: _BlindBatchState) -> bool:
+        return len(state.moves) == len(state.players)
+
+    def score(self, state: _BlindBatchState) -> dict[str, float]:
+        return {name: float(bool(state.moves[name])) for name in state.players}
+
+
+class _ThreePlayerBlindBatchGame(_BlindBatchGame):
+    min_players = 3
+    max_players = 3
+
+
+class _MatchForfeitBlindBatchGame(_BlindBatchGame):
+    forfeit_scope = "match"
+
+    def score(self, state: _BlindBatchState) -> dict[str, float]:
+        return {name: 0.0 if state.moves.get(name) == "" else 1.0 for name in state.players}
+
+
+class _NoCurrentPlayerGame(_BlindBatchGame):
+    def current_players(self, state: _BlindBatchState) -> list[str]:
+        return []
+
+
+class _ControlledPlayer(Player):
+    kind = "controlled"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        finished: asyncio.Event,
+        cancelled: asyncio.Event,
+        completion_order: list[str],
+        move: str,
+    ) -> None:
+        super().__init__(name)
+        self.started = started
+        self.release = release
+        self.finished = finished
+        self.cancelled = cancelled
+        self.completion_order = completion_order
+        self.move = move
+        self.prompts: list[str] = []
+
+    async def get_move(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        self.completion_order.append(self.name)
+        self.finished.set()
+        return self.move
+
+
+class _ControlledTechnicalLossPlayer(Player):
+    kind = "controlled_failure"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        super().__init__(name)
+        self.started = started
+        self.release = release
+
+    async def get_move(self, prompt: str) -> str:
+        self.started.set()
+        await self.release.wait()
+        raise PlayerProviderError("failed", technical_loss=True)
+
+
 def test_mock_match_completes_with_archive() -> None:
     players = [_llm("mock-a", "random", seed=1), _llm("mock-b", "random", seed=2)]
     archive = asyncio.run(play_match(create_game("math_quiz", rounds=5), players, seed=0))
@@ -100,6 +214,338 @@ def test_event_callback_receives_the_archived_event_stream() -> None:
     )
 
     assert rendered == archive.events
+
+
+def test_simultaneous_players_are_collected_blindly_and_applied_deterministically() -> None:
+    async def scenario() -> tuple[MatchArchive, _ControlledPlayer, _ControlledPlayer, list[str]]:
+        game = _BlindBatchGame()
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        first_release = asyncio.Event()
+        second_release = asyncio.Event()
+        first_finished = asyncio.Event()
+        second_finished = asyncio.Event()
+        completion_order: list[str] = []
+        first = _ControlledPlayer(
+            "first",
+            started=first_started,
+            release=first_release,
+            finished=first_finished,
+            cancelled=asyncio.Event(),
+            completion_order=completion_order,
+            move="first-answer",
+        )
+        second = _ControlledPlayer(
+            "second",
+            started=second_started,
+            release=second_release,
+            finished=second_finished,
+            cancelled=asyncio.Event(),
+            completion_order=completion_order,
+            move="second-answer",
+        )
+
+        match_task = asyncio.create_task(play_match(game, [first, second]))
+        await asyncio.wait_for(
+            asyncio.gather(first_started.wait(), second_started.wait()), timeout=2.0
+        )
+
+        assert game.state is not None
+        assert game.state.moves == {}
+        assert first.prompts == ["first:seen=0"]
+        assert second.prompts == ["second:seen=0"]
+
+        # The faster second Player finishes first, but no move is applied until
+        # every response in the batch has arrived.
+        second_release.set()
+        await asyncio.wait_for(second_finished.wait(), timeout=2.0)
+        assert game.state.moves == {}
+        assert not match_task.done()
+
+        first_release.set()
+        archive = await asyncio.wait_for(match_task, timeout=2.0)
+        return archive, first, second, completion_order
+
+    archive, first, second, completion_order = asyncio.run(scenario())
+
+    assert completion_order == ["second", "first"]
+    assert [move.player for move in archive.moves] == ["first", "second"]
+    assert [move.move for move in archive.moves] == ["first-answer", "second-answer"]
+    turn_events = [
+        (event.type, event.player)
+        for event in archive.events
+        if event.type in (EventType.TURN_PROMPT, EventType.MOVE_RECEIVED)
+    ]
+    assert turn_events == [
+        (EventType.TURN_PROMPT, "first"),
+        (EventType.TURN_PROMPT, "second"),
+        (EventType.MOVE_RECEIVED, "first"),
+        (EventType.MOVE_RECEIVED, "second"),
+    ]
+    assert first.prompts == ["first:seen=0"]
+    assert second.prompts == ["second:seen=0"]
+
+
+def test_cancelling_a_simultaneous_batch_cancels_every_player_task() -> None:
+    async def scenario() -> _BlindBatchGame:
+        game = _BlindBatchGame()
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        first_cancelled = asyncio.Event()
+        second_cancelled = asyncio.Event()
+        never_release = asyncio.Event()
+        completion_order: list[str] = []
+        first = _ControlledPlayer(
+            "first",
+            started=first_started,
+            release=never_release,
+            finished=asyncio.Event(),
+            cancelled=first_cancelled,
+            completion_order=completion_order,
+            move="unused",
+        )
+        second = _ControlledPlayer(
+            "second",
+            started=second_started,
+            release=never_release,
+            finished=asyncio.Event(),
+            cancelled=second_cancelled,
+            completion_order=completion_order,
+            move="unused",
+        )
+
+        match_task = asyncio.create_task(play_match(game, [first, second]))
+        await asyncio.wait_for(
+            asyncio.gather(first_started.wait(), second_started.wait()), timeout=2.0
+        )
+        match_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await match_task
+
+        assert first_cancelled.is_set()
+        assert second_cancelled.is_set()
+        assert completion_order == []
+        assert game.state is not None
+        assert game.state.moves == {}
+        return game
+
+    asyncio.run(scenario())
+
+
+def test_terminal_peer_failure_discards_completed_result_and_cancels_pending() -> None:
+    async def scenario() -> tuple[MatchArchive, _ThreePlayerBlindBatchGame, asyncio.Event]:
+        game = _ThreePlayerBlindBatchGame()
+        pending_started = asyncio.Event()
+        pending_cancelled = asyncio.Event()
+        never_release = asyncio.Event()
+        pending = _ControlledPlayer(
+            "pending",
+            started=pending_started,
+            release=never_release,
+            finished=asyncio.Event(),
+            cancelled=pending_cancelled,
+            completion_order=[],
+            move="unused",
+        )
+
+        archive = await asyncio.wait_for(
+            play_match(
+                game,
+                [
+                    _SequencePlayer("completed", ["A"]),
+                    _SpoofingFailurePlayer("failed"),
+                    pending,
+                ],
+            ),
+            timeout=2.0,
+        )
+        assert pending_started.is_set()
+        return archive, game, pending_cancelled
+
+    archive, game, pending_cancelled = asyncio.run(scenario())
+
+    assert pending_cancelled.is_set()
+    assert game.state is not None
+    assert game.state.moves == {"failed": ""}
+    assert [move.player for move in archive.moves] == ["failed"]
+    assert archive.events[-1].data["forfeited_by"] == "failed"
+    assert archive.scores == {"completed": 1.0, "failed": 0.0, "pending": 1.0}
+
+
+def test_terminal_batch_archive_is_independent_of_peer_completion_timing() -> None:
+    async def scenario(peer_finishes_first: bool) -> tuple[MatchArchive, asyncio.Event]:
+        peer_started = asyncio.Event()
+        peer_release = asyncio.Event()
+        peer_finished = asyncio.Event()
+        peer_cancelled = asyncio.Event()
+        failure_started = asyncio.Event()
+        failure_release = asyncio.Event()
+        peer = _ControlledPlayer(
+            "peer",
+            started=peer_started,
+            release=peer_release,
+            finished=peer_finished,
+            cancelled=peer_cancelled,
+            completion_order=[],
+            move="A",
+        )
+        failure = _ControlledTechnicalLossPlayer(
+            "failed",
+            started=failure_started,
+            release=failure_release,
+        )
+
+        match_task = asyncio.create_task(play_match(_BlindBatchGame(), [peer, failure]))
+        await asyncio.wait_for(
+            asyncio.gather(peer_started.wait(), failure_started.wait()), timeout=2.0
+        )
+        if peer_finishes_first:
+            peer_release.set()
+            await asyncio.wait_for(peer_finished.wait(), timeout=2.0)
+            assert not match_task.done()
+
+        failure_release.set()
+        archive = await asyncio.wait_for(match_task, timeout=2.0)
+        return archive, peer_cancelled
+
+    completed_archive, completed_peer_cancelled = asyncio.run(scenario(True))
+    pending_archive, pending_peer_cancelled = asyncio.run(scenario(False))
+
+    def event_signature(archive: MatchArchive) -> list[tuple]:
+        return [(event.seq, event.type, event.player, event.data) for event in archive.events]
+
+    assert not completed_peer_cancelled.is_set()
+    assert pending_peer_cancelled.is_set()
+    assert event_signature(completed_archive) == event_signature(pending_archive)
+    assert completed_archive.scores == pending_archive.scores
+    assert [move.player for move in completed_archive.moves] == ["failed"]
+    assert [move.player for move in pending_archive.moves] == ["failed"]
+
+
+def test_simultaneous_terminal_failures_use_registration_order_tie_break() -> None:
+    async def scenario() -> tuple[MatchArchive, asyncio.Event]:
+        pending_cancelled = asyncio.Event()
+        pending = _ControlledPlayer(
+            "pending",
+            started=asyncio.Event(),
+            release=asyncio.Event(),
+            finished=asyncio.Event(),
+            cancelled=pending_cancelled,
+            completion_order=[],
+            move="unused",
+        )
+        archive = await asyncio.wait_for(
+            play_match(
+                _ThreePlayerBlindBatchGame(),
+                [
+                    _SpoofingFailurePlayer("first-failure"),
+                    _SpoofingFailurePlayer("second-failure"),
+                    pending,
+                ],
+            ),
+            timeout=2.0,
+        )
+        return archive, pending_cancelled
+
+    archive, pending_cancelled = asyncio.run(scenario())
+
+    assert pending_cancelled.is_set()
+    assert [move.player for move in archive.moves] == ["first-failure"]
+    assert archive.events[-1].data["forfeited_by"] == "first-failure"
+
+
+def test_non_string_response_terminates_batch_and_cancels_pending_peer() -> None:
+    async def scenario() -> tuple[MatchArchive, asyncio.Event]:
+        non_string = _SequencePlayer("non-string", ["unused"])
+        non_string.moves = iter([object()])
+        pending_cancelled = asyncio.Event()
+        pending = _ControlledPlayer(
+            "pending",
+            started=asyncio.Event(),
+            release=asyncio.Event(),
+            finished=asyncio.Event(),
+            cancelled=pending_cancelled,
+            completion_order=[],
+            move="unused",
+        )
+        archive = await asyncio.wait_for(
+            play_match(_BlindBatchGame(), [non_string, pending]),
+            timeout=2.0,
+        )
+        return archive, pending_cancelled
+
+    archive, pending_cancelled = asyncio.run(scenario())
+
+    assert pending_cancelled.is_set()
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.player == "non-string"
+    assert rejected.data["reason_code"] == "response_limit"
+    assert rejected.data["failure_details"] == {"response_type": "object"}
+
+
+def test_match_scope_player_error_terminates_batch_and_cancels_pending_peer() -> None:
+    async def scenario() -> tuple[MatchArchive, asyncio.Event]:
+        pending_cancelled = asyncio.Event()
+        pending = _ControlledPlayer(
+            "pending",
+            started=asyncio.Event(),
+            release=asyncio.Event(),
+            finished=asyncio.Event(),
+            cancelled=pending_cancelled,
+            completion_order=[],
+            move="unused",
+        )
+        archive = await asyncio.wait_for(
+            play_match(
+                _MatchForfeitBlindBatchGame(),
+                [_TimeoutPlayer("timed-out"), pending],
+            ),
+            timeout=2.0,
+        )
+        return archive, pending_cancelled
+
+    archive, pending_cancelled = asyncio.run(scenario())
+
+    assert pending_cancelled.is_set()
+    rejected = next(event for event in archive.events if event.type == EventType.MOVE_REJECTED)
+    assert rejected.player == "timed-out"
+    assert rejected.data["forfeit_scope"] == "match"
+    assert archive.events[-1].data["forfeited_by"] == "timed-out"
+
+
+def test_unfinished_game_without_current_players_fails_closed() -> None:
+    with pytest.raises(ValueError, match="未结束时必须返回至少一名选手"):
+        asyncio.run(
+            play_match(
+                _NoCurrentPlayerGame(),
+                [_SequencePlayer("first", ["A"]), _SequencePlayer("second", ["A"])],
+            )
+        )
+
+
+def test_simultaneous_retry_is_a_new_batch_after_other_initial_results() -> None:
+    first = _SequencePlayer("first", ["Z", "A"])
+    second = _SequencePlayer("second", ["A"])
+
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=1), [first, second], max_attempts=2)
+    )
+
+    turn_events = [
+        (event.type, event.player)
+        for event in archive.events
+        if event.type in (EventType.TURN_PROMPT, EventType.MOVE_RECEIVED, EventType.MOVE_REJECTED)
+    ]
+    assert turn_events == [
+        (EventType.TURN_PROMPT, "first"),
+        (EventType.TURN_PROMPT, "second"),
+        (EventType.MOVE_REJECTED, "first"),
+        (EventType.MOVE_RECEIVED, "second"),
+        (EventType.TURN_PROMPT, "first"),
+        (EventType.MOVE_RECEIVED, "first"),
+    ]
+    assert [move.player for move in archive.moves] == ["first", "second", "first"]
+    assert "还可重试 1 次" in first.prompts[1]
 
 
 def test_knowledge_match_scores_sum_consistent() -> None:

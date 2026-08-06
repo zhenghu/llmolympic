@@ -4,15 +4,17 @@
 
     state = game.new_state(players, seed)
     while not game.is_over(state):
-        for name in game.current_players(state):   # 轮到谁
-            prompt = game.prompt_for(state, name)  # 出题
-            move   = await player.get_move(prompt) # 收走法（人/模型同接口）
-            game.apply_move(state, name, move)     # 校验并推进
+        names = game.current_players(state)                  # 同轮待行动者
+        prompts = {name: game.prompt_for(state, name) for name in names}
+        moves = await collect_concurrently(names, prompts)   # 收齐后才推进
+        for name in names:                                   # 稳定顺序应用
+            game.apply_move(state, name, moves[name])
     scores = game.score(state)                     # 终局判分
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 
@@ -65,6 +67,104 @@ def _technical_loss_scores(players: dict[str, Player], forfeited_by: str) -> dic
     return {name: 0.0 if name == forfeited_by else 1.0 for name in players}
 
 
+async def _collect_move_outcomes(
+    requests: list[tuple[Player, str]],
+    *,
+    terminate_on_player_error: bool,
+) -> list[tuple[int, object | None, BaseException | None]]:
+    """并发收集一个批次，且不把“返回异常对象”误当成“抛出异常”。
+
+    外层任务被取消时，必须取消并回收同批所有子任务。这能向原生异步
+    Provider 传播取消；线程支撑的旧同步调用仍受 Python 无法强制停止线程的限制。
+    """
+
+    # Preserve the original strict turn-based path: a single Player runs in the
+    # caller task, with the same cancellation and context-variable behaviour.
+    if len(requests) == 1:
+        player, prompt = requests[0]
+        try:
+            return [(0, _validate_move_response(await player.get_move(prompt)), None)]
+        except asyncio.CancelledError:
+            raise
+        except PlayerActionError as exc:
+            return [(0, None, exc)]
+
+    tasks = [asyncio.create_task(player.get_move(prompt)) for player, prompt in requests]
+
+    def task_outcome(task: asyncio.Task) -> tuple[object | None, BaseException | None]:
+        error = task.exception()
+        if error is not None:
+            return None, error
+        try:
+            return _validate_move_response(task.result()), None
+        except PlayerActionError as exc:
+            return None, exc
+
+    try:
+        pending_tasks = set(tasks)
+        while pending_tasks:
+            _, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Include every task that finished in this event-loop turn, not just
+            # the arbitrary subset returned by wait().  Registration order below
+            # remains the deterministic tie-break for simultaneous failures.
+            completed = {task for task in tasks if task.done()}
+            if any(task.cancelled() for task in completed):
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise asyncio.CancelledError
+
+            completed_outcomes = {task: task_outcome(task) for task in completed}
+            terminal_tasks = {
+                task
+                for task, (_, error) in completed_outcomes.items()
+                if error is not None
+                and (
+                    not isinstance(error, PlayerActionError)
+                    or error.technical_loss
+                    or terminate_on_player_error
+                )
+            }
+            if terminal_tasks:
+                still_pending = [task for task in tasks if task not in completed]
+                for task in still_pending:
+                    task.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
+                # Once this batch terminates the match, successful and ordinary
+                # turn-forfeit results must not mutate state.  Otherwise a peer
+                # completing just before the failure would produce a different
+                # archive from the same peer completing just after it.  Keep only
+                # terminal errors; enumeration preserves registration-order tie-breaks.
+                return [
+                    (index, *completed_outcomes[task])
+                    for index, task in enumerate(tasks)
+                    if task in terminal_tasks
+                ]
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+    return [(index, *task_outcome(task)) for index, task in enumerate(tasks)]
+
+
+def _retry_prompt(original_prompt: str, move: str, reason: str, remaining: int) -> str:
+    move_preview = _feedback_preview(repr(move))
+    reason_preview = _feedback_preview(reason)
+    return (
+        f"{original_prompt}\n\n"
+        f"上次输出 {move_preview} 未被接受：{reason_preview}\n"
+        f"还可重试 {remaining} 次。请修正后重新作答，"
+        "只输出符合题面格式的答案。"
+    )
+
+
 class Match:
     """一场对局。
 
@@ -114,16 +214,49 @@ class Match:
         override_scores = False
 
         while not self.game.is_over(state) and termination is None:
-            for name in self.game.current_players(state):
-                player = self.players[name]
-                original_prompt = self.game.prompt_for(state, name)
-                prompt = original_prompt
-                yield emit(EventType.TURN_PROMPT, player=name, prompt=original_prompt)
+            # Snapshot every prompt before any Player is called. For a simultaneous
+            # round this prevents a later prompt from observing an earlier answer.
+            reported_names = list(self.game.current_players(state))
+            if not reported_names:
+                raise ValueError("game.current_players() 在对局未结束时必须返回至少一名选手")
+            if len(set(reported_names)) != len(reported_names):
+                raise ValueError("game.current_players() 不能返回重复选手")
+            unknown_names = [name for name in reported_names if name not in self.players]
+            if unknown_names:
+                raise ValueError(f"game.current_players() 返回了未知选手: {unknown_names}")
+            active_names = set(reported_names)
+            current_names = [name for name in self.players if name in active_names]
+            original_prompts = {name: self.game.prompt_for(state, name) for name in current_names}
+            attempts = {name: 0 for name in current_names}
+            pending = current_names
+            prompts = dict(original_prompts)
 
-                attempts = 0
-                while True:
+            while pending and termination is None:
+                # Prompt and result events use registration order, independent of
+                # Provider completion order. Retrying players form the next batch.
+                for name in pending:
+                    yield emit(EventType.TURN_PROMPT, player=name, prompt=prompts[name])
+
+                outcomes = await _collect_move_outcomes(
+                    [(self.players[name], prompts[name]) for name in pending],
+                    terminate_on_player_error=self.forfeit_scope == "match",
+                )
+                outcomes_by_index = {
+                    index: (raw_move, action_error) for index, raw_move, action_error in outcomes
+                }
+                next_pending: list[str] = []
+                next_prompts: dict[str, str] = {}
+
+                for index, name in enumerate(pending):
+                    # A terminal peer failure cancels and reaps requests that were
+                    # still pending.  They never produced an action for this batch.
+                    if index not in outcomes_by_index:
+                        continue
+                    raw_move, action_error = outcomes_by_index[index]
                     try:
-                        move = _validate_move_response(await player.get_move(prompt))
+                        if action_error is not None:
+                            raise action_error
+                        move = _validate_move_response(raw_move)
                     except PlayerActionError as exc:
                         self.game.apply_move(state, name, FORFEIT_MOVE)
                         forfeit_scope = "match" if exc.technical_loss else self.forfeit_scope
@@ -152,14 +285,15 @@ class Match:
                                 "failure_details": exc.details,
                             }
                             override_scores = exc.technical_loss
-                        break
+                            break
+                        continue
+
                     try:
                         self.game.apply_move(state, name, move)
                         yield emit(EventType.MOVE_RECEIVED, player=name, move=move)
-                        break
                     except IllegalMoveError as exc:
-                        attempts += 1
-                        if attempts >= self.max_attempts:
+                        attempts[name] += 1
+                        if attempts[name] >= self.max_attempts:
                             self.game.apply_move(state, name, FORFEIT_MOVE)
                             rejection_reason = f"{exc}；已达最大重试次数，判放弃"
                             rejected = emit(
@@ -168,7 +302,7 @@ class Match:
                                 move=move,
                                 reason=rejection_reason,
                                 reason_code="illegal_move_limit",
-                                attempt=attempts,
+                                attempt=attempts[name],
                                 max_attempts=self.max_attempts,
                                 forfeit=True,
                                 forfeit_scope=self.forfeit_scope,
@@ -183,7 +317,9 @@ class Match:
                                     "forfeited_by": name,
                                     "cause_event_seq": rejected.seq,
                                 }
-                            break
+                                break
+                            continue
+
                         reason = str(exc)
                         yield emit(
                             EventType.MOVE_REJECTED,
@@ -191,24 +327,21 @@ class Match:
                             move=move,
                             reason=reason,
                             reason_code="illegal_move",
-                            attempt=attempts,
+                            attempt=attempts[name],
                             max_attempts=self.max_attempts,
                             forfeit=False,
                             technical_loss=False,
                         )
-                        move_preview = _feedback_preview(repr(move))
-                        reason_preview = _feedback_preview(reason)
-                        remaining = self.max_attempts - attempts
-                        prompt = (
-                            f"{original_prompt}\n\n"
-                            f"上次输出 {move_preview} 未被接受：{reason_preview}\n"
-                            f"还可重试 {remaining} 次。请修正后重新作答，"
-                            "只输出符合题面格式的答案。"
+                        next_pending.append(name)
+                        next_prompts[name] = _retry_prompt(
+                            original_prompts[name],
+                            move,
+                            reason,
+                            self.max_attempts - attempts[name],
                         )
-                        yield emit(EventType.TURN_PROMPT, player=name, prompt=prompt)
 
-                if termination is not None:
-                    break
+                pending = next_pending
+                prompts = next_prompts
 
         if termination is not None and override_scores:
             scores = _technical_loss_scores(self.players, str(termination["forfeited_by"]))

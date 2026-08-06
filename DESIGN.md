@@ -36,10 +36,11 @@
   schema v1；三者的新档案均记录 `source`：引擎生成为 `local_engine`，外部构造
   为 `external`。只有旧 match/series schema v1（包括历史上省略版本号的 JSON）
   读入时标为 `legacy`；tournament schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 6`，以 `entrants`、`entrant_id` 和展示名快照
-  持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v5
-  数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表。所有升级失败时都回滚且
-  不提升版本号。
+- SQLite 使用 `PRAGMA user_version = 7`，以 `entrants`、`entrant_id` 和展示名快照
+  持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v6
+  数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表，v1–v6→v7 会按既有
+  `rating_history` 写入顺序回填全局评分操作，并把历史 `matches` / `series_archives`
+  规范化为当前表结构且原样保留归档 JSON。所有升级失败时都回滚且不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
   Profile 身份隔离，不能根据旧显示名猜测为新的模型身份。
@@ -55,9 +56,11 @@
 ### 1.3 严格只读赛事审计
 
 - `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
-  `integrity_check`、当前 schema v6 必需列和已声明外键检查覆盖整个文件，业务语义深验
-  则限定在目标赛事。当前不对 PK/UNIQUE/CHECK/FK/必要索引做完整结构指纹；后续应基于
-  `table_xinfo` / `index_list` / `foreign_key_list` 建立兼容迁移库的 manifest，不能逐字匹配 DDL。
+  `integrity_check` 和当前 schema v7 结构 manifest 覆盖整个文件，业务语义深验则限定在
+  目标赛事。manifest 通过 `table_xinfo` / `table_list` / `index_list` / `index_xinfo` /
+  `foreign_key_list` 及 fail-closed SQL token 解析，完整核对列、PK、UNIQUE、CHECK、FK、
+  显式索引、排序/排序规则、partial predicate、STRICT/WITHOUT ROWID 和额外对象；不依赖
+  空白、大小写或 `sqlite_autoindex` 名称做逐字 DDL 匹配。
 - 审计连接使用 `mode=ro&immutable=1` 与 `query_only`，不构造 `SQLiteStore`、不迁移、
   不 chmod、不创建 sidecar、不修复数据，也不创建 Provider 或访问网络。发现活动 rollback
   journal/WAL，或审计前后主文件 device/inode/size/mtime 变化时保守失败。
@@ -67,13 +70,10 @@
   身份，避免不可封存的身份冲突拖到整场完成后才暴露。正式赛事继续深验参赛者、配对、
   series/match 关系和 canonical JSON。
 - 已计分赛事还会核对正式档案身份与全局 `entrants.identity_json` 的绑定，并重算赛事内的
-  冻结 ELO、逐局 contribution/history 和聚合 snapshot，
-  以及全局榜单的局数/胜平负汇总。若同一选手和作用域存在目标赛事外的其他计分操作，
-  schema v6 缺少全局评分操作序号，不能由事件时间证明相对提交顺序或唯一重放当前 rating；
-  报告必须把 leaderboard 覆盖标为 `partial`，不能宣称完整 PASS。`partial` 仍须验证目标
-  赛前分来自默认值或既有 history 的 `rating_after`、当前分等于某条已知 `rating_after`
-  候选，并按单局、系列赛和循环赛三类评分操作核对排行榜更新时间。未来若要求任意历史状态
-  都可唯一重放，应提升 schema 并引入单调 rating operation sequence。
+  冻结 ELO、逐局 contribution/history 和聚合 snapshot。schema v7 为每次已计分的顶层
+  match、series 或 tournament 分配唯一、单调递增的 `rating_operation_seq`；审计按该
+  提交顺序重放整个数据库的 ELO、局数、胜平负和更新时间，再与当前排行榜逐项比对。目标
+  赛事前后即使还有其他评分操作，也不再需要退化为 `partial` 或依赖事件时间推断提交顺序。
 - 运行期的 `round-robin --resume` 在把正式赛事视为完成前也使用正式档案深验，避免顶层
   JSON 尚可解析但关系索引或 ELO 已损坏时错误跳过恢复。
 - checkpoint 使用 SQLite v6 跨进程 runner lease。claim 在 `BEGIN IMMEDIATE` 短事务内
@@ -173,8 +173,12 @@ CLI（今天）          WebSocket（将来）
 - 问答项目的所有选手拿到逐字相同的 prompt；棋类按各自角色显示同一局面；
   LLM 统一单步超时与 max_tokens；人类输入使用独立限时；
   采样参数、每步走法、完整事件流记入对局档案（pydantic，可 JSON 序列化），结果可复核。
-- 当前 CLI 逐个收答并立即渲染走法：LLM 不会从 prompt 看到对手答案，但同一
-  终端里排在后面的人类可能看到前一人的输出，因此尚不属于多人类盲答界面。
+- 同时作答项目先快照同轮全部 prompt，并发收齐结果后才按报名顺序推进状态和输出事件；
+  Provider 完成先后不会改变档案，也不会把同轮答案写进其他选手的题面。收答阶段的终局
+  选手调用错误会丢弃其他同批结果并取消、回收挂起任务；`apply_move` 仍按报名顺序提交，
+  因而第三方同时作答 Game 若把非法走法定义为整场判负，必须自行接受该确定性提交语义，
+  或提供不会在校验失败前修改状态的实现。单个共享终端仍无法为多名人类提供彼此隔离的
+  私密输入，多人类实战需使用 Web/独立客户端。
 - 推理/猜谜档案保存 seed、完整题面、走法和生成器/题库版本，不复制插件内部
   标准答案；审计时需使用对应版本代码按 seed 重放，档案本身尚不能脱离代码独立判分。
 - 每场结束后，完整 JSON 档案、选手索引、总榜/项目榜 ELO 与评分历史在同一
@@ -229,7 +233,7 @@ CLI（今天）          WebSocket（将来）
    稳定 entrant 身份、命名 Provider Profiles 与 SQLite v3 迁移 ✅；
    公平循环赛与 SQLite v4 迁移 ✅；逐对阵 checkpoint/resume 与 SQLite v5 迁移 ✅；
    循环赛严格只读深度审计与恢复完成态校验 ✅；跨进程 runner lease、fencing 与
-   SQLite v6 迁移 ✅。
+   SQLite v6 迁移 ✅；全局评分操作账本、确定性 ELO 重放与 SQLite v7 迁移 ✅。
 3. **创意 + LLM 评审团**：主观判分链路（匿名、多评委）。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import os
+import sys
+import threading
 import time
 
 import pytest
@@ -380,3 +384,256 @@ def test_llm_move_timeout_must_be_positive_and_finite(timeout: float) -> None:
 def test_human_timeout_must_be_positive_and_finite(timeout: float) -> None:
     with pytest.raises(ValueError, match="有限秒数"):
         HumanPlayer("human", timeout=timeout)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_human_timeout_removes_stdin_reader_before_the_next_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        removed_fds: list[int] = []
+        remove_reader = loop.remove_reader
+
+        def track_remove_reader(fd: int) -> bool:
+            removed_fds.append(fd)
+            return remove_reader(fd)
+
+        monkeypatch.setattr(loop, "remove_reader", track_remove_reader)
+        with pytest.raises(PlayerTimeoutError):
+            await HumanPlayer("first", timeout=0.02).get_move("prompt")
+        assert removed_fds == [read_fd]
+
+        os.write(write_fd, b"next-after-timeout\n")
+        await asyncio.sleep(0.02)
+        assert await HumanPlayer("second", timeout=0.5).get_move("prompt") == "next-after-timeout"
+        assert removed_fds == [read_fd, read_fd]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_human_cancellation_removes_stdin_reader_before_the_next_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        removed_fds: list[int] = []
+        remove_reader = loop.remove_reader
+
+        def track_remove_reader(fd: int) -> bool:
+            removed_fds.append(fd)
+            return remove_reader(fd)
+
+        monkeypatch.setattr(loop, "remove_reader", track_remove_reader)
+        pending = asyncio.create_task(HumanPlayer("first", timeout=None).get_move("prompt"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert removed_fds == [read_fd]
+
+        os.write(write_fd, b"next-after-cancel\n")
+        await asyncio.sleep(0.02)
+        assert await HumanPlayer("second", timeout=0.5).get_move("prompt") == "next-after-cancel"
+        assert removed_fds == [read_fd, read_fd]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_partial_pipe_input_does_not_block_cancellation_and_is_not_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+    finish_line = threading.Timer(0.2, os.write, args=(write_fd, b"-rest\n"))
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(HumanPlayer("first", timeout=None).get_move("prompt"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        os.write(write_fd, b"partial")
+        finish_line.start()
+        await asyncio.sleep(0.02)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        assert await HumanPlayer("second", timeout=0.5).get_move("prompt") == "partial-rest"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        finish_line.cancel()
+        finish_line.join()
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_split_multibyte_pipe_input_waits_for_complete_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+    encoded = "答案\n".encode()
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(HumanPlayer("human", timeout=0.5).get_move("prompt"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        os.write(write_fd, encoded[:2])
+        await asyncio.sleep(0.02)
+        assert not pending.done()
+        os.write(write_fd, encoded[2:])
+        assert await pending == "答案"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX pseudo-terminal")
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    ((b"\x04", None), (b"partial-tty\x04", "partial-tty")),
+    ids=("empty-eof", "partial-line-eof"),
+)
+def test_tty_ctrl_d_completes_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    expected: str | None,
+) -> None:
+    import pty
+
+    master_fd, slave_fd = pty.openpty()
+    slave_stream = os.fdopen(slave_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", slave_stream)
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(HumanPlayer("human", timeout=0.5).get_move("prompt"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        os.write(master_fd, payload)
+        if expected is None:
+            with pytest.raises(EOFError):
+                await pending
+        else:
+            assert await pending == expected
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(master_fd)
+        slave_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_invalid_stdin_encoding_is_not_silently_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8", errors="strict")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(HumanPlayer("human", timeout=0.5).get_move("prompt"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        os.write(write_fd, b"\xff")
+        with pytest.raises(UnicodeDecodeError):
+            await pending
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_extra_pipe_lines_are_buffered_for_later_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+
+    async def scenario() -> None:
+        os.write(write_fd, b"first-line\nsecond-line\n")
+
+        assert await HumanPlayer("first", timeout=0.5).get_move("prompt") == "first-line"
+        assert await HumanPlayer("second", timeout=0.5).get_move("prompt") == "second-line"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a selectable POSIX stdin fd")
+def test_human_reads_a_line_already_prefetched_by_text_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    read_stream = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", read_stream)
+
+    try:
+        os.write(write_fd, b"consumed-first\nprefetched-second\n")
+        assert read_stream.readline() == "consumed-first\n"
+
+        # BufferedReader normally fetched both lines in its first raw read, so
+        # the descriptor itself is no longer readable.  HumanPlayer must still
+        # drain TextIOWrapper's read-ahead instead of waiting for new fd bytes.
+        assert (
+            asyncio.run(HumanPlayer("human", timeout=0.1).get_move("prompt")) == "prefetched-second"
+        )
+    finally:
+        os.close(write_fd)
+        read_stream.close()
+
+
+def test_human_custom_input_function_remains_supported() -> None:
+    prompts: list[str] = []
+
+    def custom_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return "custom-answer"
+
+    player = HumanPlayer("human", timeout=0.5, input_fn=custom_input)
+
+    assert asyncio.run(player.get_move("ignored game prompt")) == "custom-answer"
+    assert prompts == ["human，请输入你的答案 > "]
+
+
+def test_human_default_input_falls_back_when_stdin_has_no_file_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("fallback-answer\n"))
+
+    assert asyncio.run(HumanPlayer("human", timeout=0.5).get_move("prompt")) == "fallback-answer"

@@ -118,11 +118,12 @@ chmod 600 config.toml
 ### 升级已有数据库
 
 首次用当前源码版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
-v6 并保留既有档案和 ELO。升级前请停止所有正在写入该数据库的赛事进程，并使用
-SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和 `-shm`
-文件。升级后的
-数据库不应再交给只支持旧 schema 的版本打开。可先运行 `llmolympic doctor --db 路径`
-进行只读检查；`doctor` 不执行迁移。
+v7 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
+评分操作序号，并把历史迁移产生的 `matches` / `series_archives` 表规范化成与新建 v7
+数据库相同的结构，同时原样保留归档 JSON。升级前请停止所有正在写入该数据库的赛事进程，
+并使用 SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和
+`-shm` 文件。升级后的数据库不应再交给只支持旧 schema 的版本打开。可先运行
+`llmolympic doctor --db 路径` 进行只读检查；`doctor` 不执行迁移。
 
 Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
 目前支持 `openai` 和 `ollama`。OpenAI 兼容 Profile 必须声明
@@ -240,9 +241,20 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 `source=generated_from_structured_bank`，生成器和题库版本写入对局配置供审计。
 答案可以是选项字母或完整选项；猜谜还接受题库登记的同义名称。
 
-终端界面会按选手顺序收答并立即显示已接受的答案；模型收到的 prompt 不包含
-对手答案，但同一终端里排在后面的人类可能看到前一人的输出。启动器的人机模式
-固定把人类放在第一位；多人类盲答需等待后续 Web/独立客户端的批量收答能力。
+同时作答的项目会先快照同轮所有题面，并发收齐答案后，再按选手报名
+顺序校验、推进状态和输出事件。Provider 响应快慢不会改变归档顺序，后完成的
+选手也不会看到同轮对手的答案或由其导致的状态变化。非法答案会进入下一个
+并发重试批次；若收答阶段出现结束整场的选手调用错误，引擎会丢弃其他同批结果，并立即
+取消、回收尚未完成的选手任务。取消整场对局时，同批未完成的任务也会一并取消和回收。
+原生异步 Provider 会收到取消；POSIX 上使用内置 `input` 的终端 `HumanPlayer`
+通过事件循环的可移除 stdin reader 收答，超时或取消后不会留下抢占下一次输入的
+后台线程。自定义 `input_fn`、不可选择的 stdin 以及不支持 reader 的事件循环会安全
+回退到工作线程，仍受线程无法强制终止的限制；不启用硬超时的旧同步 Provider 也有
+同样限制。
+
+这保证了引擎与远程/独立客户端的盲答语义。单个共享终端仍不能为多名人类
+提供彼此隔离的私密输入界面；本地 reader 只会串行化共享 stdin 的提示，不会隐藏
+已经输入的内容。多人类实战应使用后续 Web/独立客户端。
 
 `series` 固定进行两局：第一局按命令中的选手顺序，第二局完整交换顺序；两局
 使用相同 seed。五子棋中这表示双方各执黑一次，国际象棋中表示双方各执白一次。
@@ -252,9 +264,10 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 问答项目也可使用 `series`：两局题目条件相同，但模型各自重新采样，用于观察
 输出波动；它不代表问答项目存在先后手优势。
 
-当前终端版 `series` 只接受 LLM/mock。`HumanPlayer` 的终端输入超时后，底层
-输入线程无法可靠取消，贸然开始第二局可能抢占输入；待可取消输入链路完成后
-再开放人类双局赛。单局 `play` 的人类对战不受影响。
+当前终端版 `series` 仍只接受 LLM/mock，以便在所有支持的平台和自定义输入环境中
+保持一致的可取消保证。库调用在 POSIX 内置 stdin 或其他可取消输入后端上可以安全
+复用 `HumanPlayer` 跑双局赛；若走工作线程 fallback，超时后仍不得贸然开始第二局。
+单局 `play` 的人类对战不受影响。
 
 `round-robin` 接受 3–16 名 LLM/mock/Profile 选手，不接受人类选手。每个无序
 选手对运行一次双局赛，因此 N 名选手会产生 `N*(N-1)/2` 个系列、`N*(N-1)`
@@ -300,13 +313,13 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 
 `audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
 权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
-schema v6 必需列和已声明外键检查，再深度核对指定赛事的 checkpoint 连续前缀、正式赛事、
-参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分赛事的稳定
-身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
-已封存赛事会验证正式档案。命令只报告、不修复数据。当前版本不对
-PK/UNIQUE/CHECK/FK/索引定义做完整结构指纹；runner lease 表的主键、token 唯一约束和
-checkpoint 外键会额外核验。其他结构级篡改需要后续基于 SQLite introspection manifest
-补充，不能把本命令当作 DDL 取证工具。
+schema v7 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
+正式赛事、参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分
+赛事的稳定身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
+已封存赛事会验证正式档案。manifest 会核对表与列、PK、UNIQUE、CHECK、FK、显式索引及
+列顺序、DESC、collation、partial predicate、STRICT / WITHOUT ROWID，并拒绝额外的表、
+视图或触发器。CHECK 与 partial predicate 使用 fail-closed 的规范化 SQL token 解析，
+不会因无关空白、大小写或 SQLite 自动索引名不同而误报。命令只报告、不修复数据。
 
 活动 runner 持有未过期租约时，进行中 checkpoint 仍会展示已保存进度，但
 `resumable=false`；租约释放或过期后才会报告为可恢复。审计不会顺手释放或过期租约。
@@ -316,13 +329,11 @@ checkpoint 外键会额外核验。其他结构级篡改需要后续基于 SQLit
 迁移，不会原地升级或 chmod。退出码 `0` 表示指定赛事通过，`1` 表示数据库/赛事不一致，
 Typer 参数错误使用退出码 `2`；`--json` 输出不包含选手、模型、题面、端点或原始异常。
 
-赛事自身的 ELO 快照、贡献和 history 始终逐项验证。若同一选手和榜单作用域还存在该赛事
-之外的其他计分操作，schema v6 没有全局 rating operation sequence，无法仅凭事件时间证明
-这些操作与目标赛事的相对提交顺序；此时 `checks.leaderboard` 会是 `partial`，而不是把
-覆盖范围夸大为完整 PASS。即使标记为 `partial`，审计仍会验证排行榜胜平负汇总、目标赛事
-赛前分的历史来源、当前分等于某条已知 history 的 `rating_after` 候选，以及更新时间对应
-真实评分操作；它只是不宣称能唯一重放全局提交顺序。`round-robin --resume` 也会在宣告
-正式赛事“已完成”前执行同一套关系与 ELO 深验。
+赛事自身的 ELO 快照、贡献和 history 始终逐项验证。schema v7 的 `rating_operations`
+为每次已计分的顶层 match、series 或 tournament 分配唯一、单调递增的全局序号；审计会按
+该提交顺序重算每个作用域的 ELO、局数和胜平负，并与当前排行榜逐项比对。因此，即使目标
+赛事前后还有其他评分操作，`checks.leaderboard` 也能给出完整 PASS，而不依赖可能倒序的
+事件时间。`round-robin --resume` 也会在宣告正式赛事“已完成”前执行同一套关系与 ELO 深验。
 
 问答赛估算为
 `2*N*(N-1)*rounds` 个选手回合；16 人 × 100 轮为 48,000 回合，默认最多
