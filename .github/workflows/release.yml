@@ -4,9 +4,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (must match v + package version)"
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -31,25 +37,65 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Verify tag and main commit
+      - name: Resolve release tag
+        id: release
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_tag="${REQUESTED_TAG}"
+          else
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Tag must use the exact vMAJOR.MINOR.PATCH format." >&2
             exit 1
           fi
+          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
 
+      - name: Verify version and main commit
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          tag_commit="$(git rev-parse "${GITHUB_REF_NAME}^{commit}")"
+          checkout_commit="$(git rev-parse HEAD^{commit})"
           main_commit="$(git rev-parse origin/main^{commit})"
-          if [[ "${tag_commit}" != "${main_commit}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} must point to the current origin/main commit." >&2
+          if [[ "${checkout_commit}" != "${main_commit}" ]]; then
+            echo "Release checkout must be the current origin/main commit." >&2
             exit 1
           fi
 
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+              echo "Tag ${RELEASE_TAG} must be an annotated tag." >&2
+              exit 1
+            fi
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "${tag_commit}" != "${main_commit}" ]]; then
+              echo "Tag ${RELEASE_TAG} must point to the current origin/main commit." >&2
+              exit 1
+            fi
+          elif git ls-remote --exit-code --tags origin \
+            "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --force origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+              echo "Existing tag ${RELEASE_TAG} is not annotated." >&2
+              exit 1
+            fi
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "${tag_commit}" != "${main_commit}" ]]; then
+              echo "Existing tag ${RELEASE_TAG} does not point to origin/main." >&2
+              exit 1
+            fi
+          fi
+
           package_version="$(python -c 'from llmolympic import __version__; print(__version__)')"
-          if [[ "${GITHUB_REF_NAME}" != "v${package_version}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match package version ${package_version}." >&2
+          if [[ "${RELEASE_TAG}" != "v${package_version}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match package version ${package_version}." >&2
             exit 1
           fi
 
@@ -119,20 +165,134 @@ jobs:
         working-directory: dist
         run: sha256sum *.whl *.tar.gz > SHA256SUMS
 
-      - name: Create draft GitHub Release
+      - name: Final revalidation
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          checkout_commit="$(git rev-parse HEAD^{commit})"
+          main_commit="$(git rev-parse origin/main^{commit})"
+          if [[ "${checkout_commit}" != "${main_commit}" ]]; then
+            echo "origin/main moved while preparing ${RELEASE_TAG}; refusing to tag." >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git fetch --force origin \
+              "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+              echo "Tag ${RELEASE_TAG} must be an annotated tag." >&2
+              exit 1
+            fi
+            tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [[ "${tag_commit}" != "${main_commit}" ]]; then
+              echo "Tag ${RELEASE_TAG} must point to the current origin/main commit." >&2
+              exit 1
+            fi
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            echo "Tag ${RELEASE_TAG} disappeared during release preparation." >&2
+            exit 1
+          fi
+
+      - name: Create or verify annotated tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/*.whl \
-            dist/*.tar.gz \
-            dist/SHA256SUMS \
-            --verify-tag \
-            --title "LLM Olympics ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            --draft
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          checkout_commit="$(git rev-parse HEAD^{commit})"
+          main_commit="$(git rev-parse origin/main^{commit})"
+          if [[ "${checkout_commit}" != "${main_commit}" ]]; then
+            echo "origin/main moved while preparing ${RELEASE_TAG}; refusing to tag." >&2
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags origin \
+            "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            tag_sha="$(gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/tags" \
+              -f tag="${RELEASE_TAG}" \
+              -f message="LLM Olympics ${RELEASE_TAG}" \
+              -f object="${main_commit}" \
+              -f type="commit" \
+              -f 'tagger[name]=github-actions[bot]' \
+              -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+              -f "tagger[date]=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --jq '.sha')"
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="${tag_sha}" >/dev/null
+          fi
+
+          git fetch --force origin \
+            "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          if [[ "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" != "tag" ]]; then
+            echo "Tag ${RELEASE_TAG} must be an annotated tag." >&2
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          if [[ "${tag_commit}" != "${main_commit}" ]]; then
+            echo "Tag ${RELEASE_TAG} must point to the current origin/main commit." >&2
+            exit 1
+          fi
+
+      - name: Create or refresh draft GitHub Release
+        id: release_state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if release_json="$(gh release view "${RELEASE_TAG}" \
+            --json isDraft,isPrerelease,assets 2>/dev/null)"; then
+            if [[ "$(jq -r '.isPrerelease' <<<"${release_json}")" == "true" ]]; then
+              echo "Existing release ${RELEASE_TAG} is unexpectedly a prerelease." >&2
+              exit 1
+            fi
+            if [[ "$(jq -r '.isDraft' <<<"${release_json}")" == "true" ]]; then
+              gh release edit "${RELEASE_TAG}" \
+                --title "LLM Olympics ${RELEASE_TAG}" \
+                --prerelease=false
+              gh release upload "${RELEASE_TAG}" \
+                dist/*.whl dist/*.tar.gz dist/SHA256SUMS --clobber
+              echo "already_published=false" >> "${GITHUB_OUTPUT}"
+            else
+              verify_dir="${RUNNER_TEMP}/existing-release"
+              mkdir -p "${verify_dir}"
+              gh release download "${RELEASE_TAG}" \
+                --dir "${verify_dir}" \
+                --pattern "llmolympic-${RELEASE_TAG#v}-py3-none-any.whl" \
+                --pattern "llmolympic-${RELEASE_TAG#v}.tar.gz" \
+                --pattern "SHA256SUMS"
+              for asset in \
+                "llmolympic-${RELEASE_TAG#v}-py3-none-any.whl" \
+                "llmolympic-${RELEASE_TAG#v}.tar.gz" \
+                "SHA256SUMS"; do
+                if ! cmp -s "dist/${asset}" "${verify_dir}/${asset}"; then
+                  echo "Published release ${RELEASE_TAG} has mismatched ${asset}." >&2
+                  exit 1
+                fi
+              done
+              echo "already_published=true" >> "${GITHUB_OUTPUT}"
+            fi
+          else
+            gh release create "${RELEASE_TAG}" \
+              dist/*.whl \
+              dist/*.tar.gz \
+              dist/SHA256SUMS \
+              --verify-tag \
+              --title "LLM Olympics ${RELEASE_TAG}" \
+              --generate-notes \
+              --draft
+            echo "already_published=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Publish GitHub Release
+        if: steps.release_state.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false
