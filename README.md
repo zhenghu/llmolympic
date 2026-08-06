@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.2.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.3.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.2.0/llmolympic-0.2.0-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.3.0/llmolympic-0.3.0-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.2.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.3.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command` 随源码仓库和 GitHub 自动生成的
 源码归档提供，不包含在 wheel 中。
 
@@ -124,6 +124,8 @@ v7 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite �
 并使用 SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和
 `-shm` 文件。升级后的数据库不应再交给只支持旧 schema 的版本打开。可先运行
 `llmolympic doctor --db 路径` 进行只读检查；`doctor` 不执行迁移。
+若旧库包含非标准或被篡改的表、额外 view/trigger，或者 ELO 历史缺失、交错、孤立或无法
+确定性重放，升级会安全拒绝；迁移事务会整体回滚，原 schema 与数据保持不变。
 
 Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
 目前支持 `openai` 和 `ollama`。OpenAI 兼容 Profile 必须声明
@@ -404,8 +406,8 @@ ruff check .
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.2.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.2.0.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.3.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.3.0.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。
