@@ -171,6 +171,73 @@ class MatchArchive(BaseModel):
             if event_players != normalized:
                 prefix = "legacy " if legacy else ""
                 raise ValueError(f"{prefix}match_started 的选手描述与档案不一致")
+        finished_events = [event for event in self.events if event.type == EventType.MATCH_FINISHED]
+        for event in finished_events:
+            if "judging" not in event.data:
+                continue
+            # Local import avoids archive -> judge -> player -> archive at module load.
+            from llmolympic.core.judge import PanelVerdict
+
+            try:
+                judging = PanelVerdict.model_validate(event.data["judging"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("match_finished 包含无效的评审团裁决") from exc
+            event_scores = event.data.get("scores")
+            if event_scores != judging.scores or self.scores != judging.scores:
+                raise ValueError("评审团聚合得分与对局最终比分不一致")
+            if self.source == "local_engine" and self.game == "creative_writing":
+                accepted_players = {
+                    item.player
+                    for item in self.events
+                    if item.type == EventType.MOVE_RECEIVED and item.player is not None
+                }
+                forfeited_players = {
+                    item.player
+                    for item in self.events
+                    if item.type == EventType.MOVE_REJECTED
+                    and item.player is not None
+                    and item.data.get("forfeit") is True
+                }
+                expected_players = {descriptor["name"] for descriptor in normalized}
+                if accepted_players | forfeited_players != expected_players:
+                    raise ValueError("创意对局的提交与放弃记录未覆盖全部参赛者")
+                if accepted_players & forfeited_players:
+                    raise ValueError("创意对局的同一参赛者不能既提交又放弃")
+                if set(judging.fixed_scores) != forfeited_players:
+                    raise ValueError("创意裁决的固定分与放弃记录不一致")
+                if any(score != 0.0 for score in judging.fixed_scores.values()):
+                    raise ValueError("创意对局的放弃者固定分必须为 0")
+                if set(judging.scores) - set(judging.fixed_scores) != accepted_players:
+                    raise ValueError("创意裁决的送审作品与已接受提交不一致")
+                contestant_ids = {descriptor["entrant_id"] for descriptor in normalized}
+                judge_ids = {
+                    verdict.judge.judge_id for verdict in judging.verdicts
+                } | {failure.judge.judge_id for failure in judging.failures}
+                if contestant_ids & judge_ids:
+                    raise ValueError("创意档案中的参赛者不能同时担任评委")
+                started_events = [
+                    item for item in self.events if item.type == EventType.MATCH_STARTED
+                ]
+                if len(started_events) != 1:
+                    raise ValueError("创意档案必须包含且只包含一个 match_started")
+                game_config = started_events[0].data.get("game_config")
+                if not isinstance(game_config, dict):
+                    raise ValueError("创意档案缺少版本化 game_config")
+                if (
+                    game_config.get("rubric_version") != judging.rubric_version
+                    or game_config.get("criteria") != judging.criteria
+                ):
+                    raise ValueError("创意裁决与开赛时冻结的 rubric 不一致")
+        if (
+            self.source == "local_engine"
+            and self.game == "creative_writing"
+            and any(
+                event.data.get("termination") == "completed"
+                and "judging" not in event.data
+                for event in finished_events
+            )
+        ):
+            raise ValueError("正常完成的创意对局必须包含评审团裁决")
         return self
 
     def to_json(self) -> str:

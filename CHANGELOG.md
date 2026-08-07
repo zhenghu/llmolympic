@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+- 启动第三阶段：新增双人 `creative_writing` 开放作答项目，以及 3–9 名 LLM 组成的匿名
+  评审团。每名评委分别盲评每份作品，完整评委交集达到严格多数 quorum 后，以版本化 rubric
+  的加权总分中位数生成 0–1 最终比分。
+- `play` 新增可重复的 `--judge`；禁止重复评委、自评和人类评委。个别评委失败可在 quorum
+  内降级，未达 quorum 则不存档、不更新 ELO。创意项目首切明确不开放 `series` 和
+  `round-robin`。
+- 评审协议严格拒绝缺失/额外字段、布尔值、NaN、Infinity、越界分数和超长理由；作品按
+  不可信数据隔离，评委题面不包含参赛者或模型身份。档案只保存安全白名单评委描述、匿名
+  映射、逐维裁决与可重算聚合，不保存原始响应、凭据或端点。
+- 创意裁决继续使用 SQLite schema v7，在 `match_finished.data.judging` 中持久化，并复用
+  现有双人总榜和分项目 ELO。`play.command` 新增完全离线的创意写作 + 三算法评委入口。
+- 新增手动触发的 `Live Provider Smoke` GitHub Actions 工作流：使用受 Environment 保护的
+  OpenRouter Secret，以两名 mock 参赛者和三个可配置云端评委执行固定 6 次逻辑请求的真实
+  评审冒烟，并要求三个 Provider 路由全部成功；它不阻塞 PR。CI 与 Release 的 wheel/sdist
+  隔离安装也新增零费用三 mock 评委冒烟。
+
 ## [0.3.0] - 2026-08-06
 
 - SQLite schema 升至 v7；每次已计分的顶层 match、series 或 tournament 都在同一事务中

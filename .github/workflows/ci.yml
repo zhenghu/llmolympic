@@ -110,6 +110,14 @@ jobs:
             --rounds 1 \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-smoke.db"
+          "${smoke_venv}/bin/llmolympic" play \
+            --game creative_writing \
+            --players mock:random,mock:fixed \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-wheel-creative-smoke.db"
 
       - name: Smoke-test source distribution outside the checkout
         run: |
@@ -129,3 +137,11 @@ jobs:
             --rounds 1 \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-smoke.db"
+          "${smoke_venv}/bin/llmolympic" play \
+            --game creative_writing \
+            --players mock:random,mock:fixed \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-creative-smoke.db"

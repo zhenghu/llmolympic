@@ -160,7 +160,8 @@ llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
 ## 运行
 
 macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、国际象棋、
-数学、知识、逻辑推理和猜谜竞答；全部六个项目都提供三个 mock 的离线循环赛入口，
+数学、知识、逻辑推理、猜谜竞答和创意写作；六个客观判分项目都提供三个 mock 的
+离线循环赛入口，创意写作提供“两名 mock 参赛者 + 三名匿名算法评委”的离线演示，
 并保留已有的人类对战、两个 mock 自动演示和棋类换先手双局赛。
 
 ```bash
@@ -175,6 +176,16 @@ llmolympic play --game math_quiz --players openai:gpt-4o-mini,ollama:llama3.1 --
 
 # 两个命名兼容端点对战（推荐）
 llmolympic play --game math_quiz --players profile:kimi,profile:deepseek --seed 42
+
+# 创意写作离线演示：Mock 是确定性算法，不是 LLM
+llmolympic play --game creative_writing \
+  --players mock:random,mock:fixed \
+  --judge mock:strict --judge mock:balanced --judge mock:lenient --seed 42
+
+# 创意写作云端实战：参赛模型与三名评委使用不同的稳定身份
+llmolympic play --game creative_writing \
+  --players profile:writer-a,profile:writer-b \
+  --judge profile:judge-a --judge profile:judge-b --judge profile:judge-c --seed 42
 
 # 动态逻辑推理：排序约束与三位密码题都会先由程序穷举确认唯一解
 llmolympic play --game reasoning_quiz --players mock:random,mock:fixed --rounds 5 --seed 42
@@ -383,6 +394,27 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 推理与猜谜档案记录 seed、题面、走法以及生成器/题库版本，但不额外复制内部
 标准答案；独立复核需要用对应版本代码按 seed 重放生成器。
 
+### 创意写作与匿名评审团
+
+`creative_writing` 是第三阶段的首个主观判分项目：两名参赛者在同一轮盲写一篇
+20–2000 字的微型故事。它需要用可重复的 `--judge` 提供 3–9 名唯一 LLM 评委；
+人类不能担任评委，同一稳定身份也不能同时参赛和评审。命名 Provider Profile、
+普通 OpenAI/Ollama 以及离线 mock 都复用现有模型接入，其中 OpenAI 和 Provider
+Profiles 都是云端 LLM，Ollama 是本地 LLM，mock 只是离线算法。
+
+每名评委会分别收到每份作品，题面只使用 A/B 匿名标签，不包含参赛者姓名、
+`entrant_id`、Provider、Profile 或模型信息。作品正文按不可信数据隔离，不能向评委
+发出系统指令；但平台无法阻止作者在正文中主动透露身份或通过文风被识别。只有完整
+评完全部有效作品的评委才进入裁决，达到严格多数 quorum 后，系统按版本化 rubric
+计算各评委的加权总分，再取中位数并归一化到 0–1。个别评委失败会被安全记录；未达到
+quorum 时命令失败，不写入对局，也不更新 ELO。
+
+成功裁决的安全评委描述、匿名映射、逐维分数、理由、失败摘要、quorum 与聚合版本都
+保存在 `match_finished.data.judging`，SQLite 仍使用 schema v7；最终双人比分继续进入
+总榜和 `creative_writing` 项目榜。评委原始响应、API Key、端点和请求头不会进入档案。
+当前首个切片只支持 `play`，尚未把评委配置、费用估算和恢复语义接入 `series` 或
+`round-robin`，因此这两种模式会在建库和模型调用前明确拒绝创意项目。
+
 技术负也会生成完整档案并正常更新双人 ELO。事件中的 `reason_code`、
 `forfeit_scope`、`termination`、`forfeited_by` 等字段可供程序稳定统计；CLI
 显示中文原因，但不会把 Provider 的原始异常文本或凭据写入档案。
@@ -401,6 +433,37 @@ ELO 目前适用于双人对局：比较双方最终比分后按胜 / 平 / 负�
 pytest
 ruff check .
 ```
+
+### 真实 Provider 自动化冒烟
+
+真实评委测试默认不随本地测试或 PR CI 运行，避免网络波动、第三方模型变化和调用费用阻塞
+日常合并。需要实测时，可用 mock 参赛者和三个 OpenRouter 云端评委手动运行：
+
+```bash
+OPENAI_API_KEY="$OPENROUTER_API_KEY" \
+OPENAI_BASE_URL="https://openrouter.ai/api/v1" \
+LLMOLYMPIC_RUN_LIVE=1 \
+LLMOLYMPIC_LIVE_JUDGES="openai:openai/gpt-4o-mini-2024-07-18,openai:google/gemini-2.5-flash-lite,openai:anthropic/claude-haiku-4.5" \
+python -m pytest -m live_provider -q -s
+```
+
+这些变量只对该命令生效，避免同一终端后续执行普通 `pytest` 时意外再次产生云端调用。
+
+仓库的 `Live Provider Smoke` GitHub Actions 工作流提供同一项手动实测。在仓库设置中创建
+名为 `live-provider-smoke` 的 GitHub Environment，并只在该 Environment 中添加
+`OPENROUTER_API_KEY` Secret；然后从 Actions 页面选择工作流并点击 **Run workflow**。
+三个评委模型可在触发界面覆盖，输入只作为环境变量传给测试，不会拼入 shell 命令。
+`-s` 会在日志中显示脱敏的 `LIVE_PROVIDER_SMOKE` JSON 摘要；工作流不会上传数据库或档案。
+必须把该 Environment 的 deployment branches 限制为 `main`，工作流也只允许 `main` 运行；
+代码内的分支判断只是纵深防御，不能替代 Environment 规则。仓库有多位写入者时，还应设置
+required reviewers。每次触发都要确认 **Use workflow from** 选择的是 `main`。
+
+每次冒烟固定由两名 mock 参赛者各提交一份作品，再由三个云端模型分别评审两份作品，
+因此会安排 6 次逻辑评审请求；成功路径包含 6 次可能计费的模型调用。建议为专用测试 Key
+设置限额；实际费用取决于触发时所选模型及 Provider 定价。工作流要求三名评委全部成功，
+任一模型失败都会让冒烟失败。工作流只允许读取仓库内容，并且会在缺少 Secret 时直接失败而
+不输出 Key。
+CI 与 Release 仍会分别从 wheel 和 sdist 运行零费用的三 mock 评委创意写作冒烟。
 
 ## Release 资产
 

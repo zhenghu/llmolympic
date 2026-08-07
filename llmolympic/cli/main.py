@@ -39,6 +39,7 @@ from llmolympic.core.game import (
     validate_player_count,
     validate_players,
 )
+from llmolympic.core.judge import JudgePanelError, LLMJudgePanel
 from llmolympic.core.match import play_match
 from llmolympic.core.player import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
@@ -277,10 +278,10 @@ def _guard_renderer(render: Callable[..., None]) -> Callable[..., None]:
     return guarded
 
 
-def _split_player_specs(spec: str) -> list[str]:
+def _split_player_specs(spec: str, *, param_hint: str = "--players") -> list[str]:
     tokens = [token.strip() for token in spec.split(",")]
     if any(not token for token in tokens):
-        raise typer.BadParameter("选手规格不能为空", param_hint="--players")
+        raise typer.BadParameter("选手规格不能为空", param_hint=param_hint)
     return tokens
 
 
@@ -362,6 +363,8 @@ def _parse_players(
     spec: str,
     human_timeout: float,
     llm_timeout: float | None = None,
+    *,
+    param_hint: str = "--players",
 ) -> list[Player]:
     """把 ``profile:kimi:moonshot-v1,human:小明`` 等规格解析成选手。
 
@@ -371,7 +374,7 @@ def _parse_players(
     使用 ``[profiles.<id>]``，并生成与显示名分离的稳定 entrant ID。
     """
     players: list[Player] = []
-    for token in _split_player_specs(spec):
+    for token in _split_player_specs(spec, param_hint=param_hint):
         kind, _, ident = token.partition(":")
         if kind == "human":
             players.append(HumanPlayer(name=ident or "人类", timeout=human_timeout))
@@ -381,16 +384,16 @@ def _parse_players(
             if not profile_id:
                 raise typer.BadParameter(
                     "Profile 选手必须使用 profile:<id>[:model]",
-                    param_hint="--players",
+                    param_hint=param_hint,
                 )
             if separator and not explicit_model.strip():
-                raise typer.BadParameter("Profile 模型名不能为空", param_hint="--players")
+                raise typer.BadParameter("Profile 模型名不能为空", param_hint=param_hint)
             profile = get_profile(profile_id)
             model = explicit_model.strip() if separator else profile.default_model
             if not model:
                 raise typer.BadParameter(
                     f"Provider Profile {profile_id!r} 未指定模型，且没有 default_model",
-                    param_hint="--players",
+                    param_hint=param_hint,
                 )
             provider = create_profile_provider(profile)
             entrant_id = profile_entrant_id(profile_id, model)
@@ -424,12 +427,12 @@ def _parse_players(
     if len(set(entrant_ids)) != len(entrant_ids):
         raise typer.BadParameter(
             f"选手稳定身份必须唯一: {entrant_ids}",
-            param_hint="--players",
+            param_hint=param_hint,
         )
     _disambiguate_duplicate_display_names(players)
     names = [player.name for player in players]
     if len(set(names)) != len(names):
-        raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
+        raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint=param_hint)
     return players
 
 
@@ -481,7 +484,16 @@ def _render(ev: MatchEvent) -> None:
             line.append(" · ")
             line.append(literal_text(ev.data.get("reason_code")))
             console.print(line)
+        judging = ev.data.get("judging")
+        if isinstance(judging, dict):
+            summary = Text("匿名评审完成：", style="green")
+            summary.append(
+                f"{judging.get('successful_judges', 0)}/{judging.get('panel_size', 0)} 名有效评委"
+            )
+            summary.append(f" · quorum={judging.get('quorum', 0)}")
+            console.print(summary)
         scores = ev.data["scores"]
+        score_precision = 4 if isinstance(judging, dict) else 2
         table = Table(title="最终比分")
         table.add_column("排名", justify="right")
         table.add_column("选手")
@@ -492,7 +504,7 @@ def _render(ev: MatchEvent) -> None:
             table.add_row(
                 Text(str(rank)),
                 literal_text(name, max_chars=NAME_DISPLAY_LIMIT),
-                Text(f"{s:.2f}"),
+                Text(f"{s:.{score_precision}f}"),
             )
         console.print(table)
 
@@ -560,12 +572,13 @@ def _prepare_contest(
     no_llm_timeout: bool,
     require_two: bool = False,
     allow_human: bool = True,
+    mode: str = "play",
 ) -> tuple[Game, list[Player]]:
     """按固定顺序完成项目、人数、超时与 Provider 校验。"""
 
     try:
         game_options = {} if rounds is None else {"rounds": rounds}
-        selected_game = create_game(game_name, **game_options)
+        selected_game = create_game(game_name, mode=mode, **game_options)
     except ValueError as exc:
         param_hint = "--rounds" if rounds is not None and game_name in list_games() else "--game"
         raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
@@ -612,6 +625,54 @@ def _prepare_contest(
     return selected_game, selected_players
 
 
+def _prepare_judge_panel(
+    game: Game,
+    contestants: list[Player],
+    judge_specs: list[str] | None,
+    *,
+    llm_timeout: float | None,
+    no_llm_timeout: bool,
+) -> LLMJudgePanel | None:
+    """解析独立评委，并在创建 SQLite 文件前完成角色与身份校验。"""
+
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    raw_specs = list(judge_specs or [])
+    if not requires_panel:
+        if raw_specs:
+            raise typer.BadParameter(
+                f"项目 {game.name!r} 不使用 LLM 评审团",
+                param_hint="--judge",
+            )
+        return None
+    if not raw_specs:
+        raise typer.BadParameter(
+            f"项目 {game.name!r} 需要至少 3 个 --judge",
+            param_hint="--judge",
+        )
+
+    joined = ",".join(raw_specs)
+    tokens = _split_player_specs(joined, param_hint="--judge")
+    if any(token.partition(":")[0] == "human" for token in tokens):
+        raise typer.BadParameter("评委必须是 LLM/Profile/mock，不能是人类", param_hint="--judge")
+    try:
+        effective_timeout = _resolve_llm_timeout(llm_timeout, disabled=no_llm_timeout)
+        parsed = _parse_players(
+            joined,
+            60.0,
+            effective_timeout,
+            param_hint="--judge",
+        )
+        if any(not isinstance(judge, LLMPlayer) for judge in parsed):
+            raise ValueError("评委必须是 LLM/Profile/mock")
+        panel = LLMJudgePanel([judge for judge in parsed if isinstance(judge, LLMPlayer)])
+        panel.validate_contestants(contestants)
+        return panel
+    except typer.BadParameter:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--judge") from exc
+
+
 def _prepare_round_robin(
     *,
     game_name: str,
@@ -624,7 +685,7 @@ def _prepare_round_robin(
 
     try:
         game_options = {} if rounds is None else {"rounds": rounds}
-        selected_game = create_game(game_name, **game_options)
+        selected_game = create_game(game_name, mode="round_robin", **game_options)
     except ValueError as exc:
         param_hint = "--rounds" if rounds is not None and game_name in list_games() else "--game"
         raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
@@ -765,8 +826,20 @@ def _validate_tournament_workload(
     )
 
 
-async def _run(game: Game, players: list[Player], seed: int, store: SQLiteStore) -> None:
-    archive = await play_match(game, players, seed=seed, on_event=_guard_renderer(_render))
+async def _run(
+    game: Game,
+    players: list[Player],
+    seed: int,
+    store: SQLiteStore,
+    judge_panel: LLMJudgePanel | None = None,
+) -> None:
+    archive = await play_match(
+        game,
+        players,
+        seed=seed,
+        on_event=_guard_renderer(_render),
+        judge_panel=judge_panel,
+    )
     result = store.save_match(archive, rating_source="engine")
     _best_effort_render(_render_saved, archive, store, result)
 
@@ -1125,7 +1198,7 @@ async def _run_round_robin(
 @app.command()
 def play(
     game: str = typer.Option(
-        "math_quiz", "--game", "-g", help=f"比赛项目: {', '.join(list_games())}"
+        "math_quiz", "--game", "-g", help=f"比赛项目: {', '.join(list_games('play'))}"
     ),
     players: str = typer.Option(
         "mock:random,mock:fixed",
@@ -1165,6 +1238,16 @@ def play(
         "--no-llm-timeout",
         help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
+    judge: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--judge",
+            help=(
+                "创意项目的独立评委，可重复指定 3–9 次；例如 "
+                "--judge profile:judge-a --judge profile:judge-b --judge profile:judge-c"
+            ),
+        ),
+    ] = None,
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
@@ -1178,10 +1261,50 @@ def play(
         timeout=timeout,
         llm_timeout=llm_timeout,
         no_llm_timeout=no_llm_timeout,
+        mode="play",
+    )
+    judge_panel = _prepare_judge_panel(
+        selected_game,
+        selected_players,
+        judge,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
     )
     store = _open_store(database)
     try:
-        asyncio.run(_run(selected_game, selected_players, seed, store))
+        if judge_panel is None:
+            asyncio.run(_run(selected_game, selected_players, seed, store))
+        else:
+            asyncio.run(
+                _run(
+                    selected_game,
+                    selected_players,
+                    seed,
+                    store,
+                    judge_panel=judge_panel,
+                )
+            )
+    except JudgePanelError as exc:
+        line = Text("评审失败，对局未存档且未更新 ELO：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        for failure in exc.failures:
+            judge_descriptor = failure.get("judge")
+            if not isinstance(judge_descriptor, dict):
+                continue
+            detail = Text("  - ", style="yellow")
+            detail.append(
+                literal_text(
+                    f"{judge_descriptor.get('provider', '?')}:{judge_descriptor.get('model', '?')}",
+                    max_chars=NAME_DISPLAY_LIMIT,
+                )
+            )
+            detail.append(" · ")
+            detail.append(literal_text(failure.get("reason_code")))
+            detail.append(" / ")
+            detail.append(literal_text(failure.get("error_type")))
+            console.print(detail)
+        raise typer.Exit(code=1) from exc
     except (OSError, sqlite3.Error, StorageError) as exc:
         line = Text("对局已完成，但 SQLite 存档失败：", style="red")
         line.append(literal_text(exc))
@@ -1195,7 +1318,7 @@ def series(
         "gomoku",
         "--game",
         "-g",
-        help=f"比赛项目: {', '.join(list_games())}",
+        help=f"比赛项目: {', '.join(list_games('series'))}",
     ),
     players: str = typer.Option(
         "mock:random,mock:fixed",
@@ -1251,6 +1374,7 @@ def series(
         no_llm_timeout=no_llm_timeout,
         require_two=True,
         allow_human=False,
+        mode="series",
     )
     store = _open_store(database)
     try:
@@ -1268,7 +1392,7 @@ def round_robin(
         None,
         "--game",
         "-g",
-        help=f"比赛项目: {', '.join(list_games())}（新赛事默认 knowledge_quiz）",
+        help=f"比赛项目: {', '.join(list_games('round_robin'))}（新赛事默认 knowledge_quiz）",
     ),
     players: str | None = typer.Option(
         None,

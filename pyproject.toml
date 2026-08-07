@@ -39,6 +39,9 @@ packages = ["llmolympic"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live_provider: opt-in smoke tests that make real, potentially billable provider calls",
+]
 
 [tool.ruff]
 line-length = 100

@@ -582,6 +582,20 @@ def test_retry_prompt_includes_rejected_move_and_reason() -> None:
     assert archive.moves[-1].prompt == player.prompts[1]
 
 
+def test_player_cannot_submit_the_engine_reserved_forfeit_marker() -> None:
+    player = _SequencePlayer("scripted", [FORFEIT_MOVE, "A"])
+
+    archive = asyncio.run(
+        play_match(create_game("knowledge_quiz", rounds=1), [player], max_attempts=2)
+    )
+
+    assert len(player.prompts) == 2
+    assert archive.moves[0].move == FORFEIT_MOVE
+    assert archive.moves[0].accepted is False
+    assert "引擎保留" in (archive.moves[0].reason or "")
+    assert archive.moves[1].accepted is True
+
+
 def test_overlong_output_is_not_archived_and_causes_technical_loss() -> None:
     long_move = "Z" * (MAX_MOVE_CHARS + 1)
     player = _SequencePlayer("scripted", [long_move])
