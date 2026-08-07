@@ -3,21 +3,17 @@ name: Live Provider Smoke
 on:
   workflow_dispatch:
     inputs:
-      judge_model_1:
-        description: "First OpenRouter judge model"
+      candidate_models:
+        description: "3-9 comma-separated openai:<vendor>/<model> candidates, tried in order"
         required: true
-        default: "openai/gpt-4o-mini-2024-07-18"
+        default: >-
+          openai:openai/gpt-5.6-luna,openai:deepseek/deepseek-v4-flash-0731,openai:mistralai/mistral-medium-3-5,openai:x-ai/grok-4.3,openai:google/gemini-3.5-flash-lite
         type: string
-      judge_model_2:
-        description: "Second OpenRouter judge model"
+      confirm_billable:
+        description: "Confirm up to 15 potentially billable provider calls"
         required: true
-        default: "google/gemini-2.5-flash-lite"
-        type: string
-      judge_model_3:
-        description: "Third OpenRouter judge model"
-        required: true
-        default: "anthropic/claude-haiku-4.5"
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -28,13 +24,15 @@ concurrency:
 
 jobs:
   require-main:
-    name: Require trusted main branch
+    name: Validate trusted billable dispatch
     runs-on: ubuntu-latest
     timeout-minutes: 1
     env:
+      CANDIDATE_MODELS: "${{ inputs.candidate_models }}"
+      CONFIRM_BILLABLE: "${{ inputs.confirm_billable }}"
       SELECTED_REF: "${{ github.ref }}"
     steps:
-      - name: Reject non-main workflow refs
+      - name: Validate branch, confirmation, and candidates
         shell: bash
         run: |
           if [[ "${SELECTED_REF}" != "refs/heads/main" ]]; then
@@ -42,18 +40,69 @@ jobs:
             exit 1
           fi
 
+          if [[ "${CONFIRM_BILLABLE}" != "true" ]]; then
+            echo "Set confirm_billable to true before starting billable provider calls." >&2
+            exit 1
+          fi
+
+          if [[ -z "${CANDIDATE_MODELS}" || ${#CANDIDATE_MODELS} -gt 2375 ]]; then
+            echo "candidate_models must contain 3-9 bounded candidate specs." >&2
+            exit 1
+          fi
+          if [[ "${CANDIDATE_MODELS}" == *$'\n'* || "${CANDIDATE_MODELS}" == *$'\r'* ]]; then
+            echo "candidate_models must be one comma-separated line." >&2
+            exit 1
+          fi
+          if [[ "${CANDIDATE_MODELS}" == ,* || "${CANDIDATE_MODELS}" == *, || "${CANDIDATE_MODELS}" == *,,* ]]; then
+            echo "candidate_models cannot contain empty entries." >&2
+            exit 1
+          fi
+
+          IFS=',' read -r -a candidates <<< "${CANDIDATE_MODELS}"
+          if (( ${#candidates[@]} < 3 || ${#candidates[@]} > 9 )); then
+            echo "candidate_models must contain between 3 and 9 candidates." >&2
+            exit 1
+          fi
+
+          seen_candidates=()
+          for candidate in "${candidates[@]}"; do
+            if (( ${#candidate} > 263 )); then
+              echo "Each candidate spec must be at most 263 characters." >&2
+              exit 1
+            fi
+            if [[ ! "${candidate}" =~ ^openai:[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:+-]*$ ]]; then
+              echo "Each candidate must be one openai:<vendor>/<model> spec without whitespace." >&2
+              exit 1
+            fi
+            model_slug="${candidate#openai:}"
+            if (( ${#model_slug} > 256 )); then
+              echo "Each OpenRouter model identifier must be at most 256 characters." >&2
+              exit 1
+            fi
+            canonical_candidate="$(printf '%s' "${candidate}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${canonical_candidate}" == openai:openrouter/auto* || "${canonical_candidate}" == "openai:openrouter/free" ]]; then
+              echo "candidate_models cannot use dynamic OpenRouter routing aliases." >&2
+              exit 1
+            fi
+            for seen_candidate in "${seen_candidates[@]}"; do
+              if [[ "${canonical_candidate}" == "${seen_candidate}" ]]; then
+                echo "candidate_models must not contain duplicate model specs." >&2
+                exit 1
+              fi
+            done
+            seen_candidates+=("${canonical_candidate}")
+          done
+
   smoke:
     name: Creative writing with live judges
     needs: require-main
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     environment: live-provider-smoke
     env:
-      JUDGE_MODEL_1: "${{ inputs.judge_model_1 }}"
-      JUDGE_MODEL_2: "${{ inputs.judge_model_2 }}"
-      JUDGE_MODEL_3: "${{ inputs.judge_model_3 }}"
+      LLMOLYMPIC_LIVE_JUDGE_CANDIDATES: "${{ inputs.candidate_models }}"
+      LLMOLYMPIC_LIVE_LLM_TIMEOUT: "60"
       LLMOLYMPIC_RUN_LIVE: "1"
-      LLMOLYMPIC_LIVE_JUDGES: "openai:${{ inputs.judge_model_1 }},openai:${{ inputs.judge_model_2 }},openai:${{ inputs.judge_model_3 }}"
       OPENAI_BASE_URL: https://openrouter.ai/api/v1
 
     steps:
@@ -68,16 +117,6 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
-
-      - name: Validate judge model inputs
-        shell: bash
-        run: |
-          for model in "${JUDGE_MODEL_1}" "${JUDGE_MODEL_2}" "${JUDGE_MODEL_3}"; do
-            if [[ ! "${model}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:+-]*$ ]]; then
-              echo "Each judge input must be one OpenRouter provider/model identifier." >&2
-              exit 1
-            fi
-          done
 
       - name: Require OpenRouter secret
         shell: bash

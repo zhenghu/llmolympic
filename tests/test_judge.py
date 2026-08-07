@@ -16,6 +16,7 @@ from llmolympic.core.judge import (
     LLMJudgePanel,
     _judge_prompt,
     _parse_response,
+    score_judge_submission,
 )
 from llmolympic.core.player import HumanPlayer, LLMPlayer
 from llmolympic.providers.base import Provider
@@ -71,6 +72,22 @@ class _ScriptedJudgeProvider(Provider):
             },
             ensure_ascii=False,
         )
+
+
+class _RawResponseJudgeProvider(Provider):
+    """Return one exact response so public protocol-boundary failures can be tested."""
+
+    def __init__(self, response: str) -> None:
+        self.name = "raw-response-judge"
+        self.response = response
+        self.calls: list[list[dict]] = []
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        raise AssertionError("judge tests must use the native async provider path")
+
+    async def achat(self, messages: list[dict], *, model: str, **params) -> str:
+        self.calls.append(messages)
+        return self.response
 
 
 class _CancellationTracker:
@@ -176,6 +193,81 @@ def test_judge_prompt_uses_the_actual_anonymous_label_in_response_schema() -> No
     assert '"scores":{"B":' in instructions
     assert '"rationales":{"B":' in instructions
     assert '"scores":{"A":' not in instructions
+
+
+def test_score_judge_submission_supports_label_b_with_the_strict_protocol() -> None:
+    scores = {"WORK_ALPHA": {"originality": 7.0, "clarity": 8.5}}
+    provider = _ScriptedJudgeProvider("judge-provider", scores)
+    request = _request(submissions={"Alpha": "WORK_ALPHA"})
+
+    parsed_scores, rationale = asyncio.run(
+        score_judge_submission(
+            _judge("judge:probe", provider),
+            request,
+            "B",
+            "WORK_ALPHA",
+        )
+    )
+
+    assert parsed_scores == scores["WORK_ALPHA"]
+    assert rationale == "assessment for WORK_ALPHA"
+    assert len(provider.calls) == 1
+    assert _judge_input(provider.calls[0])["submissions"] == {"B": "WORK_ALPHA"}
+
+
+def test_score_judge_submission_rejects_non_protocol_wrapped_json() -> None:
+    provider = _RawResponseJudgeProvider(
+        '```json\n{"scores":{"B":{"originality":7,"clarity":8}},'
+        '"rationales":{"B":"reason"}}\n```'
+    )
+
+    with pytest.raises(JudgePanelError) as raised:
+        asyncio.run(
+            score_judge_submission(
+                _judge("judge:strict-probe", provider),
+                _request(submissions={"Alpha": "WORK_ALPHA"}),
+                "B",
+                "WORK_ALPHA",
+            )
+        )
+
+    assert raised.value.reason_code == "invalid_judge_response"
+    assert len(provider.calls) == 1
+
+
+def test_panel_routes_every_submission_through_public_score_boundary(monkeypatch) -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 8.0, "clarity": 4.0},
+        "WORK_BETA": {"originality": 4.0, "clarity": 8.0},
+    }
+    judges = [
+        _judge(
+            f"judge:{index}",
+            _ScriptedJudgeProvider(f"judge-provider-{index}", scores),
+        )
+        for index in range(3)
+    ]
+    calls: list[tuple[str, str, str]] = []
+
+    async def tracked_score(
+        judge: LLMPlayer,
+        request: JudgingRequest,
+        label: str,
+        submission: str,
+    ) -> tuple[dict[str, float], str]:
+        calls.append((judge.entrant_id, label, submission))
+        return await score_judge_submission(judge, request, label, submission)
+
+    monkeypatch.setattr("llmolympic.core.judge.score_judge_submission", tracked_score)
+
+    verdict = asyncio.run(LLMJudgePanel(judges).adjudicate(_request(), seed=19))
+
+    assert verdict.successful_judges == 3
+    assert len(calls) == 6
+    for judge in judges:
+        judge_calls = [(label, submission) for judge_id, label, submission in calls if judge_id == judge.entrant_id]
+        assert {label for label, _ in judge_calls} == {"A", "B"}
+        assert {submission for _, submission in judge_calls} == {"WORK_ALPHA", "WORK_BETA"}
 
 
 def test_one_incomplete_judge_is_excluded_but_majority_quorum_still_aggregates() -> None:
