@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 from llmolympic import config
 from llmolympic.cli.main import (
     _prepare_round_robin,
+    _restore_round_robin,
     _run_round_robin,
     _runner_lease_heartbeat,
     _validate_tournament_workload,
@@ -27,6 +28,7 @@ from llmolympic.core.storage import (
     TournamentRunnerLeaseLostError,
 )
 from llmolympic.core.tournament import (
+    TournamentCheckpoint,
     checkpoint_with_series,
     prepare_round_robin,
     resume_round_robin,
@@ -760,6 +762,85 @@ display_name = "Renamed"
     assert tournament.players[0]["move_timeout_seconds"] == 0.5
     first_event = tournament.pairings[0].series.legs[0].events[0]
     assert first_event.data["game_config"]["rounds"] == 1
+
+
+def test_round_robin_restores_legacy_checkpoint_without_route_snapshot() -> None:
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="mock:fixed,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=29)
+    payload = checkpoint.model_dump(mode="python")
+    for descriptor in payload["players"]:
+        descriptor.pop("route_id")
+    legacy_checkpoint = TournamentCheckpoint.model_validate(payload)
+
+    restored_game, restored_players = _restore_round_robin(legacy_checkpoint)
+
+    assert all(player.route_id.startswith("route:v1:") for player in restored_players)
+    assert all("route_id" not in player.describe() for player in restored_players)
+    tournament = asyncio.run(
+        resume_round_robin(restored_game, restored_players, legacy_checkpoint)
+    )
+    assert all("route_id" not in descriptor for descriptor in tournament.players)
+    assert all(
+        "route_id" not in descriptor
+        for pairing in tournament.pairings
+        for leg in pairing.series.legs
+        for descriptor in leg.players
+    )
+
+
+def test_round_robin_rejects_partial_or_changed_route_snapshot_before_play(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.local]
+provider = "ollama"
+default_model = "model"
+base_url = "http://localhost:11434"
+""",
+    )
+    game, players = _prepare_round_robin(
+        game_name="knowledge_quiz",
+        player_spec="profile:local,mock:random,mock:illegal",
+        rounds=1,
+        llm_timeout=1,
+        no_llm_timeout=False,
+    )
+    checkpoint = prepare_round_robin(game, players, seed=30)
+
+    partial = checkpoint.model_dump(mode="python")
+    partial["players"][0].pop("route_id")
+    with pytest.raises(ValueError, match="route_id 快照不完整"):
+        _restore_round_robin(TournamentCheckpoint.model_validate(partial))
+
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        """
+[profiles.local]
+provider = "ollama"
+default_model = "model"
+base_url = "http://localhost:22468"
+""",
+        encoding="utf-8",
+    )
+    if os.name == "posix":
+        config_path.chmod(0o600)
+    config.load_config.cache_clear()
+    try:
+        restored_game, restored_players = _restore_round_robin(checkpoint)
+        with pytest.raises(ValueError, match="选手描述与 checkpoint 不一致"):
+            asyncio.run(resume_round_robin(restored_game, restored_players, checkpoint))
+    finally:
+        config.load_config.cache_clear()
 
 
 def test_round_robin_checkpoint_never_persists_profile_api_key(

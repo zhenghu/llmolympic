@@ -157,6 +157,14 @@ llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
 创建新的 ELO 身份，更换 Profile ID 或模型则会。
 同场出现重复展示名时，CLI 会附加 Profile 和模型进行消歧。
 
+`entrant_id` 只表示竞技身份；评委独立性另由 Provider 派生的 `route_id`
+判断。OpenAI/Ollama 的路由由协议族、规范化端点和精确模型组成，mock 的路由
+由算法策略组成。因此，同一端点和模型即使改用另一个 Profile、API Key、展示名、
+采样参数或 direct 语法，也不能在同一评审团重复投票，参赛者也不能通过更换这些
+字段规避自评检查。`route_id` 不参与 ELO，也不会写入 `entrants.identity_json`。
+第三方可配置端点的 Provider 应覆盖 `route_id_for()`，否则默认实现会保守地把
+同一适配器类型和模型视为同一路由。
+
 ## 运行
 
 macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、国际象棋、
@@ -410,8 +418,16 @@ Profiles 都是云端 LLM，Ollama 是本地 LLM，mock 只是离线算法。
 quorum 时命令失败，不写入对局，也不更新 ELO。
 
 成功裁决的安全评委描述、匿名映射、逐维分数、理由、失败摘要、quorum 与聚合版本都
-保存在 `match_finished.data.judging`，SQLite 仍使用 schema v7；最终双人比分继续进入
-总榜和 `creative_writing` 项目榜。评委原始响应、API Key、端点和请求头不会进入档案。
+保存在 `match_finished.data.judging`。新裁决使用 `PanelVerdict` schema v2，并在
+`panel` 中冻结完整评审团及每名评委的 `route_id`；即使全部参赛者都已技术放弃、没有
+实际评委调用，也能复核评委路由唯一性。旧 schema v1 裁决仍可读取，但因没有路由快照，
+不能被视为已验证路由独立。SQLite 仍使用 schema v7，最终双人比分继续进入总榜和
+`creative_writing` 项目榜。
+
+评委原始响应、API Key、原始端点和请求头不会进入档案。`route_id` 是稳定、可跨档案
+关联的端点伪名；常见端点可能通过字典枚举被猜出，因此它不是加密或保密边界。路由检查
+只证明本地配置的请求路径不同，无法通过 DNS/CNAME、供应商模型别名或动态后端证明底层
+基础模型必然不同。
 当前首个切片只支持 `play`，尚未把评委配置、费用估算和恢复语义接入 `series` 或
 `round-robin`，因此这两种模式会在建库和模型调用前明确拒绝创意项目。
 

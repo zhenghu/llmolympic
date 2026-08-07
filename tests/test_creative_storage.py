@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 
 import pytest
@@ -14,6 +15,7 @@ from llmolympic.core.match import play_match
 from llmolympic.core.player import LLMPlayer, Player
 from llmolympic.core.storage import SCHEMA_VERSION, SQLiteStore
 from llmolympic.games.creative_writing import CreativeWriting
+from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
 
 
@@ -60,6 +62,16 @@ class _AlwaysInvalidPlayer(Player):
         return "too short"
 
 
+class _AlwaysInvalidJudgeProvider(Provider):
+    name = "invalid-judge"
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        return "Z"
+
+    async def achat(self, messages: list[dict], *, model: str, **params) -> str:
+        return "Z"
+
+
 def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
     game = CreativeWriting()
     contestants = _contestants()
@@ -77,11 +89,18 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
     assert finished.data["termination"] == "completed"
     verdict = PanelVerdict.model_validate(finished.data["judging"])
     contestant_names = {contestant.name for contestant in contestants}
-    assert verdict.schema_version == 1
+    assert verdict.schema_version == 2
     assert verdict.panel_size == 3
     assert verdict.quorum == 2
     assert verdict.successful_judges == 3
     assert verdict.failures == []
+    assert verdict.panel is not None
+    assert len(verdict.panel) == verdict.panel_size
+    assert len({judge.judge_id for judge in verdict.panel}) == verdict.panel_size
+    assert len({judge.route_id for judge in verdict.panel}) == verdict.panel_size
+    assert {judge.judge_id: judge for judge in verdict.panel} == {
+        item.judge.judge_id: item.judge for item in verdict.verdicts
+    }
     assert verdict.scores == archive.scores == finished.data["scores"]
     assert len(verdict.verdicts) == 3
     assert {item.judge.model for item in verdict.verdicts} == {
@@ -94,6 +113,11 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
         assert set(item.label_map.values()) == contestant_names
         assert set(item.scores) == contestant_names
         assert set(item.rationales) == contestant_names
+
+    serialized = archive.to_json()
+    assert "route:v1:" in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
 
     assert archive.scores["Contestant A"] > archive.scores["Contestant B"]
 
@@ -141,14 +165,30 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
 
     with sqlite3.connect(path) as connection:
         schema_after = connection.execute("PRAGMA user_version").fetchone()[0]
+        identities = [
+            json.loads(row[0])
+            for row in connection.execute("SELECT identity_json FROM entrants").fetchall()
+        ]
     assert schema_before == schema_after == SCHEMA_VERSION == 7
+    assert identities
+    assert all("route_id" not in identity for identity in identities)
 
 
 def test_creative_quorum_failure_is_not_saved(tmp_path) -> None:
     panel = LLMJudgePanel(
         [
-            _judge("Invalid Judge A", "illegal", "invalid-judge-a"),
-            _judge("Invalid Judge B", "illegal", "invalid-judge-b"),
+            LLMPlayer(
+                "Invalid Judge A",
+                _AlwaysInvalidJudgeProvider(),
+                "invalid-judge-a",
+                move_timeout_seconds=None,
+            ),
+            LLMPlayer(
+                "Invalid Judge B",
+                _AlwaysInvalidJudgeProvider(),
+                "invalid-judge-b",
+                move_timeout_seconds=None,
+            ),
             _judge("Valid Judge", "balanced", "valid-judge"),
         ]
     )
@@ -234,11 +274,21 @@ def test_creative_archive_rejects_self_human_judge_and_rubric_drift() -> None:
     )
 
     self_judged = archive.model_dump(mode="python")
-    self_judged["events"][-1]["data"]["judging"]["verdicts"][0]["judge"][
-        "judge_id"
-    ] = archive.players[0]["entrant_id"]
+    self_judging = self_judged["events"][-1]["data"]["judging"]
+    self_judging["panel"][0]["judge_id"] = archive.players[0]["entrant_id"]
+    self_judging["verdicts"][0]["judge"]["judge_id"] = archive.players[0][
+        "entrant_id"
+    ]
     with pytest.raises(ValueError, match="不能同时担任评委"):
         MatchArchive.model_validate(self_judged)
+
+    route_self_judged = archive.model_dump(mode="python")
+    route_judging = route_self_judged["events"][-1]["data"]["judging"]
+    contestant_route = archive.players[0]["route_id"]
+    route_judging["panel"][0]["route_id"] = contestant_route
+    route_judging["verdicts"][0]["judge"]["route_id"] = contestant_route
+    with pytest.raises(ValueError, match="参赛者路由不能同时担任评委"):
+        MatchArchive.model_validate(route_self_judged)
 
     human_judged = archive.model_dump(mode="python")
     human_judged["events"][-1]["data"]["judging"]["verdicts"][0]["judge"][
@@ -251,3 +301,124 @@ def test_creative_archive_rejects_self_human_judge_and_rubric_drift() -> None:
     rubric_drift["events"][-1]["data"]["judging"]["rubric_version"] = "forged-v2"
     with pytest.raises(ValueError, match="冻结的 rubric 不一致"):
         MatchArchive.model_validate(rubric_drift)
+
+
+def test_creative_fixed_scores_v2_still_freezes_the_full_panel() -> None:
+    archive = asyncio.run(
+        play_match(
+            CreativeWriting(),
+            [_AlwaysInvalidPlayer("Forfeiter A"), _AlwaysInvalidPlayer("Forfeiter B")],
+            seed=21,
+            judge_panel=_healthy_panel(),
+        )
+    )
+
+    judging = PanelVerdict.model_validate(archive.events[-1].data["judging"])
+
+    assert judging.schema_version == 2
+    assert judging.aggregation == "fixed-scores-v1"
+    assert judging.fixed_scores == {"Forfeiter A": 0.0, "Forfeiter B": 0.0}
+    assert judging.verdicts == []
+    assert judging.failures == []
+    assert judging.successful_judges == 0
+    assert judging.panel is not None
+    assert len(judging.panel) == judging.panel_size == 3
+    assert len({judge.route_id for judge in judging.panel}) == 3
+
+
+def test_creative_archive_keeps_v1_judging_readable_without_panel_routes() -> None:
+    archive = asyncio.run(
+        play_match(
+            CreativeWriting(),
+            _contestants(),
+            seed=34,
+            judge_panel=_healthy_panel(),
+        )
+    )
+    payload = archive.model_dump(mode="python")
+    judging = payload["events"][-1]["data"]["judging"]
+    judging["schema_version"] = 1
+    judging.pop("panel")
+    for item in [*judging["verdicts"], *judging["failures"]]:
+        item["judge"].pop("route_id")
+
+    loaded = MatchArchive.model_validate(payload)
+    legacy_judging = PanelVerdict.model_validate(loaded.events[-1].data["judging"])
+
+    assert legacy_judging.schema_version == 1
+    assert legacy_judging.panel is None
+    assert all(item.judge.route_id is None for item in legacy_judging.verdicts)
+
+
+def test_creative_v1_judging_sqlite_round_trip_does_not_rewrite_archive(tmp_path) -> None:
+    current = asyncio.run(
+        play_match(
+            CreativeWriting(),
+            _contestants(),
+            seed=35,
+            judge_panel=_healthy_panel(),
+        )
+    )
+    payload = current.model_dump(mode="python")
+    for descriptor in payload["players"]:
+        descriptor.pop("route_id")
+    for event in payload["events"]:
+        if event["type"] == EventType.MATCH_STARTED:
+            for descriptor in event["data"]["players"]:
+                descriptor.pop("route_id")
+    judging = payload["events"][-1]["data"]["judging"]
+    judging["schema_version"] = 1
+    judging.pop("panel")
+    for item in [*judging["verdicts"], *judging["failures"]]:
+        item["judge"].pop("route_id")
+    historical = MatchArchive.model_validate(payload)
+
+    path = tmp_path / "creative-v1-judging.db"
+    store = SQLiteStore(path)
+    saved = store.save_match(historical, rating_source="engine")
+    assert saved.inserted is True
+    with sqlite3.connect(path) as connection:
+        raw_before = connection.execute(
+            "SELECT archive_json FROM matches WHERE match_id = ?",
+            (historical.match_id,),
+        ).fetchone()[0]
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+
+    loaded = store.get_match(historical.match_id)
+    assert loaded is not None
+    loaded_judging = PanelVerdict.model_validate(loaded.events[-1].data["judging"])
+    assert loaded_judging.schema_version == 1
+    assert loaded_judging.panel is None
+    assert all("route_id" not in descriptor for descriptor in loaded.players)
+    repeated = store.save_match(loaded, rating_source="engine")
+    assert repeated.inserted is False
+
+    with sqlite3.connect(path) as connection:
+        raw_after = connection.execute(
+            "SELECT archive_json FROM matches WHERE match_id = ?",
+            (historical.match_id,),
+        ).fetchone()[0]
+    assert raw_after == raw_before
+
+
+def test_creative_archive_rejects_sensitive_or_missing_v2_panel_fields() -> None:
+    archive = asyncio.run(
+        play_match(
+            CreativeWriting(),
+            _contestants(),
+            seed=55,
+            judge_panel=_healthy_panel(),
+        )
+    )
+
+    sensitive = archive.model_dump(mode="python")
+    sensitive["events"][-1]["data"]["judging"]["panel"][0]["base_url"] = (
+        "https://secret.example/v1"
+    )
+    with pytest.raises(ValueError, match="无效的评审团裁决"):
+        MatchArchive.model_validate(sensitive)
+
+    missing_route = archive.model_dump(mode="python")
+    missing_route["events"][-1]["data"]["judging"]["panel"][0].pop("route_id")
+    with pytest.raises(ValueError, match="无效的评审团裁决"):
+        MatchArchive.model_validate(missing_route)
