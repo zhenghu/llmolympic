@@ -16,9 +16,10 @@
 - 创意裁决继续使用 SQLite schema v7，在 `match_finished.data.judging` 中持久化，并复用
   现有双人总榜和分项目 ELO。`play.command` 新增完全离线的创意写作 + 三算法评委入口。
 - 新增手动触发的 `Live Provider Smoke` GitHub Actions 工作流：使用受 Environment 保护的
-  OpenRouter Secret，以两名 mock 参赛者和三个可配置云端评委执行固定 6 次逻辑请求的真实
-  评审冒烟，并要求三个 Provider 路由全部成功；它不阻塞 PR。CI 与 Release 的 wheel/sdist
-  隔离安装也新增零费用三 mock 评委冒烟。
+  OpenRouter Secret，按顺序从 3–9 个候选中探针选出最先通过严格评审协议的三个模型，再以
+  两名 mock 参赛者执行固定 6 次正式评审请求。单次运行最多 15 次可能计费调用，正式阶段仍
+  要求三个 Provider 路由全部成功；它不阻塞 PR。CI 与 Release 的 wheel/sdist 隔离安装也
+  新增零费用三 mock 评委冒烟。
 
 ## [0.3.0] - 2026-08-06
 

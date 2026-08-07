@@ -338,6 +338,31 @@ def _parse_response(
     return parsed, rationale
 
 
+async def score_judge_submission(
+    judge: LLMPlayer,
+    request: JudgingRequest,
+    label: str,
+    submission: str,
+) -> tuple[dict[str, float], str]:
+    """用正式匿名评审协议为一份作品评分。
+
+    模型选择探针与完整评审团共用这个边界，确保二者使用相同的系统提示、
+    请求信封和严格响应解析。Provider、超时和协议异常保持原有类型向上传播。
+    """
+
+    response = await judge.complete(
+        _judge_prompt(
+            task=request.task,
+            criteria=request.criteria,
+            label=label,
+            submission=submission,
+            rubric_version=request.rubric_version,
+        ),
+        system_prompt=JUDGE_SYSTEM_PROMPT,
+    )
+    return _parse_response(response, label=label, criteria=list(request.criteria))
+
+
 def _median(values: list[Decimal]) -> Decimal:
     ordered = sorted(values)
     middle = len(ordered) // 2
@@ -391,26 +416,6 @@ class LLMJudgePanel:
         if overlap:
             raise ValueError("同一稳定身份不能同时担任参赛者和评委")
 
-    async def _score_one(
-        self,
-        judge: LLMPlayer,
-        *,
-        request: JudgingRequest,
-        label: str,
-        submission: str,
-    ) -> tuple[dict[str, float], str]:
-        response = await judge.complete(
-            _judge_prompt(
-                task=request.task,
-                criteria=request.criteria,
-                label=label,
-                submission=submission,
-                rubric_version=request.rubric_version,
-            ),
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-        )
-        return _parse_response(response, label=label, criteria=list(request.criteria))
-
     async def adjudicate(self, request: JudgingRequest, *, seed: int) -> PanelVerdict:
         """并发完成独立盲评并按评委完整交集形成多数裁决。"""
 
@@ -439,11 +444,11 @@ class LLMJudgePanel:
             for label, player in label_map.items():
                 tasks.append(
                     asyncio.create_task(
-                        self._score_one(
+                        score_judge_submission(
                             judge,
-                            request=request,
-                            label=label,
-                            submission=request.submissions[player],
+                            request,
+                            label,
+                            request.submissions[player],
                         )
                     )
                 )

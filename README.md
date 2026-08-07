@@ -437,32 +437,42 @@ ruff check .
 ### 真实 Provider 自动化冒烟
 
 真实评委测试默认不随本地测试或 PR CI 运行，避免网络波动、第三方模型变化和调用费用阻塞
-日常合并。需要实测时，可用 mock 参赛者和三个 OpenRouter 云端评委手动运行：
+日常合并。需要实测时，可提供 3–9 个按优先级排列的 OpenRouter 云端评委候选；测试会先
+逐个探针，再用最先通过的三个模型运行正式冒烟：
 
 ```bash
 OPENAI_API_KEY="$OPENROUTER_API_KEY" \
 OPENAI_BASE_URL="https://openrouter.ai/api/v1" \
 LLMOLYMPIC_RUN_LIVE=1 \
-LLMOLYMPIC_LIVE_JUDGES="openai:openai/gpt-4o-mini-2024-07-18,openai:google/gemini-2.5-flash-lite,openai:anthropic/claude-haiku-4.5" \
+LLMOLYMPIC_LIVE_JUDGE_CANDIDATES="openai:openai/gpt-5.6-luna,openai:deepseek/deepseek-v4-flash-0731,openai:mistralai/mistral-medium-3-5,openai:x-ai/grok-4.3,openai:google/gemini-3.5-flash-lite" \
 python -m pytest -m live_provider -q -s
 ```
 
 这些变量只对该命令生效，避免同一终端后续执行普通 `pytest` 时意外再次产生云端调用。
+候选必须是 3–9 个唯一的 `openai:<vendor>/<model>` spec，不接受会动态改选模型的
+`openrouter/auto*` 或 `openrouter/free`。探针按输入顺序逐个发送一次与正式评审相同的系统提示、
+请求信封和严格 JSON 解析；“可用”只表示模型在这一次探针中成功通过完整协议，不保证后续
+调用不会因网络或第三方服务变化而失败。选满三个后不会继续探测其余候选；如果最终不足三个，
+正式比赛不会启动，也不会写入对局或更新 ELO。
 
 仓库的 `Live Provider Smoke` GitHub Actions 工作流提供同一项手动实测。在仓库设置中创建
 名为 `live-provider-smoke` 的 GitHub Environment，并只在该 Environment 中添加
 `OPENROUTER_API_KEY` Secret；然后从 Actions 页面选择工作流并点击 **Run workflow**。
-三个评委模型可在触发界面覆盖，输入只作为环境变量传给测试，不会拼入 shell 命令。
-`-s` 会在日志中显示脱敏的 `LIVE_PROVIDER_SMOKE` JSON 摘要；工作流不会上传数据库或档案。
+触发界面的 `candidate_models` 接受同样的候选列表；勾选 `confirm_billable` 后才会进入受
+Environment 保护的计费 job。输入只作为环境变量传给校验和测试，不会拼入 shell 命令。
+`-s` 会在日志中显示脱敏的模型选择与 `LIVE_PROVIDER_SMOKE` JSON 摘要，只包含模型 spec、
+安全原因码和聚合结果，不包含原始响应或 Provider 异常文本；工作流不会上传数据库或档案。
 必须把该 Environment 的 deployment branches 限制为 `main`，工作流也只允许 `main` 运行；
 代码内的分支判断只是纵深防御，不能替代 Environment 规则。仓库有多位写入者时，还应设置
 required reviewers。每次触发都要确认 **Use workflow from** 选择的是 `main`。
 
-每次冒烟固定由两名 mock 参赛者各提交一份作品，再由三个云端模型分别评审两份作品，
-因此会安排 6 次逻辑评审请求；成功路径包含 6 次可能计费的模型调用。建议为专用测试 Key
-设置限额；实际费用取决于触发时所选模型及 Provider 定价。工作流要求三名评委全部成功，
-任一模型失败都会让冒烟失败。工作流只允许读取仓库内容，并且会在缺少 Secret 时直接失败而
-不输出 Key。
+若输入 `N` 个候选，选择阶段最多调用 `N` 次；正式阶段固定由两名 mock 参赛者各提交一份
+作品，再由选中的三个云端模型分别评审两份作品，因此固定调用 6 次。总上限为 `N + 6`，
+而 `N <= 9`，所以单次工作流最多发起 15 次可能计费的模型调用。建议为专用测试 Key 设置
+Provider 侧费用限额；请求次数和输出 Token 上限不是美元价格保证，实际费用取决于所选模型
+及 Provider 定价。GitHub 工作流把单次模型请求限制为 60 秒且不做 Provider 重试；探针选出
+的三名评委在正式阶段仍必须 3/3 全部成功，任一模型失败都会让冒烟失败。工作流只允许读取
+仓库内容，缺少 Secret 时会直接失败且不会输出 Key、请求头、原始模型响应或端点详情。
 CI 与 Release 仍会分别从 wheel 和 sdist 运行零费用的三 mock 评委创意写作冒烟。
 
 ## Release 资产
