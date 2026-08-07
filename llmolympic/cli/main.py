@@ -74,6 +74,7 @@ from llmolympic.core.tournament import (
 from llmolympic.diagnostics import run_diagnostics
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_profile_provider, create_provider
+from llmolympic.providers.base import validate_route_id
 
 app = typer.Typer(
     help="LLM Olympics —— 人类与 LLM 的多项目竞技场",
@@ -767,6 +768,14 @@ def _checkpoint_llm_timeout(checkpoint: TournamentCheckpoint) -> float | None:
 def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[Player]]:
     """Recreate providers from current config while preserving frozen tournament identity."""
 
+    route_fields = tuple("route_id" in descriptor for descriptor in checkpoint.players)
+    if any(route_fields) and not all(route_fields):
+        raise ValueError("循环赛 checkpoint 的 route_id 快照不完整")
+    has_route_snapshot = all(route_fields)
+    if has_route_snapshot:
+        for descriptor in checkpoint.players:
+            validate_route_id(descriptor.get("route_id"))
+
     player_spec = ",".join(_checkpoint_player_spec(item) for item in checkpoint.players)
     timeout = _checkpoint_llm_timeout(checkpoint)
     raw_rounds = checkpoint.game_config.get("rounds")
@@ -788,6 +797,10 @@ def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[P
     # completed and future series have byte-for-byte identical descriptors.
     for player, descriptor in zip(players, checkpoint.players):
         player.name = descriptor["name"]
+        if not has_route_snapshot:
+            if not isinstance(player, LLMPlayer):  # pragma: no cover - parser contract guard
+                raise TypeError("旧循环赛 checkpoint 只能恢复 LLM/mock/Profile 选手")
+            player._use_legacy_route_description()
     return game, players
 
 

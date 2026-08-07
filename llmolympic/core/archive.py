@@ -14,6 +14,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.providers.base import validate_route_id
 
 ARCHIVE_SCHEMA_VERSION = 2
 ArchiveSource = Literal["local_engine", "external", "legacy"]
@@ -210,9 +211,36 @@ class MatchArchive(BaseModel):
                 if set(judging.scores) - set(judging.fixed_scores) != accepted_players:
                     raise ValueError("创意裁决的送审作品与已接受提交不一致")
                 contestant_ids = {descriptor["entrant_id"] for descriptor in normalized}
-                judge_ids = {
-                    verdict.judge.judge_id for verdict in judging.verdicts
-                } | {failure.judge.judge_id for failure in judging.failures}
+                if judging.schema_version == 2:
+                    # PanelVerdict v2 guarantees a complete snapshot even when
+                    # every contestant forfeits and no judge call is made.
+                    panel = judging.panel
+                    if panel is None:  # defensive narrowing; rejected by PanelVerdict
+                        raise ValueError("schema v2 创意档案缺少 panel 快照")
+                    judge_ids = {descriptor.judge_id for descriptor in panel}
+                    contestant_routes: set[str] = set()
+                    for descriptor in normalized:
+                        if descriptor.get("kind") != "llm":
+                            continue
+                        try:
+                            contestant_routes.add(
+                                validate_route_id(descriptor.get("route_id"))
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                "schema v2 创意档案缺少有效的参赛者路由身份"
+                            ) from exc
+                    judge_routes = {
+                        descriptor.route_id for descriptor in panel
+                    }
+                    if contestant_routes & judge_routes:
+                        raise ValueError("创意档案中的参赛者路由不能同时担任评委")
+                else:
+                    # Historical v1 verdicts had neither a full panel snapshot
+                    # nor route fingerprints. Preserve their entrant-only audit.
+                    judge_ids = {
+                        verdict.judge.judge_id for verdict in judging.verdicts
+                    } | {failure.judge.judge_id for failure in judging.failures}
                 if contestant_ids & judge_ids:
                     raise ValueError("创意档案中的参赛者不能同时担任评委")
                 started_events = [

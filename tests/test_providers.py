@@ -11,7 +11,13 @@ from openai import APITimeoutError
 
 from llmolympic.config import ProviderProfile
 from llmolympic.providers import create_profile_provider
-from llmolympic.providers.base import ProviderConfigurationError, ProviderTimeoutError
+from llmolympic.providers.base import (
+    Provider,
+    ProviderConfigurationError,
+    ProviderTimeoutError,
+    validate_route_id,
+)
+from llmolympic.providers.mock import MockProvider
 from llmolympic.providers.ollama_provider import OllamaProvider
 from llmolympic.providers.openai_provider import OpenAIProvider
 
@@ -34,6 +40,18 @@ class _OpenAIClient:
     def with_options(self, **options):
         self.options = options
         return self
+
+
+class _FallbackRouteProvider(Provider):
+    name = "fallback"
+
+    def __init__(self, *, name: str, api_key: str, base_url: str) -> None:
+        self.name = name
+        self.api_key = api_key
+        self.base_url = base_url
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        return "ok"
 
 
 def _openai_provider(*, async_client: bool = False) -> tuple[OpenAIProvider, _OpenAIClient]:
@@ -86,6 +104,38 @@ def test_ollama_requests_have_a_default_output_token_budget() -> None:
 
     assert default["options"]["num_predict"] == 1024
     assert explicit["options"]["num_predict"] == 64
+
+
+def test_default_route_identity_is_stable_without_inspecting_instance_attributes() -> None:
+    first = _FallbackRouteProvider(
+        name="first",
+        api_key="first-sensitive-key",
+        base_url="https://first-sensitive.example/v1",
+    )
+    second = _FallbackRouteProvider(
+        name="second",
+        api_key="second-sensitive-key",
+        base_url="https://second-sensitive.example/v1",
+    )
+
+    first_route = first.route_id_for("exact-model")
+    second_route = second.route_id_for("exact-model")
+
+    assert validate_route_id(first_route) == first_route
+    assert first_route == second_route
+    assert first.route_id_for("other-model") != first_route
+    assert "sensitive" not in first_route
+
+
+def test_mock_route_identity_uses_strategy_and_ignores_model_and_seed() -> None:
+    fixed = MockProvider("fixed", seed=1)
+    fixed_relabelled = MockProvider("fixed", seed=999)
+    random = MockProvider("random", seed=1)
+
+    assert fixed.route_id_for("fake-model-a") == fixed_relabelled.route_id_for(
+        "fake-model-b"
+    )
+    assert fixed.route_id_for("anything") != random.route_id_for("anything")
 
 
 def test_ollama_sync_timeout_is_converted_to_stable_provider_error(monkeypatch) -> None:
@@ -194,6 +244,115 @@ def test_openai_profile_without_base_url_does_not_inherit_global_endpoint(monkey
     assert provider.profile_id == "official"
     assert str(provider._client.base_url) == "https://api.openai.com/v1/"
     assert "attacker.example" not in str(provider._client.base_url)
+
+
+def test_openai_route_identity_matches_direct_and_profile_canonical_endpoint() -> None:
+    direct = OpenAIProvider(
+        api_key="direct-sensitive-key",
+        base_url="HTTPS://API.OPENAI.COM:443/v1///",
+    )
+    profile = OpenAIProvider(
+        api_key="profile-sensitive-key",
+        base_url="https://api.openai.com/v1",
+        profile_id="official-profile",
+        use_legacy_config=False,
+    )
+    renamed_profile = OpenAIProvider(
+        api_key="rotated-sensitive-key",
+        base_url="https://API.OPENAI.COM:443/v1/",
+        profile_id="renamed-profile",
+        use_legacy_config=False,
+    )
+
+    route_id = direct.route_id_for("gpt-test")
+
+    assert route_id == profile.route_id_for("gpt-test")
+    assert route_id == renamed_profile.route_id_for("gpt-test")
+    assert route_id != direct.route_id_for("gpt-test-2")
+    assert route_id != OpenAIProvider(
+        api_key="direct-sensitive-key",
+        base_url="https://gateway.example/v1",
+    ).route_id_for("gpt-test")
+    assert "api.openai.com" not in route_id
+    assert "sensitive-key" not in route_id
+
+
+def test_openai_official_defaults_share_route_across_direct_and_profile(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "llmolympic.providers.openai_provider.cfg_get",
+        lambda *args, **kwargs: None,
+    )
+    direct = OpenAIProvider(api_key="direct-key")
+    profile = OpenAIProvider(
+        api_key="profile-key",
+        profile_id="official",
+        use_legacy_config=False,
+    )
+
+    assert direct.route_id_for("gpt-test") == profile.route_id_for("gpt-test")
+
+
+def test_endpoint_route_identity_normalizes_ollama_spelling_but_not_protocol() -> None:
+    upper = OllamaProvider(
+        "HTTP://LOCALHOST:80/api///",
+        profile_id="upper",
+        use_legacy_config=False,
+    )
+    lower = OllamaProvider(
+        "http://localhost/api",
+        profile_id="lower",
+        use_legacy_config=False,
+    )
+    openai_compatible = OpenAIProvider(
+        api_key="test-key",
+        base_url="http://localhost:80/api",
+    )
+
+    assert upper.route_id_for("exact-model") == lower.route_id_for("exact-model")
+    assert upper.route_id_for("exact-model") != lower.route_id_for("other-model")
+    assert upper.route_id_for("exact-model") != openai_compatible.route_id_for(
+        "exact-model"
+    )
+
+
+def test_endpoint_route_identity_canonicalizes_ip_literals_without_dns_resolution() -> None:
+    expanded_ipv6 = OllamaProvider("http://[0:0:0:0:0:0:0:1]:80/api/")
+    compressed_ipv6 = OllamaProvider("http://[::1]/api")
+    localhost = OllamaProvider("http://localhost/api")
+    ipv4_loopback = OllamaProvider("http://127.0.0.1/api")
+    case_sensitive_path = OllamaProvider("http://localhost/API")
+
+    assert expanded_ipv6.route_id_for("model") == compressed_ipv6.route_id_for("model")
+    assert localhost.route_id_for("model") != ipv4_loopback.route_id_for("model")
+    assert localhost.route_id_for("model") != case_sensitive_path.route_id_for("model")
+
+
+def test_endpoint_route_identity_canonicalizes_idna_and_dns_root_dot() -> None:
+    unicode_host = OllamaProvider("http://BÜCHER.example/api")
+    ascii_host = OllamaProvider("http://xn--bcher-kva.example/api")
+    idna_2008_host = OllamaProvider("http://faß.de/api")
+    idna_2008_ascii = OllamaProvider("http://xn--fa-hia.de/api")
+    rooted_host = OllamaProvider("http://EXAMPLE.com./api")
+    unicode_rooted_host = OllamaProvider("http://example.com。/api")
+    plain_host = OllamaProvider("http://example.com/api")
+
+    assert unicode_host.route_id_for("model") == ascii_host.route_id_for("model")
+    assert idna_2008_host.route_id_for("model") == idna_2008_ascii.route_id_for("model")
+    assert rooted_host.route_id_for("model") == plain_host.route_id_for("model")
+    assert unicode_rooted_host.route_id_for("model") == plain_host.route_id_for("model")
+
+
+def test_endpoint_route_identity_canonicalizes_utf8_and_percent_encoded_paths() -> None:
+    unicode_path = OllamaProvider("http://localhost/café/v1")
+    encoded_path = OllamaProvider("http://localhost/caf%C3%A9/v1")
+    lowercase_escape = OllamaProvider("http://localhost/caf%c3%a9/v1")
+    literal_unreserved = OllamaProvider("http://localhost/a~b/v1")
+    encoded_unreserved = OllamaProvider("http://localhost/a%7eb/v1")
+
+    assert unicode_path.route_id_for("model") == encoded_path.route_id_for("model")
+    assert unicode_path.route_id_for("model") == lowercase_escape.route_id_for("model")
+    assert literal_unreserved.route_id_for("model") == encoded_unreserved.route_id_for("model")
 
 
 @pytest.mark.parametrize(
@@ -394,6 +553,13 @@ def test_ollama_profile_uses_its_endpoint_and_exposes_profile_id() -> None:
         "https://user:password@example.test/v1",
         "https://example.test/v1?api_key=query-secret",
         "https://example.test/v1#credential-fragment",
+        "https://example.test/v1/\x00hidden",
+        "https://example.test/v1/\u202ehidden",
+        "https://example.test/v1/../chat",
+        "https://example.test/v1/%2e%2e/chat",
+        "https://example.test/v1/%2Fchat",
+        "https://example.test/v1/%5cchat",
+        "https://example.test:99999/v1",
     ],
 )
 def test_profile_provider_rejects_invalid_or_credential_bearing_url(

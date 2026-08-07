@@ -13,6 +13,11 @@
 - 评审协议严格拒绝缺失/额外字段、布尔值、NaN、Infinity、越界分数和超长理由；作品按
   不可信数据隔离，评委题面不包含参赛者或模型身份。档案只保存安全白名单评委描述、匿名
   映射、逐维裁决与可重算聚合，不保存原始响应、凭据或端点。
+- 新增与 `entrant_id` / ELO 分离的 Provider `route_id`：同一规范化端点和模型不能通过
+  direct/Profile、Key、名称或采样参数变化重复担任评委或规避自评。`PanelVerdict` 升至
+  schema v2 并冻结完整评审团；旧 v1 裁决保持可读，MatchArchive v2 与 SQLite schema v7
+  均不变。路由摘要不保存原始端点，但它可关联且可能被字典猜测，不作为保密或远端模型
+  真实性证明。
 - 创意裁决继续使用 SQLite schema v7，在 `match_finished.data.judging` 中持久化，并复用
   现有双人总榜和分项目 ELO。`play.command` 新增完全离线的创意写作 + 三算法评委入口。
 - 新增手动触发的 `Live Provider Smoke` GitHub Actions 工作流：使用受 Environment 保护的

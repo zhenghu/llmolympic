@@ -13,6 +13,8 @@ from llmolympic.providers.base import (
     Provider,
     ProviderConfigurationError,
     ProviderTimeoutError,
+    _endpoint_fingerprint,
+    _stable_route_id,
     validate_base_url,
 )
 
@@ -100,6 +102,7 @@ class OpenAIProvider(Provider):
             require_https_for_remote=True,
         )
         self.profile_id = profile_id
+        self._route_endpoint_fingerprint = _endpoint_fingerprint(resolved_base_url)
         # Profiles always bind a key to one isolated endpoint. Preserve the
         # documented legacy SDK behavior for the exact official endpoint, but
         # never forward ambient OpenAI organization, project, admin, webhook,
@@ -128,6 +131,13 @@ class OpenAIProvider(Provider):
             # OPENAI_CUSTOM_HEADERS, so scrub each real client too.
             self._client = _isolate_client(self._client)
             self._async_client = _isolate_client(self._async_client)
+
+    def route_id_for(self, model: str) -> str:
+        return _stable_route_id(
+            family="openai-chat-completions-v1",
+            target=self._route_endpoint_fingerprint,
+            model=model,
+        )
 
     @classmethod
     def _completion_params(cls, params: dict, *, model: str) -> dict:

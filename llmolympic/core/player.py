@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from llmolympic.core.archive import validate_entrant_id
-from llmolympic.providers.base import Provider, ProviderTimeoutError
+from llmolympic.providers.base import Provider, ProviderTimeoutError, validate_route_id
 
 SYSTEM_PROMPT = (
     "你是 LLM Olympics 的一名参赛选手。请仔细阅读题面，"
@@ -268,6 +268,19 @@ def _provider_profile_id(provider: object) -> str | None:
     return value if isinstance(value, str) and _SAFE_PROFILE_ID.fullmatch(value) else None
 
 
+def _provider_route_id(provider: object, model: str) -> str:
+    route_id_for = getattr(provider, "route_id_for", None)
+    if route_id_for is None:
+        # Preserve the documented chat-only duck-provider compatibility while
+        # giving it the same conservative, attribute-free fallback identity.
+        route_id = Provider.route_id_for(provider, model)  # type: ignore[arg-type]
+    elif callable(route_id_for):
+        route_id = route_id_for(model)
+    else:
+        raise ValueError("Provider route_id_for 必须是可调用方法")
+    return validate_route_id(route_id)
+
+
 def profile_entrant_id(profile_id: str, model: str) -> str:
     """Return the documented stable identity for one Profile/model pair."""
 
@@ -363,6 +376,7 @@ class LLMPlayer(Player):
         **sampling_params,
     ) -> None:
         profile_id = _provider_profile_id(provider)
+        route_id = _provider_route_id(provider, model)
         sampling_identity = _canonical_sampling_identity(sampling_params)
         generated_entrant_id = (
             profile_entrant_id(profile_id, model)
@@ -407,9 +421,20 @@ class LLMPlayer(Player):
         self.provider = provider
         self.model = model
         self.profile_id = profile_id
+        self._route_id = route_id
+        self._include_route_id_in_description = True
         self.move_timeout_seconds = move_timeout_seconds
         self.max_response_chars = max_response_chars
         self.sampling_params = sampling_params
+
+    @property
+    def route_id(self) -> str:
+        return self._route_id
+
+    def _use_legacy_route_description(self) -> None:
+        """Keep old tournament checkpoint descriptors stable during resume."""
+
+        self._include_route_id_in_description = False
 
     async def complete(self, prompt: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
         """调用底层模型并执行与参赛走法相同的超时、错误和大小隔离。"""
@@ -508,6 +533,8 @@ class LLMPlayer(Player):
             "sampling_params": _archive_sampling_params(self.sampling_params),
             "max_response_chars": self.max_response_chars,
         }
+        if self._include_route_id_in_description:
+            description["route_id"] = self.route_id
         if self.profile_id is not None:
             description["profile_id"] = self.profile_id
         if self.move_timeout_seconds is not None:

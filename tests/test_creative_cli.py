@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
 from rich.text import Text
 from typer.testing import CliRunner
 
+from llmolympic import config
 from llmolympic.cli.main import app
 from llmolympic.core.storage import SQLiteStore
+from llmolympic.providers.openai_provider import OpenAIProvider
 
 runner = CliRunner()
 
@@ -33,6 +38,37 @@ def _creative_args(path) -> list[str]:
         "--db",
         str(path),
     ]
+
+
+def _configure_same_route_profiles(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        """
+[profiles.contestant]
+provider = "openai"
+default_model = "shared-model"
+base_url = "https://shared-gateway.example/v1"
+api_key_env = "CREATIVE_ROUTE_TEST_KEY"
+
+[profiles.judge_a]
+provider = "openai"
+default_model = "shared-model"
+base_url = "https://shared-gateway.example/v1/"
+api_key_env = "CREATIVE_ROUTE_TEST_KEY"
+
+[profiles.judge_b]
+provider = "openai"
+default_model = "shared-model"
+base_url = "https://SHARED-GATEWAY.EXAMPLE:443/v1"
+api_key_env = "CREATIVE_ROUTE_TEST_KEY"
+""",
+        encoding="utf-8",
+    )
+    if os.name == "posix":
+        config_path.chmod(0o600)
+    monkeypatch.setenv("LLMOLYMPIC_CONFIG", str(config_path))
+    monkeypatch.setenv("CREATIVE_ROUTE_TEST_KEY", "must-not-appear-in-output")
+    config.load_config.cache_clear()
 
 
 def test_creative_play_renders_judging_and_persists(tmp_path) -> None:
@@ -108,6 +144,92 @@ def test_creative_rejects_self_judging_before_database_is_opened(tmp_path) -> No
 
     assert result.exit_code == 2
     assert "不能同时担任参赛者和评委" in output
+    assert not path.exists()
+
+
+def test_creative_rejects_duplicate_profile_routes_before_database_or_network(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "duplicate-route-must-not-exist.db"
+    _configure_same_route_profiles(monkeypatch, tmp_path)
+    calls = 0
+
+    async def unexpected_call(self, messages, *, model, **params):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("route gate must run before provider calls")
+
+    monkeypatch.setattr(OpenAIProvider, "achat", unexpected_call)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "play",
+                "--game",
+                "creative_writing",
+                "--players",
+                "mock:random,mock:fixed",
+                "--judge",
+                "profile:judge_a",
+                "--judge",
+                "profile:judge_b",
+                "--judge",
+                "mock:strict",
+                "--db",
+                str(path),
+            ],
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    output = _plain(result.output)
+    assert result.exit_code == 2
+    assert "评委路由身份必须唯一" in output
+    assert "must-not-appear-in-output" not in output
+    assert calls == 0
+    assert not path.exists()
+
+
+def test_creative_rejects_profile_route_self_judging_before_database_or_network(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "self-route-must-not-exist.db"
+    _configure_same_route_profiles(monkeypatch, tmp_path)
+    calls = 0
+
+    async def unexpected_call(self, messages, *, model, **params):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("self-route gate must run before provider calls")
+
+    monkeypatch.setattr(OpenAIProvider, "achat", unexpected_call)
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "play",
+                "--game",
+                "creative_writing",
+                "--players",
+                "profile:contestant,mock:fixed",
+                "--judge",
+                "profile:judge_a",
+                "--judge",
+                "mock:strict",
+                "--judge",
+                "mock:lenient",
+                "--db",
+                str(path),
+            ],
+        )
+    finally:
+        config.load_config.cache_clear()
+
+    output = _plain(result.output)
+    assert result.exit_code == 2
+    assert "同一模型路由不能同时担任参赛者和评委" in output
+    assert "must-not-appear-in-output" not in output
+    assert calls == 0
     assert not path.exists()
 
 

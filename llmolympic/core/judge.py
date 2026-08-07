@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from llmolympic.core.player import LLMPlayer, Player
+from llmolympic.providers.base import validate_route_id
 
 MIN_JUDGES = 3
 MAX_JUDGES = 9
@@ -114,6 +115,7 @@ class JudgeDescriptor(BaseModel):
     model: str = Field(min_length=1, max_length=256)
     profile_id: str | None = Field(default=None, max_length=64)
     timeout_seconds: float | None = None
+    route_id: str | None = None
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -121,6 +123,13 @@ class JudgeDescriptor(BaseModel):
         if value is not None and (not math.isfinite(value) or value <= 0):
             raise ValueError("评委超时必须是大于 0 的有限数字")
         return value
+
+    @field_validator("route_id")
+    @classmethod
+    def _validate_route_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_route_id(value)
 
 
 class JudgeVerdict(BaseModel):
@@ -183,13 +192,17 @@ class PanelVerdict(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal[1] = 1
+    # Missing schema_version remains on the historical v1 path. The engine
+    # always writes v2 explicitly so old archives without panel/route data stay
+    # readable instead of being silently reinterpreted as trusted v2 records.
+    schema_version: Literal[1, 2] = 1
     rubric_version: str = Field(min_length=1, max_length=64)
     criteria: dict[str, float]
     aggregation: str = "weighted-median-v1"
     panel_size: int = Field(ge=MIN_JUDGES, le=MAX_JUDGES)
     quorum: int = Field(ge=1, le=MAX_JUDGES)
     successful_judges: int = Field(ge=0, le=MAX_JUDGES)
+    panel: list[JudgeDescriptor] | None = None
     fixed_scores: dict[str, float] = Field(default_factory=dict)
     scores: dict[str, float]
     verdicts: list[JudgeVerdict]
@@ -210,6 +223,25 @@ class PanelVerdict(BaseModel):
         judge_ids.extend(failure.judge.judge_id for failure in self.failures)
         if len(judge_ids) != len(set(judge_ids)):
             raise ValueError("评审结果包含重复评委")
+
+        actual_descriptors = [verdict.judge for verdict in self.verdicts]
+        actual_descriptors.extend(failure.judge for failure in self.failures)
+        if self.schema_version == 1:
+            if self.panel is not None or any(
+                descriptor.route_id is not None for descriptor in actual_descriptors
+            ):
+                raise ValueError("schema v1 裁决不能声明 v2 panel 路由快照")
+        else:
+            if self.panel is None or len(self.panel) != self.panel_size:
+                raise ValueError("schema v2 panel 快照必须覆盖整个评审团")
+            panel_ids = [descriptor.judge_id for descriptor in self.panel]
+            if len(panel_ids) != len(set(panel_ids)):
+                raise ValueError("schema v2 panel 快照包含重复评委身份")
+            if any(descriptor.route_id is None for descriptor in self.panel):
+                raise ValueError("schema v2 panel 快照缺少评委路由身份")
+            panel_routes = [descriptor.route_id for descriptor in self.panel]
+            if len(panel_routes) != len(set(panel_routes)):
+                raise ValueError("schema v2 panel 快照包含重复评委路由")
         if self.aggregation == "fixed-scores-v1":
             if self.verdicts or self.failures or self.successful_judges:
                 raise ValueError("全固定分裁决不能包含评委输出")
@@ -218,6 +250,16 @@ class PanelVerdict(BaseModel):
             return self
         if len(self.verdicts) + len(self.failures) != self.panel_size:
             raise ValueError("评委成功与失败记录未覆盖整个评审团")
+        if self.schema_version == 2:
+            panel = self.panel
+            if panel is None:  # defensive narrowing; rejected above
+                raise ValueError("schema v2 panel 快照必须覆盖整个评审团")
+            panel_by_id = {descriptor.judge_id: descriptor for descriptor in panel}
+            actual_by_id = {
+                descriptor.judge_id: descriptor for descriptor in actual_descriptors
+            }
+            if panel_by_id != actual_by_id:
+                raise ValueError("评委成功与失败记录必须精确匹配 panel 快照")
         if self.successful_judges < self.quorum:
             raise ValueError("有效评委未达到法定人数")
         if self.aggregation != "weighted-median-v1":
@@ -252,6 +294,7 @@ def _safe_judge_descriptor(judge: LLMPlayer) -> JudgeDescriptor:
         model=judge.model,
         profile_id=judge.profile_id,
         timeout_seconds=judge.move_timeout_seconds,
+        route_id=judge.route_id,
     )
 
 
@@ -407,6 +450,9 @@ class LLMJudgePanel:
         judge_ids = [judge.entrant_id for judge in judges]
         if len(set(judge_ids)) != len(judge_ids):
             raise ValueError("评委稳定身份必须唯一")
+        judge_routes = [judge.route_id for judge in judges]
+        if len(set(judge_routes)) != len(judge_routes):
+            raise ValueError("评委路由身份必须唯一")
         self.judges = tuple(judges)
         self.quorum = len(judges) // 2 + 1
 
@@ -415,18 +461,29 @@ class LLMJudgePanel:
         overlap = contestant_ids & {judge.entrant_id for judge in self.judges}
         if overlap:
             raise ValueError("同一稳定身份不能同时担任参赛者和评委")
+        contestant_routes = {
+            contestant.route_id
+            for contestant in contestants
+            if isinstance(contestant, LLMPlayer)
+        }
+        if contestant_routes & {judge.route_id for judge in self.judges}:
+            raise ValueError("同一模型路由不能同时担任参赛者和评委")
 
     async def adjudicate(self, request: JudgingRequest, *, seed: int) -> PanelVerdict:
         """并发完成独立盲评并按评委完整交集形成多数裁决。"""
 
+        panel = [_safe_judge_descriptor(judge) for judge in self.judges]
+
         if not request.submissions:
             return PanelVerdict(
+                schema_version=2,
                 rubric_version=request.rubric_version,
                 criteria=request.criteria,
                 aggregation="fixed-scores-v1",
                 panel_size=len(self.judges),
                 quorum=self.quorum,
                 successful_judges=0,
+                panel=panel,
                 fixed_scores=request.fixed_scores,
                 scores=request.fixed_scores,
                 verdicts=[],
@@ -476,7 +533,7 @@ class LLMJudgePanel:
         verdicts: list[JudgeVerdict] = []
         failures: list[JudgeFailure] = []
         for index, judge in enumerate(self.judges):
-            descriptor = _safe_judge_descriptor(judge)
+            descriptor = panel[index]
             if errors[index] or len(by_judge[index]) != len(players):
                 error = errors[index][0] if errors[index] else JudgePanelError("incomplete")
                 failures.append(
@@ -513,11 +570,13 @@ class LLMJudgePanel:
         )
 
         return PanelVerdict(
+            schema_version=2,
             rubric_version=request.rubric_version,
             criteria=request.criteria,
             panel_size=len(self.judges),
             quorum=self.quorum,
             successful_judges=len(verdicts),
+            panel=panel,
             fixed_scores=request.fixed_scores,
             scores=scores,
             verdicts=verdicts,

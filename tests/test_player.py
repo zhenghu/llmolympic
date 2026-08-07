@@ -92,6 +92,11 @@ class _ProfileAsyncProvider(_ResponseAsyncProvider):
     profile_id = "stable-profile"
 
 
+class _InvalidRouteProvider(_ResponseAsyncProvider):
+    def route_id_for(self, model: str) -> str:
+        return "unsafe-route"
+
+
 def test_native_async_provider_is_cancelled_at_llm_move_timeout() -> None:
     provider = _SlowAsyncProvider()
     player = LLMPlayer(
@@ -144,6 +149,7 @@ def test_chat_only_duck_provider_remains_available_without_hard_timeout() -> Non
     )
 
     assert asyncio.run(player.get_move("prompt")) == "B"
+    assert player.route_id.startswith("route:v1:")
 
 
 def test_legacy_sync_provider_cannot_claim_reliable_hard_timeout() -> None:
@@ -183,6 +189,11 @@ def test_reserved_provider_request_timeout_is_rejected_before_match() -> None:
             "model",
             request_timeout=1.0,
         )
+
+
+def test_provider_route_identity_must_use_the_strict_opaque_format() -> None:
+    with pytest.raises(ValueError, match="route_id"):
+        LLMPlayer("invalid-route", _InvalidRouteProvider("A"), "model")
 
 
 def test_llm_response_limit_is_recorded_but_not_sent_to_provider() -> None:
@@ -311,10 +322,34 @@ def test_direct_llm_identity_is_stable_order_independent_and_disambiguates_name(
         seed=8,
         temperature=0.2,
     )
+    other_model = LLMPlayer(
+        "first",
+        _ResponseAsyncProvider("A"),
+        "other-model",
+        seed=7,
+        temperature=0.2,
+    )
 
     assert first.entrant_id == reordered.entrant_id
     assert first.entrant_id != renamed.entrant_id
     assert first.entrant_id != resampled.entrant_id
+    assert first.route_id == reordered.route_id == renamed.route_id == resampled.route_id
+    assert first.route_id != other_model.route_id
+
+
+def test_llm_route_identity_is_readonly_and_legacy_description_switch_is_one_way() -> None:
+    player = LLMPlayer("player", _ResponseAsyncProvider("A"), "model")
+    route_id = player.route_id
+
+    assert len(route_id) == len("route:v1:") + 64
+    assert player.describe()["route_id"] == route_id
+    with pytest.raises(AttributeError):
+        player.route_id = "route:v1:" + "0" * 64  # type: ignore[misc]
+
+    player._use_legacy_route_description()
+
+    assert player.route_id == route_id
+    assert "route_id" not in player.describe()
 
 
 def test_profile_llm_identity_uses_documented_profile_and_model_key() -> None:
@@ -342,6 +377,8 @@ def test_profile_llm_identity_uses_documented_profile_and_model_key() -> None:
 
     assert first.entrant_id == renamed.entrant_id == resampled.entrant_id
     assert first.entrant_id == "profile:stable-profile:model"
+    assert first.route_id == renamed.route_id == resampled.route_id
+    assert first.describe()["route_id"] == first.route_id
     assert first.describe()["profile_id"] == "stable-profile"
 
 
