@@ -15,16 +15,37 @@
   映射、逐维裁决与可重算聚合，不保存原始响应、凭据或端点。
 - 新增与 `entrant_id` / ELO 分离的 Provider `route_id`：同一规范化端点和模型不能通过
   direct/Profile、Key、名称或采样参数变化重复担任评委或规避自评。`PanelVerdict` 升至
-  schema v2 并冻结完整评审团；旧 v1 裁决保持可读，MatchArchive v2 与 SQLite schema v7
-  均不变。路由摘要不保存原始端点，但它可关联且可能被字典猜测，不作为保密或远端模型
-  真实性证明。
-- 创意裁决继续使用 SQLite schema v7，在 `match_finished.data.judging` 中持久化，并复用
+  schema v2 并冻结完整评审团；旧 v1 裁决保持可读，MatchArchive v2 不变。路由摘要不保存
+  原始端点，但它可关联且可能被字典猜测，不作为保密或远端模型真实性证明。
+- 创意裁决使用当前 SQLite schema v8，在 `match_finished.data.judging` 中持久化，并复用
   现有双人总榜和分项目 ELO。`play.command` 新增完全离线的创意写作 + 三算法评委入口。
 - 新增手动触发的 `Live Provider Smoke` GitHub Actions 工作流：使用受 Environment 保护的
   OpenRouter Secret，按顺序从 3–9 个候选中探针选出最先通过严格评审协议的三个模型，再以
   两名 mock 参赛者执行固定 6 次正式评审请求。单次运行最多 15 次可能计费调用，正式阶段仍
   要求三个 Provider 路由全部成功；它不阻塞 PR。CI 与 Release 的 wheel/sdist 隔离安装也
   新增零费用三 mock 评委冒烟。
+- `play`、`series` 与 `round-robin` 新增五项 Provider 硬预算：调用总数、累计 input、
+  单次 output cap、累计 output 和本地预估美元。对应 CLI 为 `--max-provider-calls`、
+  `--max-input-tokens`、`--max-output-tokens-per-call`、`--max-total-output-tokens` 与
+  `--max-estimated-cost-usd`；每项独立按 CLI > `LLMOLYMPIC_*` 环境变量 > `[budget]` >
+  默认值解析。
+- 每批并发模型/算法调用会在创建 task 前原子预留；预算不足时不发出任何部分请求。调用包含
+  重试和创意评委请求，input 以规范 messages JSON 的 UTF-8 字节数保守预留，output 以实际
+  下发 cap 预留。缺失/非法 usage、异常、超时及 dispatch 后取消都按完整上界计费；仅明确
+  未 dispatch 的取消会释放预留。`UsageError` 直接中止，不记技术负、不保存部分结果或 ELO。
+- 费用配置只接受 `Decimal` 十进制字符串并以整数纳美元记账：上限向下取整，精确 spec 的
+  USD/百万 Token 价格和每次调用估价向上取整。OpenAI 与 Provider Profiles 作为云端 LLM
+  必须显式冻结准确价格；Ollama 是本地 LLM、mock 是算法，两者未显式给价时按零估价。该美元
+  数值只是本地估算，不能替代 Provider 账户或网关的真实费用限额。
+- SQLite schema 升至 v8，新增 credential/content-free 的 `provider_budgets` 与
+  `provider_call_attempts`。`round-robin` 将 checkpoint 与冻结 policy 原子创建，使用同一
+  runner lease generation 保护 reserve/dispatch/settle；takeover 释放旧未调度预留，并把旧
+  已调度未知调用按完整上界计费。恢复拒绝预算 CLI，忽略当前预算 env/config，只使用 SQLite
+  冻结值；旧无预算 checkpoint 保持兼容且不会被追溯加预算。
+- `play` 的参赛者与创意评委、`series` 的两局分别共享整次内存预算；循环赛预算跨进程持续且
+  封存后不可再用。`--allow-large-tournament` 只跳过静态规模确认，不能绕过硬预算。预算表不
+  保存 Key、原始端点、请求头、模型名、prompt、response 或 Provider 原始异常；只保存 opaque
+  route、整数 policy/计数、状态、时间和 lease generation。
 
 ## [0.3.0] - 2026-08-06
 

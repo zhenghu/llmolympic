@@ -9,6 +9,8 @@ import json
 import re
 import unicodedata
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import unquote, urlsplit
 
 import idna
@@ -195,6 +197,53 @@ class ProviderTimeoutError(TimeoutError):
     """Provider 的原生异步请求超过调用方给定的截止时间。"""
 
 
+class UsageSupport(StrEnum):
+    """How reliably one Provider can account for model token usage."""
+
+    NONE = "none"
+    REPORTED = "reported"
+    EXACT_ZERO = "exact_zero"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUsage:
+    """Strict, provider-reported token counts for one completed call."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+    def __post_init__(self) -> None:
+        for field_name in ("input_tokens", "output_tokens", "total_tokens"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} 必须是非负整数")
+            if value < 0:
+                raise ValueError(f"{field_name} 必须是非负整数")
+        if self.total_tokens != self.input_tokens + self.output_tokens:
+            raise ValueError("total_tokens 必须等于 input_tokens + output_tokens")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderChatResult:
+    """Text plus optional accounting metadata from one Provider call.
+
+    ``text`` intentionally remains validated by ``LLMPlayer`` so legacy
+    adapters that accidentally return a non-string keep the existing stable
+    player error instead of failing at a new compatibility boundary.
+    """
+
+    text: str
+    usage: ProviderUsage | None = None
+    finish_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.usage is not None and not isinstance(self.usage, ProviderUsage):
+            raise TypeError("usage 必须是 ProviderUsage 或 None")
+        if self.finish_reason is not None and not isinstance(self.finish_reason, str):
+            raise TypeError("finish_reason 必须是字符串或 None")
+
+
 class Provider(ABC):
     """把各家模型 API 统一成同步与异步 chat 调用。
 
@@ -206,6 +255,24 @@ class Provider(ABC):
     # 命名 Profile 实例会设置这个安全标识；永远不在 Provider
     # 对象上暴露 Profile 解析出的 API Key。
     profile_id: str | None = None
+
+    def usage_support_for(self, model: str) -> UsageSupport:
+        """Return the adapter's accounting capability without probing it."""
+
+        del model
+        return UsageSupport.NONE
+
+    def resolve_output_token_cap(
+        self,
+        model: str,
+        *,
+        requested_cap: int | None,
+        params: dict[str, object],
+    ) -> int | None:
+        """Return the output bound this adapter can provably send, if any."""
+
+        del model, requested_cap, params
+        return None
 
     def route_id_for(self, model: str) -> str:
         """Return a stable route identity without inspecting instance secrets.
@@ -235,6 +302,32 @@ class Provider(ABC):
     ) -> str:
         """同步发送消息；``request_timeout`` 是网络请求限时。"""
 
+    def chat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        """Compatibility wrapper for synchronous adapters without usage metadata."""
+
+        if output_token_cap is not None:
+            raise ProviderConfigurationError(
+                f"Provider {self.name!r} 不支持可验证的输出 Token 上限"
+            )
+        call_params = dict(params)
+        if request_timeout is not None:
+            call_params["request_timeout"] = request_timeout
+        return ProviderChatResult(
+            text=self.chat(
+                messages,
+                model=model,
+                **call_params,
+            )
+        )
+
     async def achat(
         self,
         messages: list[dict],
@@ -252,4 +345,30 @@ class Provider(ABC):
             messages,
             model=model,
             **call_params,
+        )
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        """Compatibility wrapper for asynchronous adapters without usage metadata."""
+
+        if output_token_cap is not None:
+            raise ProviderConfigurationError(
+                f"Provider {self.name!r} 不支持可验证的输出 Token 上限"
+            )
+        call_params = dict(params)
+        if request_timeout is not None:
+            call_params["request_timeout"] = request_timeout
+        return ProviderChatResult(
+            text=await self.achat(
+                messages,
+                model=model,
+                **call_params,
+            )
         )

@@ -12,6 +12,7 @@
 | **Match**（对局） | 通用回合循环：发题面 → 收走法 → 校验推进 → 判分 |
 | **Judge**（裁判） | 客观项目由 Game 规则判分；创意项目由匿名、多评委 `LLMJudgePanel` 异步裁决 |
 | **Rating**（评分） | 标准 ELO（K=32），分项目 + 总榜，SQLite 持久化 |
+| **Usage Budget**（用量预算） | Provider 调用前原子预留，按可信 usage 结算；支持内存和 SQLite v8 账本 |
 
 ### 1.1 选手身份与 Provider Profile
 
@@ -40,11 +41,13 @@
   schema v1；三者的新档案均记录 `source`：引擎生成为 `local_engine`，外部构造
   为 `external`。只有旧 match/series schema v1（包括历史上省略版本号的 JSON）
   读入时标为 `legacy`；tournament schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 7`，以 `entrants`、`entrant_id` 和展示名快照
+- SQLite 使用 `PRAGMA user_version = 8`，以 `entrants`、`entrant_id` 和展示名快照
   持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v6
   数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表，v1–v6→v7 会按既有
   `rating_history` 写入顺序回填全局评分操作，并把历史 `matches` / `series_archives`
-  规范化为当前表结构且原样保留归档 JSON。所有升级失败时都回滚且不提升版本号。
+  规范化为当前表结构且原样保留归档 JSON；v7→v8 以 additive migration 新增 Provider
+  预算及无内容调用尝试账本。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
+  不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
   Profile 身份隔离，不能根据旧显示名猜测为新的模型身份。
@@ -60,7 +63,7 @@
 ### 1.3 严格只读赛事审计
 
 - `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
-  `integrity_check` 和当前 schema v7 结构 manifest 覆盖整个文件，业务语义深验则限定在
+  `integrity_check` 和当前 schema v8 结构 manifest 覆盖整个文件，业务语义深验则限定在
   目标赛事。manifest 通过 `table_xinfo` / `table_list` / `index_list` / `index_xinfo` /
   `foreign_key_list` 及 fail-closed SQL token 解析，完整核对列、PK、UNIQUE、CHECK、FK、
   显式索引、排序/排序规则、partial predicate、STRICT/WITHOUT ROWID 和额外对象；不依赖
@@ -92,6 +95,41 @@
   只实现同步 `chat()` 的旧适配器在线程中发出的单次请求仍可能无法立即取消。
 - v5→v6 升级前必须停止旧版 runner；已加载的 v5 代码没有 lease 写入校验，新版 schema
   无法反向为旧进程注入 fencing。
+
+### 1.4 Provider 用量与硬预算
+
+- 五个配置字段是 `max_provider_calls`、`max_input_tokens`、
+  `max_output_tokens_per_call`、`max_total_output_tokens` 和
+  `max_estimated_cost_usd`；每个字段独立按 CLI > `LLMOLYMPIC_*` 环境变量 >
+  `[budget]` > 默认值解析。总预算默认关闭，单次输出 cap 默认 1024 Token；改变 cap
+  本身也会启用预算执行。
+- 每个 Provider transport attempt 预留一次调用，包括非法输出重试和每份创意作品的独立
+  评审。input 上界是 system/user messages 以固定字段排序、无多余空白 JSON 序列化后的
+  UTF-8 字节数，保证不依赖供应商 tokenizer；output 上界是 Provider 能真正下发的 cap。
+  Provider 报告有效 usage 时按实际 input/output Token 结算。未报告或非法 usage、超时、
+  Provider 异常及 dispatch 后取消都按完整上界计费；只允许明确未 dispatch 的预留释放。
+- Match 同时作答和 Judge 独立盲评在创建任何 task 前调用共享账本的 `reserve_many()`。
+  整批调用、input、output 和估价先作一次原子校验；任一维度超限则整批不预留、不建 task、
+  不调用 Provider。报告值超过预留时记录 violation、毒化账本并禁止后续 dispatch，不能以
+  Provider 错误或技术负吞掉 `UsageError`。
+- 金额只用整数纳美元。CLI、环境变量、TOML 与 `[pricing]` 的金额先以 `Decimal` 读取；
+  USD 上限向下取整到纳美元，USD/百万 Token 价格向上取整到纳美元/百万 Token，每次调用
+  的 input + output 估价再向上取整到 1 纳美元。启用费用上限时，所有云端 route 必须按
+  精确 `openai:<model>` 或 `profile:<id>:<model>` spec 显式给价；同一 `route_id` 的冲突
+  价格和动态 OpenRouter 路由均 fail closed。OpenAI 与 Provider Profiles 是云端 LLM，
+  Ollama 是本地 LLM，mock 是算法，human 是外部人类；Ollama/mock 未显式给价时按零估价。
+- `play` 的参赛者和评委共享一个内存 `UsageBudget`；`series` 两局共享同一个内存账本。
+  `round-robin` 在创建 checkpoint 的同一事务中写入 SQLite v8 budget，冻结限额、output cap、
+  input-bound/cost-rounding 版本及 `route_id → price` policy。每次 reserve/dispatch/settle
+  都受 runner lease generation fencing；takeover 会释放旧 generation 的 reserved attempt，
+  并把 dispatched attempt 按完整上界记为 unknown，然后才允许新 runner 继续。
+- `round-robin --resume` 拒绝所有显式预算 CLI 选项，并只读取 SQLite 中的冻结 policy；当前
+  `[budget]`、`[pricing]` 及预算环境变量不会改变旧赛事。历史无预算 checkpoint 继续无预算
+  恢复。`--allow-large-tournament` 只跳过静态规模确认，绝不改变硬预算状态机或额度。
+- 账本只持久化 opaque `route_id`、整数 policy/限额/累计值、attempt 状态、时间和 lease
+  generation，不保存 API Key、Key 哈希、原始端点、请求头、模型名、prompt、response 或
+  Provider 原始异常。美元限额只是按本地冻结价格得到的估算，不能替代 Provider 账户、组织
+  或网关侧的真实支付限额。
 
 ## 2. 统一 Game 接口（核心设计）
 
@@ -135,8 +173,9 @@ class Game(Protocol):
 或模型身份；正文被视为不可信数据。`PanelVerdict` schema v2 冻结完整 `panel`，要求
 评委 ID 和 `route_id` 均唯一，正常裁决的成功/失败记录必须精确覆盖该快照；全固定分路径
 虽然不调用评委，也仍保留同一快照。旧 v1 裁决可兼容读取，但不具备已验证的路由独立性。
-嵌套裁决版本升级不改变 MatchArchive v2 或 SQLite schema v7。当前不支持创意双局赛或
-循环赛，避免在 checkpoint、恢复、费用估算与审计尚未冻结评委配置时产生不可复核赛事。
+嵌套裁决版本升级不改变 MatchArchive v2；当前 SQLite schema v8 另行承载 Provider
+预算账本。创意 `play` 的参赛者与评委已共享预算，但仍不支持创意双局赛或循环赛，避免在
+checkpoint、恢复与审计尚未冻结评委配置时产生不可复核赛事。
 
 持久化的 `route_id` 是对配置路由的稳定伪名，不包含 Key、请求头或原始端点，但常见端点
 仍可能被字典枚举，不能把它当作保密机制。规范化不会执行 DNS 查询，也不会合并 CNAME、
@@ -226,7 +265,7 @@ CLI（今天）          WebSocket（将来）
   较少技术负排名，完全同绩时按 `entrant_id` 确定展示顺序，并展示 ELO 净变化
   （已实现）。当前串行执行，每完成一组双局对阵就保存检查点；`--resume`
   跳过已完成 prefix，全部完成时才封存正式档案并更新一次 ELO。超过默认对局/
-  调用预算需显式使用 `--allow-large-tournament`。
+  调用规模阈值需显式使用 `--allow-large-tournament`；该确认不绕过 Provider 硬预算。
 - **锦标赛**：单场多题总分制（阶段四）。
 
 ## 7. 技术栈
@@ -253,7 +292,9 @@ CLI（今天）          WebSocket（将来）
    循环赛严格只读深度审计与恢复完成态校验 ✅；跨进程 runner lease、fencing 与
    SQLite v6 迁移 ✅；全局评分操作账本、确定性 ELO 重放与 SQLite v7 迁移 ✅。
 3. **创意 + LLM 评审团（进行中）**：双人创意写作与单场 CLI ✅；逐作品匿名盲评、
-   3–9 名评委多数 quorum、严格 JSON 与加权中位数聚合 ✅；SQLite v7 档案与双人 ELO ✅；
-   评委配置的系列赛/循环赛 checkpoint、恢复、费用估算及深度审计待完成。
+   3–9 名评委多数 quorum、严格 JSON 与加权中位数聚合 ✅；双人档案与 ELO ✅；
+   Provider 硬预算与创意 `play` 参赛者/评委共享预算 ✅；客观项目 `round-robin` 的
+   SQLite v8 跨进程预算账本 ✅；评委配置的创意系列赛/循环赛 checkpoint、恢复及深度审计
+   仍待完成，尚未开放创意 `series`。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。

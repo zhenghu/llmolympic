@@ -127,6 +127,90 @@ def test_play_persists_once_and_query_commands_read_same_database(tmp_path) -> N
     assert "match_finished" in archive.output
 
 
+def test_play_provider_call_budget_aborts_without_archive_or_elo(tmp_path) -> None:
+    path = tmp_path / "play-budget.db"
+
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "mock:random,mock:fixed",
+            "--rounds",
+            "1",
+            "--max-provider-calls",
+            "0",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 1
+    assert "调用次数达到硬上限" in output
+    assert "0 次模型/算法调用" in output
+    store = SQLiteStore(path)
+    assert store.list_matches() == []
+    assert store.leaderboard() == []
+
+
+def test_play_budget_success_reports_aggregate_usage(tmp_path) -> None:
+    path = tmp_path / "play-budget-success.db"
+
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "mock:random,mock:fixed",
+            "--rounds",
+            "1",
+            "--max-provider-calls",
+            "10",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 0, output
+    assert "Provider 预算" in output
+    assert "2 次模型/算法调用" in output
+    assert len(SQLiteStore(path).list_matches()) == 1
+
+
+def test_cloud_cost_budget_requires_price_before_database_creation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "missing-price.db"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _configure_profiles(monkeypatch, tmp_path, "")
+
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--players",
+            "openai:test-model,mock:fixed",
+            "--max-estimated-cost-usd",
+            "1",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 2
+    assert "price for every cloud Provider route" in output
+    assert "test-key" not in output
+    assert not path.exists()
+
+
 def test_gomoku_play_persists_match_and_updates_project_elo(tmp_path) -> None:
     path = tmp_path / "gomoku.db"
     result = runner.invoke(
@@ -258,6 +342,32 @@ def test_gomoku_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) ->
     assert '"legs"' in archive_result.output
 
 
+def test_series_budget_exhaustion_never_partially_saves_or_rates(tmp_path) -> None:
+    path = tmp_path / "series-budget.db"
+
+    result = runner.invoke(
+        app,
+        [
+            "series",
+            "--game",
+            "gomoku",
+            "--players",
+            "mock:fixed,mock:illegal",
+            "--max-provider-calls",
+            "1",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 1
+    assert "调用次数达到硬上限" in output
+    store = SQLiteStore(path)
+    assert store.list_matches() == []
+    assert store.leaderboard() == []
+
+
 def test_chess_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) -> None:
     path = tmp_path / "chess-series.db"
     result = runner.invoke(
@@ -363,6 +473,39 @@ def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) ->
     assert tournament_id in archive.output
     assert '"format": "round_robin_two_leg"' in archive.output
     assert '"pairings"' in archive.output
+
+
+def test_round_robin_uses_one_durable_finalized_budget(tmp_path) -> None:
+    path = tmp_path / "round-robin-budget.db"
+
+    result = runner.invoke(
+        app,
+        [
+            "round-robin",
+            "--game",
+            "knowledge_quiz",
+            "--players",
+            "mock:fixed,mock:random,mock:illegal",
+            "--rounds",
+            "1",
+            "--max-provider-calls",
+            "100",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 0, output
+    assert "Provider 预算" in output
+    tournament_id = _tournament_id_from_output(output)
+    budget = SQLiteStore(path).load_tournament_provider_budget(tournament_id)
+    assert budget is not None
+    assert budget.finalized is True
+    assert budget.reserved.calls == 0
+    assert 1 <= budget.spent.calls <= 100
+    assert budget.limits.calls == 100
+    assert budget.policy.max_output_tokens_per_call == 1024
 
 
 def test_round_robin_resume_rejects_active_lease_before_restoring_provider(
@@ -912,6 +1055,11 @@ display_name = "Remote"
         ["--llm-timeout", "1"],
         ["--no-llm-timeout"],
         ["--allow-large-tournament"],
+        ["--max-provider-calls", "1"],
+        ["--max-input-tokens", "1"],
+        ["--max-output-tokens-per-call", "1"],
+        ["--max-total-output-tokens", "1"],
+        ["--max-estimated-cost-usd", "1"],
     ],
 )
 def test_round_robin_resume_rejects_new_tournament_configuration_before_opening_database(

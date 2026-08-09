@@ -19,8 +19,22 @@ from llmolympic.core.judge import (
     _parse_response,
     score_judge_submission,
 )
-from llmolympic.core.player import HumanPlayer, LLMPlayer
-from llmolympic.providers.base import Provider
+from llmolympic.core.player import HumanPlayer, LLMPlayer, UsageReservationProtocol
+from llmolympic.core.usage import (
+    BudgetExceededError,
+    BudgetLimits,
+    ProviderBudgetPolicy,
+    RouteBudgetPolicy,
+    UsageBudget,
+    UsageExceedsReservationError,
+    UsageTotals,
+)
+from llmolympic.providers.base import (
+    Provider,
+    ProviderChatResult,
+    ProviderUsage,
+    UsageSupport,
+)
 
 _JUDGE_INPUT_RE = re.compile(r"<judge-input>(.*?)</judge-input>", re.DOTALL)
 
@@ -91,6 +105,42 @@ class _RawResponseJudgeProvider(Provider):
         return self.response
 
 
+class _UsageScriptedJudgeProvider(_ScriptedJudgeProvider):
+    def __init__(
+        self,
+        name: str,
+        scores_by_submission: Mapping[str, Mapping[str, float]],
+        *,
+        usage: ProviderUsage | None = None,
+    ) -> None:
+        super().__init__(name, scores_by_submission)
+        self.usage = usage or ProviderUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+
+    def usage_support_for(self, model: str) -> UsageSupport:
+        return UsageSupport.REPORTED
+
+    def resolve_output_token_cap(
+        self,
+        model: str,
+        *,
+        requested_cap: int | None,
+        params: dict[str, object],
+    ) -> int | None:
+        return requested_cap
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        **params,
+    ) -> ProviderChatResult:
+        return ProviderChatResult(
+            text=await self.achat(messages, model=model, **params),
+            usage=self.usage,
+        )
+
+
 class _CancellationTracker:
     def __init__(self, expected_starts: int) -> None:
         self.expected_starts = expected_starts
@@ -145,6 +195,24 @@ def _request(
         submissions=submissions or {"Alpha": "WORK_ALPHA", "Beta": "WORK_BETA"},
         rubric_version="creative-writing-v1",
     )
+
+
+def _bind_judge_budget(
+    judges: list[LLMPlayer],
+    budget: UsageBudget,
+    *,
+    max_output_tokens: int = 1024,
+) -> ProviderBudgetPolicy:
+    policy = ProviderBudgetPolicy(
+        max_output_tokens_per_call=max_output_tokens,
+        routes=tuple(
+            RouteBudgetPolicy(route_id=judge.route_id)
+            for judge in sorted(judges, key=lambda judge: judge.route_id)
+        ),
+    )
+    for judge in judges:
+        judge.bind_usage_budget(budget, policy)
+    return policy
 
 
 @pytest.mark.parametrize(
@@ -255,9 +323,17 @@ def test_panel_routes_every_submission_through_public_score_boundary(monkeypatch
         request: JudgingRequest,
         label: str,
         submission: str,
+        *,
+        reservation: UsageReservationProtocol | None = None,
     ) -> tuple[dict[str, float], str]:
         calls.append((judge.entrant_id, label, submission))
-        return await score_judge_submission(judge, request, label, submission)
+        return await score_judge_submission(
+            judge,
+            request,
+            label,
+            submission,
+            reservation=reservation,
+        )
 
     monkeypatch.setattr("llmolympic.core.judge.score_judge_submission", tracked_score)
 
@@ -616,3 +692,129 @@ def test_cancelling_panel_reaps_every_in_flight_judge_call() -> None:
 
     assert started == 6
     assert cancelled == 6
+
+
+def test_judge_fanout_reserves_atomically_before_any_provider_call() -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 7.0, "clarity": 6.0},
+        "WORK_BETA": {"originality": 6.0, "clarity": 7.0},
+    }
+    providers = [
+        _UsageScriptedJudgeProvider(f"usage-provider-{index}", scores)
+        for index in range(3)
+    ]
+    judges = [
+        _judge(f"judge:budget-{index}", provider)
+        for index, provider in enumerate(providers)
+    ]
+    budget = UsageBudget(BudgetLimits(calls=5))
+    _bind_judge_budget(judges, budget)
+
+    with pytest.raises(BudgetExceededError):
+        asyncio.run(LLMJudgePanel(judges).adjudicate(_request(), seed=3))
+
+    assert [len(provider.calls) for provider in providers] == [0, 0, 0]
+    assert budget.spent == UsageTotals.zero()
+    assert budget.reserved == UsageTotals.zero()
+
+
+def test_judge_usage_overrun_propagates_as_operator_error_not_panel_failure() -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 7.0, "clarity": 6.0},
+        "WORK_BETA": {"originality": 6.0, "clarity": 7.0},
+    }
+    providers = [
+        _UsageScriptedJudgeProvider(
+            "overrun-provider",
+            scores,
+            usage=ProviderUsage(
+                input_tokens=10_000,
+                output_tokens=1,
+                total_tokens=10_001,
+            ),
+        ),
+        _UsageScriptedJudgeProvider("usage-provider-1", scores),
+        _UsageScriptedJudgeProvider("usage-provider-2", scores),
+    ]
+    judges = [
+        _judge(f"judge:overrun-{index}", provider)
+        for index, provider in enumerate(providers)
+    ]
+    budget = UsageBudget(BudgetLimits())
+    _bind_judge_budget(judges, budget, max_output_tokens=8)
+
+    with pytest.raises(UsageExceedsReservationError):
+        asyncio.run(LLMJudgePanel(judges).adjudicate(_request(), seed=4))
+
+    assert budget.poisoned
+    assert budget.reserved == UsageTotals.zero()
+    # The first impossible report poisons the shared ledger before later tasks
+    # dispatch; those still-reserved siblings are released by panel cleanup.
+    assert sum(len(provider.calls) for provider in providers) == 1
+
+
+def test_budgeted_panel_cancellation_charges_all_dispatched_calls() -> None:
+    async def scenario() -> tuple[_CancellationTracker, UsageBudget]:
+        tracker = _CancellationTracker(expected_starts=6)
+        judges = [
+            _judge(
+                f"judge:budget-cancel-{index}",
+                _BlockingJudgeProvider(f"blocking-provider-{index}", tracker),
+            )
+            for index in range(3)
+        ]
+        budget = UsageBudget(BudgetLimits(calls=6))
+        _bind_judge_budget(judges, budget)
+        task = asyncio.create_task(LLMJudgePanel(judges).adjudicate(_request(), seed=5))
+        await asyncio.wait_for(tracker.all_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return tracker, budget
+
+    tracker, budget = asyncio.run(scenario())
+
+    assert tracker.started == tracker.cancelled == 6
+    assert budget.spent.calls == 6
+    assert budget.reserved == UsageTotals.zero()
+
+
+def test_judge_task_cancelled_before_first_execution_releases_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 7.0, "clarity": 6.0},
+        "WORK_BETA": {"originality": 6.0, "clarity": 7.0},
+    }
+    providers = [
+        _UsageScriptedJudgeProvider(f"usage-provider-{index}", scores)
+        for index in range(3)
+    ]
+    judges = [
+        _judge(f"judge:prestart-{index}", provider)
+        for index, provider in enumerate(providers)
+    ]
+    budget = UsageBudget(BudgetLimits(calls=6))
+    _bind_judge_budget(judges, budget)
+    real_create_task = asyncio.create_task
+    created = 0
+
+    def cancel_second_before_run(coroutine):
+        nonlocal created
+        created += 1
+        task = real_create_task(coroutine)
+        if created == 2:
+            task.cancel()
+        return task
+
+    monkeypatch.setattr(
+        "llmolympic.core.judge.asyncio.create_task",
+        cancel_second_before_run,
+    )
+
+    verdict = asyncio.run(LLMJudgePanel(judges).adjudicate(_request(), seed=6))
+
+    assert verdict.successful_judges == 2
+    assert [len(provider.calls) for provider in providers] == [1, 2, 2]
+    assert budget.spent.calls == 5
+    assert budget.reserved == UsageTotals.zero()

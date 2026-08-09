@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from llmolympic import config
@@ -141,6 +143,186 @@ def test_database_path_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path) -> 
     monkeypatch.setenv("LLMOLYMPIC_DB", str(environment))
     assert database_path() == environment.resolve()
     assert database_path(explicit) == explicit.resolve()
+
+
+def test_budget_and_pricing_defaults_are_credential_free() -> None:
+    assert config.load_budget_settings() == config.ProviderBudgetSettings()
+    assert config.load_provider_pricing() == {}
+
+
+def test_budget_and_pricing_are_parsed_strictly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        """
+[budget]
+max_provider_calls = 25
+max_input_tokens = 50000
+max_output_tokens_per_call = 512
+max_total_output_tokens = 10000
+max_estimated_cost_usd = "4.25"
+
+[pricing."profile:kimi:moonshot-v1"]
+input_usd_per_million_tokens = "0.50"
+output_usd_per_million_tokens = "2.00"
+
+[pricing."ollama:llama3.1:8b"]
+input_usd_per_million_tokens = "0"
+output_usd_per_million_tokens = "0"
+""",
+    )
+
+    assert config.load_budget_settings() == config.ProviderBudgetSettings(
+        max_provider_calls=25,
+        max_input_tokens=50000,
+        max_output_tokens_per_call=512,
+        max_total_output_tokens=10000,
+        max_estimated_cost_usd=Decimal("4.25"),
+    )
+    assert config.load_provider_pricing() == {
+        "profile:kimi:moonshot-v1": config.ProviderTokenPrice(
+            input_usd_per_million_tokens=Decimal("0.50"),
+            output_usd_per_million_tokens=Decimal("2.00"),
+        ),
+        "ollama:llama3.1:8b": config.ProviderTokenPrice(
+            input_usd_per_million_tokens=Decimal(0),
+            output_usd_per_million_tokens=Decimal(0),
+        ),
+    }
+
+
+def test_budget_zero_totals_are_valid_kill_switches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        """
+[budget]
+max_provider_calls = 0
+max_input_tokens = 0
+max_total_output_tokens = 0
+max_estimated_cost_usd = "0"
+""",
+    )
+
+    assert config.load_budget_settings() == config.ProviderBudgetSettings(
+        max_provider_calls=0,
+        max_input_tokens=0,
+        max_total_output_tokens=0,
+        max_estimated_cost_usd=Decimal(0),
+    )
+
+
+def test_budget_resolution_is_fieldwise_cli_then_env_then_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _use_config(
+        monkeypatch,
+        tmp_path,
+        """
+[budget]
+max_provider_calls = 10
+max_input_tokens = 20
+max_output_tokens_per_call = 30
+max_total_output_tokens = 40
+max_estimated_cost_usd = "5.00"
+""",
+    )
+    environment = {
+        "LLMOLYMPIC_MAX_PROVIDER_CALLS": "11",
+        "LLMOLYMPIC_MAX_OUTPUT_TOKENS_PER_CALL": "31",
+        "LLMOLYMPIC_MAX_ESTIMATED_COST_USD": "6.00",
+    }
+
+    resolved = config.resolve_budget_settings(
+        max_provider_calls=12,
+        max_total_output_tokens=42,
+        environ=environment,
+    )
+
+    assert resolved == config.ProviderBudgetSettings(
+        max_provider_calls=12,
+        max_input_tokens=20,
+        max_output_tokens_per_call=31,
+        max_total_output_tokens=42,
+        max_estimated_cost_usd=Decimal("6.00"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("LLMOLYMPIC_MAX_PROVIDER_CALLS", ""),
+        ("LLMOLYMPIC_MAX_INPUT_TOKENS", " 1"),
+        ("LLMOLYMPIC_MAX_OUTPUT_TOKENS_PER_CALL", "0"),
+        ("LLMOLYMPIC_MAX_TOTAL_OUTPUT_TOKENS", "01"),
+        ("LLMOLYMPIC_MAX_ESTIMATED_COST_USD", "NaN"),
+    ],
+)
+def test_budget_environment_values_are_strict(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _use_config(monkeypatch, tmp_path, "")
+
+    with pytest.raises(ValueError):
+        config.resolve_budget_settings(environ={name: value})
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        ("[budget]\nunknown = 1\n", "未知字段"),
+        ("[budget]\nmax_provider_calls = true\n", "必须是"),
+        ("[budget]\nmax_output_tokens_per_call = 0\n", "必须是"),
+        ("[budget]\nmax_estimated_cost_usd = 1.5\n", "十进制字符串"),
+        ('[budget]\nmax_estimated_cost_usd = "NaN"\n', "有限"),
+        (
+            (
+                '[pricing."bad spec"]\ninput_usd_per_million_tokens = "1"\n'
+                'output_usd_per_million_tokens = "1"\n'
+            ),
+            "键必须是显式",
+        ),
+        (
+            '[pricing."openai:model"]\ninput_usd_per_million_tokens = "1"\n',
+            "缺少字段",
+        ),
+        (
+            (
+                '[pricing."openai:model"]\ninput_usd_per_million_tokens = "-1"\n'
+                'output_usd_per_million_tokens = "1"\n'
+            ),
+            "非负",
+        ),
+        (
+            (
+                '[pricing."openai:model"]\ninput_usd_per_million_tokens = "1"\n'
+                'output_usd_per_million_tokens = "1"\napi_key = "secret"\n'
+            ),
+            "未知字段",
+        ),
+    ],
+)
+def test_invalid_budget_or_pricing_is_rejected(
+    content: str,
+    error: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _use_config(monkeypatch, tmp_path, content)
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        config.load_budget_settings()
+        config.load_provider_pricing()
 
 
 def test_named_provider_profiles_are_strict_and_credential_free(

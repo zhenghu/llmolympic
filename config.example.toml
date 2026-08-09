@@ -45,3 +45,25 @@ display_name = "Local Llama"
 # 对局稳定性（对应环境变量 LLMOLYMPIC_LLM_TIMEOUT）
 [match]
 # llm_timeout_seconds = 120.0
+
+# Provider 调用与费用保护。总预算默认不启用；单次输出上限保持 1024。
+# CLI 按字段覆盖环境变量，环境变量再覆盖这里：
+# LLMOLYMPIC_MAX_PROVIDER_CALLS / LLMOLYMPIC_MAX_INPUT_TOKENS /
+# LLMOLYMPIC_MAX_OUTPUT_TOKENS_PER_CALL / LLMOLYMPIC_MAX_TOTAL_OUTPUT_TOKENS /
+# LLMOLYMPIC_MAX_ESTIMATED_COST_USD。
+[budget]
+# max_provider_calls = 200
+# max_input_tokens = 500000
+# max_output_tokens_per_call = 1024
+# max_total_output_tokens = 200000
+# max_estimated_cost_usd = "5.00" # 本地估算上限，不等同 Provider 最终账单
+
+# 云端模型价格必须由用户按精确 CLI spec 显式冻结；程序不会联网猜价。
+# 金额使用 USD / 1,000,000 tokens 的十进制字符串。
+[pricing."profile:kimi:moonshot-v1-128k"]
+input_usd_per_million_tokens = "0.50"
+output_usd_per_million_tokens = "2.00"
+
+[pricing."profile:deepseek:deepseek-chat"]
+input_usd_per_million_tokens = "0.30"
+output_usd_per_million_tokens = "1.20"

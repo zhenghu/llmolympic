@@ -1,4 +1,4 @@
-"""Complete SQLite v7 schema-manifest and fail-closed parser tests."""
+"""Complete SQLite v8 schema-manifest and fail-closed parser tests."""
 
 from __future__ import annotations
 
@@ -63,6 +63,34 @@ def _redirect_match_players_to_unicode_long_s(connection: sqlite3.Connection) ->
     connection.execute("CREATE INDEX match_players_player_idx ON match_players(player, match_id)")
     connection.execute(
         "CREATE INDEX match_players_entrant_idx ON match_players(entrant_id, match_id)"
+    )
+
+
+def _remove_provider_attempt_strict_mode(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        """
+        SELECT sql FROM sqlite_schema
+        WHERE type = 'table' AND name = 'provider_call_attempts'
+        """
+    ).fetchone()
+    assert row is not None and isinstance(row[0], str)
+    strict_sql = row[0].rstrip()
+    assert strict_sql.endswith(" STRICT")
+    non_strict_sql = strict_sql.removesuffix(" STRICT")
+    connection.execute("DROP TABLE provider_call_attempts")
+    connection.execute(non_strict_sql)
+    connection.execute(
+        """
+        CREATE INDEX provider_call_attempts_budget_state_idx
+        ON provider_call_attempts(budget_id, state, attempt_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX provider_call_attempts_generation_state_idx
+        ON provider_call_attempts(budget_id, runner_generation, state)
+        WHERE runner_generation IS NOT NULL
+        """
     )
 
 
@@ -210,6 +238,11 @@ SCHEMA_TAMPERS: tuple[tuple[str, SchemaTamper, str], ...] = (
         "foreign keys",
     ),
     (
+        "provider-attempt-without-strict",
+        _remove_provider_attempt_strict_mode,
+        "column definitions",
+    ),
+    (
         "extra-view",
         _execute_script("CREATE VIEW unexpected_view AS SELECT entrant_id FROM entrants;"),
         "unsupported table kind",
@@ -250,14 +283,14 @@ SCHEMA_TAMPERS: tuple[tuple[str, SchemaTamper, str], ...] = (
 )
 
 
-def test_fresh_v7_database_passes_the_complete_manifest(tmp_path: Path) -> None:
-    database = tmp_path / "fresh-v7.db"
+def test_fresh_v8_database_passes_the_complete_manifest(tmp_path: Path) -> None:
+    database = tmp_path / "fresh-v8.db"
 
     SQLiteStore(database)
     SQLiteStore(database, create=False)
     inspection = inspect_database(database)
 
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
     assert inspection.schema_version == SCHEMA_VERSION
     assert not inspection.migration_required
     with pytest.raises(TournamentAuditError) as caught:

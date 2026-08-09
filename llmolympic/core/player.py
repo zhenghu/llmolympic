@@ -14,10 +14,29 @@ import select
 import sys
 import weakref
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from threading import Lock
+from typing import Protocol
 
 from llmolympic.core.archive import validate_entrant_id
-from llmolympic.providers.base import Provider, ProviderTimeoutError, validate_route_id
+from llmolympic.core.usage import (
+    BudgetLimits,
+    CallBounds,
+    ProviderBudgetPolicy,
+    TokenPrice,
+    UsageError,
+    UsageTotals,
+    UsageValidationError,
+)
+from llmolympic.providers.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    Provider,
+    ProviderChatResult,
+    ProviderTimeoutError,
+    ProviderUsage,
+    UsageSupport,
+    validate_route_id,
+)
 
 SYSTEM_PROMPT = (
     "你是 LLM Olympics 的一名参赛选手。请仔细阅读题面，"
@@ -47,6 +66,58 @@ _ARCHIVE_SAFE_SAMPLING_KEYS = frozenset(
         "top_p",
     }
 )
+_BUDGET_FORBIDDEN_SAMPLING_KEYS = frozenset(
+    {
+        "extra_body",
+        "extra_query",
+        "extra_headers",
+        "response_format",
+        "tool_choice",
+        "tools",
+        "functions",
+        "function_call",
+    }
+)
+
+
+class UsageReservationProtocol(Protocol):
+    """Structural reservation contract shared by memory and SQLite ledgers."""
+
+    @property
+    def budget_id(self) -> object: ...
+
+    @property
+    def bounds(self) -> CallBounds: ...
+
+    @property
+    def state(self) -> str: ...
+
+    def dispatch(self) -> object: ...
+
+    def settle(self, usage: UsageTotals | None) -> UsageTotals: ...
+
+    def release_pre_dispatch(self) -> None: ...
+
+    def charge_unknown(self) -> UsageTotals: ...
+
+
+class UsageBudgetProtocol(Protocol):
+    """Structural hard-budget contract; no concrete ledger type is required."""
+
+    @property
+    def limits(self) -> BudgetLimits: ...
+
+    @property
+    def budget_id(self) -> object: ...
+
+    def owns(self, reservation: UsageReservationProtocol) -> bool: ...
+
+    def reserve(self, bounds: CallBounds) -> UsageReservationProtocol: ...
+
+    def reserve_many(
+        self,
+        bounds: Iterable[CallBounds],
+    ) -> tuple[UsageReservationProtocol, ...]: ...
 
 
 class _CancellableStdinUnavailable(Exception):
@@ -281,6 +352,18 @@ def _provider_route_id(provider: object, model: str) -> str:
     return validate_route_id(route_id)
 
 
+def _provider_usage_support(provider: object, model: str) -> UsageSupport:
+    support_for = getattr(provider, "usage_support_for", None)
+    if support_for is None:
+        return UsageSupport.NONE
+    if not callable(support_for):
+        raise UsageValidationError("Provider usage_support_for must be callable")
+    support = support_for(model)
+    if not isinstance(support, UsageSupport):
+        raise UsageValidationError("Provider usage_support_for returned an invalid capability")
+    return support
+
+
 def profile_entrant_id(profile_id: str, model: str) -> str:
     """Return the documented stable identity for one Profile/model pair."""
 
@@ -373,6 +456,8 @@ class LLMPlayer(Player):
         entrant_id: str | None = None,
         move_timeout_seconds: float | None = DEFAULT_LLM_TIMEOUT_SECONDS,
         max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
+        usage_budget: UsageBudgetProtocol | None = None,
+        budget_policy: ProviderBudgetPolicy | None = None,
         **sampling_params,
     ) -> None:
         profile_id = _provider_profile_id(provider)
@@ -394,9 +479,10 @@ class LLMPlayer(Player):
             name,
             entrant_id=generated_entrant_id if entrant_id is None else entrant_id,
         )
-        if "request_timeout" in sampling_params:
+        reserved_params = {"request_timeout", "output_token_cap"} & set(sampling_params)
+        if reserved_params:
             raise ValueError(
-                "request_timeout 是 Provider 内部保留参数；请使用 move_timeout_seconds"
+                f"{', '.join(sorted(reserved_params))} 是 Provider 内部保留参数"
             )
         if move_timeout_seconds is not None and (
             not math.isfinite(move_timeout_seconds) or move_timeout_seconds <= 0
@@ -408,6 +494,8 @@ class LLMPlayer(Player):
             or not 1 <= max_response_chars <= DEFAULT_MAX_RESPONSE_CHARS
         ):
             raise ValueError(f"LLM 响应字符上限必须是 1 到 {DEFAULT_MAX_RESPONSE_CHARS} 之间的整数")
+        if (usage_budget is None) != (budget_policy is None):
+            raise UsageValidationError("usage_budget and budget_policy must be configured together")
         if move_timeout_seconds is not None:
             async_implementation = getattr(type(provider), "achat", None)
             if (
@@ -426,49 +514,327 @@ class LLMPlayer(Player):
         self.move_timeout_seconds = move_timeout_seconds
         self.max_response_chars = max_response_chars
         self.sampling_params = sampling_params
+        self._usage_budget: UsageBudgetProtocol | None = None
+        self._budget_policy: ProviderBudgetPolicy | None = None
+        self._usage_support = _provider_usage_support(provider, model)
+        self._token_price: TokenPrice | None = None
+        self._output_token_cap: int | None = None
+        self._usage_calls_started = False
+        self._usage_binding_lock = Lock()
+        self._bound_model: str | None = None
+        self._bound_sampling_params: dict[str, object] | None = None
+        if usage_budget is not None:
+            if budget_policy is None:  # pragma: no cover - pair guard above
+                raise UsageValidationError("usage budget is missing its frozen policy")
+            self.bind_usage_budget(usage_budget, budget_policy)
 
     @property
     def route_id(self) -> str:
         return self._route_id
+
+    @property
+    def usage_budget(self) -> UsageBudgetProtocol | None:
+        return self._usage_budget
+
+    @property
+    def budget_policy(self) -> ProviderBudgetPolicy | None:
+        return self._budget_policy
+
+    @staticmethod
+    def _snapshot_budget_sampling_params(
+        sampling_params: dict[str, object],
+    ) -> dict[str, object]:
+        return dict(sampling_params)
+
+    def _enforce_budget_request_stability(self) -> None:
+        if self._usage_budget is None:
+            return
+        if (
+            self._bound_model is None
+            or self._bound_sampling_params is None
+            or self.model != self._bound_model
+            or self.sampling_params != self._bound_sampling_params
+        ):
+            raise UsageValidationError("budgeted LLM request parameters changed after binding")
+        self._validate_budget_sampling_params(self._bound_sampling_params)
+
+    def bind_usage_budget(
+        self,
+        usage_budget: UsageBudgetProtocol,
+        budget_policy: ProviderBudgetPolicy,
+    ) -> None:
+        """Bind one shared ledger and frozen policy exactly once, before calls start."""
+
+        with self._usage_binding_lock:
+            if self._usage_calls_started:
+                raise UsageValidationError("cannot bind a usage budget after an LLM call started")
+            if self._usage_budget is not None or self._budget_policy is not None:
+                raise UsageValidationError("LLMPlayer usage budget is already bound")
+            try:
+                limits = usage_budget.limits
+            except AttributeError as exc:
+                raise UsageValidationError(
+                    "usage budget must expose immutable BudgetLimits"
+                ) from exc
+
+            if not isinstance(limits, BudgetLimits):
+                raise UsageValidationError("usage budget limits must be BudgetLimits")
+            if not callable(getattr(usage_budget, "reserve", None)) or not callable(
+                getattr(usage_budget, "reserve_many", None)
+            ):
+                raise UsageValidationError(
+                    "usage budget must support reserve and reserve_many"
+                )
+            if not callable(getattr(usage_budget, "owns", None)):
+                raise UsageValidationError("usage budget must support reservation ownership checks")
+            if not isinstance(budget_policy, ProviderBudgetPolicy):
+                raise UsageValidationError("budget_policy must be ProviderBudgetPolicy")
+
+            token_price = budget_policy.price_for(self.route_id)
+            strict_resource_budget = any(
+                limit is not None
+                for limit in (limits.input, limits.output, limits.estimated_cost)
+            ) or budget_policy.max_output_tokens_per_call != DEFAULT_MAX_OUTPUT_TOKENS
+            bound_sampling_params = self._snapshot_budget_sampling_params(self.sampling_params)
+            self._validate_budget_sampling_params(bound_sampling_params)
+            if strict_resource_budget and self._usage_support is UsageSupport.NONE:
+                raise UsageValidationError(
+                    "Provider does not report usage required by the token or cost budget"
+                )
+
+            if (
+                limits.estimated_cost is not None
+                and token_price is None
+                and self._usage_support is not UsageSupport.EXACT_ZERO
+            ):
+                raise UsageValidationError(
+                    "the cost budget requires a frozen token price for every billed route"
+                )
+
+            output_token_cap: int | None = None
+            if self._usage_support is UsageSupport.EXACT_ZERO:
+                output_token_cap = 0
+            elif self._usage_support is UsageSupport.REPORTED:
+                resolve_cap = getattr(self.provider, "resolve_output_token_cap", None)
+                if callable(resolve_cap):
+                    output_token_cap = resolve_cap(
+                        self.model,
+                        requested_cap=budget_policy.max_output_tokens_per_call,
+                        params=bound_sampling_params,
+                    )
+
+                if output_token_cap is None:
+                    if strict_resource_budget:
+                        raise UsageValidationError(
+                            "Provider cannot enforce the output cap required by the budget"
+                        )
+                elif (
+                    isinstance(output_token_cap, bool)
+                    or not isinstance(output_token_cap, int)
+                    or output_token_cap < 1
+                ):
+                    raise UsageValidationError("Provider returned an invalid output token cap")
+                elif not callable(
+                    getattr(self.provider, "achat_with_usage", None)
+                ) and not callable(getattr(self.provider, "chat_with_usage", None)):
+                    raise UsageValidationError(
+                        "Provider cannot return usage for its negotiated output cap"
+                    )
+
+            self._usage_budget = usage_budget
+            self._budget_policy = budget_policy
+            self._token_price = token_price
+            self._output_token_cap = output_token_cap
+            self._bound_model = self.model
+            self._bound_sampling_params = bound_sampling_params
+
+    def _validate_budget_sampling_params(self, sampling_params: dict[str, object]) -> None:
+        """Reject sampling parameters that can mutate request body semantics."""
+
+        for key in sampling_params:
+            lowered = key.lower()
+            if lowered in _BUDGET_FORBIDDEN_SAMPLING_KEYS:
+                raise UsageValidationError(
+                    f"budgeted Provider calls do not accept sampling parameter {key!r}"
+                )
+            if lowered.startswith("extra_") or "tool" in lowered or "function" in lowered:
+                raise UsageValidationError(
+                    f"budgeted Provider calls do not accept sampling parameter {key!r}"
+                )
+
+    @staticmethod
+    def _completion_messages(prompt: str, system_prompt: str) -> list[dict]:
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+    def call_bounds(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+    ) -> CallBounds | None:
+        """Return the frozen conservative authorization for one model call."""
+
+        self._enforce_budget_request_stability()
+        if self._usage_budget is None:
+            return None
+        if self._usage_support is UsageSupport.NONE or self._output_token_cap is None:
+            # Calls-only budgets remain compatible with legacy adapters. They
+            # deliberately make no token or cost claim.
+            return CallBounds(route_id=self.route_id)
+        if self._usage_support is UsageSupport.EXACT_ZERO:
+            return CallBounds(route_id=self.route_id)
+
+        messages = self._completion_messages(prompt, system_prompt)
+        canonical_messages = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        input_bound = len(canonical_messages)
+        output_bound = self._output_token_cap
+        estimated_cost = (
+            0
+            if self._token_price is None
+            else self._token_price.estimate(
+                input_tokens=input_bound,
+                output_tokens=output_bound,
+            )
+        )
+        return CallBounds(
+            input=input_bound,
+            output=output_bound,
+            estimated_cost=estimated_cost,
+            route_id=self.route_id,
+        )
+
+    def _usage_totals(self, usage: object) -> UsageTotals:
+        if not isinstance(usage, ProviderUsage):
+            raise UsageValidationError("Provider usage must be ProviderUsage")
+        estimated_cost = (
+            0
+            if self._token_price is None
+            else self._token_price.estimate(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+            )
+        )
+        return UsageTotals(
+            calls=1,
+            input=usage.input_tokens,
+            output=usage.output_tokens,
+            estimated_cost=estimated_cost,
+        )
 
     def _use_legacy_route_description(self) -> None:
         """Keep old tournament checkpoint descriptors stable during resume."""
 
         self._include_route_id_in_description = False
 
-    async def complete(self, prompt: str, *, system_prompt: str = SYSTEM_PROMPT) -> str:
-        """调用底层模型并执行与参赛走法相同的超时、错误和大小隔离。"""
+    async def complete_with_usage(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        reservation: UsageReservationProtocol | None = None,
+    ) -> ProviderChatResult:
+        """Return model text and optional usage under the existing safety boundary."""
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
+        with self._usage_binding_lock:
+            self._usage_calls_started = True
+        messages = self._completion_messages(prompt, system_prompt)
+        expected_bounds = self.call_bounds(prompt, system_prompt=system_prompt)
+        if expected_bounds is None:
+            if reservation is not None:
+                raise UsageValidationError("an unbudgeted LLM call cannot accept a reservation")
+        else:
+            if reservation is None:
+                budget = self._usage_budget
+                if budget is None:  # pragma: no cover - narrowed by call_bounds
+                    raise UsageValidationError("budgeted LLM call is missing its usage budget")
+                reservation = budget.reserve(expected_bounds)
+            elif reservation.budget_id != self._usage_budget.budget_id or not self._usage_budget.owns(
+                reservation
+            ):
+                raise UsageValidationError("reservation does not belong to this player's usage budget")
+            elif reservation.bounds != expected_bounds:
+                raise UsageValidationError("call reservation does not match the frozen CallBounds")
+            try:
+                reservation.dispatch()
+            except BaseException:
+                if reservation.state == "reserved":
+                    reservation.release_pre_dispatch()
+                raise
+
+        if self._usage_budget is None:
+            call_model = self.model
+            call_params = dict(self.sampling_params)
+        else:
+            if self._bound_model is None or self._bound_sampling_params is None:
+                raise UsageValidationError("player budgeted state is incomplete")
+            call_model = self._bound_model
+            call_params = self._snapshot_budget_sampling_params(self._bound_sampling_params)
+        if self._output_token_cap is not None:
+            call_params["output_token_cap"] = self._output_token_cap
         try:
-            async_chat = getattr(self.provider, "achat", None)
-            if async_chat is None:
-                response = await asyncio.to_thread(
-                    self.provider.chat,
+            async_chat_with_usage = getattr(self.provider, "achat_with_usage", None)
+            if async_chat_with_usage is not None:
+                call = async_chat_with_usage(
                     messages,
-                    model=self.model,
-                    **self.sampling_params,
-                )
-            else:
-                call = async_chat(
-                    messages,
-                    model=self.model,
+                    model=call_model,
                     request_timeout=self.move_timeout_seconds,
-                    **self.sampling_params,
+                    **call_params,
                 )
                 if self.move_timeout_seconds is None:
-                    response = await call
+                    raw_result = await call
                 else:
                     async with asyncio.timeout(self.move_timeout_seconds):
-                        response = await call
+                        raw_result = await call
+            else:
+                async_chat = getattr(self.provider, "achat", None)
+                if async_chat is None:
+                    sync_chat_with_usage = getattr(self.provider, "chat_with_usage", None)
+                    sync_chat = (
+                        sync_chat_with_usage
+                        if sync_chat_with_usage is not None
+                        else self.provider.chat
+                    )
+                    raw_result = await asyncio.to_thread(
+                        sync_chat,
+                        messages,
+                        model=call_model,
+                        **call_params,
+                    )
+                else:
+                    call = async_chat(
+                        messages,
+                        model=call_model,
+                        request_timeout=self.move_timeout_seconds,
+                        **call_params,
+                    )
+                    if self.move_timeout_seconds is None:
+                        raw_result = await call
+                    else:
+                        async with asyncio.timeout(self.move_timeout_seconds):
+                            raw_result = await call
+        except UsageError:
+            if reservation is not None:
+                reservation.charge_unknown()
+            raise
         except ProviderTimeoutError as exc:
+            if reservation is not None:
+                reservation.charge_unknown()
             raise self._timeout_error() from exc
         except TimeoutError as exc:
+            if reservation is not None:
+                reservation.charge_unknown()
             raise self._timeout_error() from exc
         except Exception as exc:
+            if reservation is not None:
+                reservation.charge_unknown()
             raise PlayerProviderError(
                 f"{self.provider.name} 模型服务调用失败，判技术负",
                 technical_loss=True,
@@ -478,6 +844,29 @@ class LLMPlayer(Player):
                     "error_type": type(exc).__name__,
                 },
             ) from exc
+        except BaseException:
+            if reservation is not None:
+                reservation.charge_unknown()
+            raise
+        result = (
+            raw_result
+            if isinstance(raw_result, ProviderChatResult)
+            else ProviderChatResult(text=raw_result)
+        )
+        if reservation is not None:
+            try:
+                reservation.settle(
+                    None if result.usage is None else self._usage_totals(result.usage)
+                )
+            except UsageError:
+                # Invalid counters can fail before the ledger sees an actual
+                # value.  Once dispatched, unknown usage is always charged at
+                # the authorized bound; ledger-recorded overruns are already a
+                # terminal (and poisoned) state and must not be overwritten.
+                if reservation.state in {"reserved", "dispatched"}:
+                    reservation.charge_unknown()
+                raise
+        response = result.text
         if not isinstance(response, str):
             raise PlayerProviderError(
                 f"{self.provider.name} 模型返回了非文本响应，判技术负",
@@ -499,10 +888,32 @@ class LLMPlayer(Player):
                     "max_response_chars": self.max_response_chars,
                 },
             )
-        return response
+        return result
 
-    async def get_move(self, prompt: str) -> str:
-        return await self.complete(prompt)
+    async def complete(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        reservation: UsageReservationProtocol | None = None,
+    ) -> str:
+        """调用底层模型并执行与参赛走法相同的超时、错误和大小隔离。"""
+
+        return (
+            await self.complete_with_usage(
+                prompt,
+                system_prompt=system_prompt,
+                reservation=reservation,
+            )
+        ).text
+
+    async def get_move(
+        self,
+        prompt: str,
+        *,
+        reservation: UsageReservationProtocol | None = None,
+    ) -> str:
+        return await self.complete(prompt, reservation=reservation)
 
     def _timeout_error(self) -> PlayerTimeoutError:
         details: dict[str, object] = {
@@ -540,6 +951,66 @@ class LLMPlayer(Player):
         if self.move_timeout_seconds is not None:
             description["move_timeout_seconds"] = self.move_timeout_seconds
         return description
+
+
+def reserve_player_call_batch(
+    requests: Iterable[tuple[Player, str, str]],
+) -> tuple[UsageReservationProtocol | None, ...]:
+    """Reserve every budgeted LLM request before any Provider task starts."""
+
+    batch = tuple(requests)
+    llm_players = [player for player, _, _ in batch if isinstance(player, LLMPlayer)]
+    budgeted = [player for player in llm_players if player.usage_budget is not None]
+    if not budgeted:
+        return tuple(None for _ in batch)
+    if len(budgeted) != len(llm_players):
+        raise UsageValidationError(
+            "one Provider call batch cannot mix budgeted and unbudgeted LLM players"
+        )
+
+    budget = budgeted[0].usage_budget
+    policy = budgeted[0].budget_policy
+    if budget is None or policy is None:  # pragma: no cover - narrowed by construction
+        raise UsageValidationError("budgeted LLM player is missing its frozen policy")
+    if any(player.usage_budget is not budget for player in budgeted[1:]):
+        raise UsageValidationError("one Provider call batch must share one usage budget")
+    if any(player.budget_policy != policy for player in budgeted[1:]):
+        raise UsageValidationError("one Provider call batch must share one frozen budget policy")
+
+    bounds: list[CallBounds] = []
+    budgeted_indices: list[int] = []
+    for index, (player, prompt, system_prompt) in enumerate(batch):
+        if not isinstance(player, LLMPlayer):
+            continue
+        bound = player.call_bounds(prompt, system_prompt=system_prompt)
+        if bound is None:  # pragma: no cover - rejected by the mixed-mode guard
+            raise UsageValidationError("budgeted LLM call is missing CallBounds")
+        budgeted_indices.append(index)
+        bounds.append(bound)
+
+    reservations = tuple(budget.reserve_many(bounds))
+    if len(reservations) != len(bounds) or any(
+        reservation.bounds != bound
+        for reservation, bound in zip(reservations, bounds, strict=False)
+    ):
+        for reservation in reservations:
+            reservation.release_pre_dispatch()
+        raise UsageValidationError("usage budget returned invalid batch reservations")
+
+    aligned: list[UsageReservationProtocol | None] = [None] * len(batch)
+    for index, reservation in zip(budgeted_indices, reservations, strict=True):
+        aligned[index] = reservation
+    return tuple(aligned)
+
+
+def release_undispatched_reservations(
+    reservations: Iterable[UsageReservationProtocol | None],
+) -> None:
+    """Release only reservations whose Provider coroutine never dispatched."""
+
+    for reservation in reservations:
+        if reservation is not None and reservation.state == "reserved":
+            reservation.release_pre_dispatch()
 
 
 class HumanPlayer(Player):
