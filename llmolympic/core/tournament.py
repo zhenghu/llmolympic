@@ -22,6 +22,7 @@ from llmolympic.core.game import (
     describe_game_config,
     validate_players,
 )
+from llmolympic.core.judge import JudgePanelSnapshot, LLMJudgePanel
 from llmolympic.core.match import MAX_MOVE_ATTEMPTS
 from llmolympic.core.player import HumanPlayer, Player
 from llmolympic.core.series import SERIES_SCHEMA_VERSION, SeriesArchive, play_two_leg_series
@@ -201,6 +202,7 @@ def _validate_completed_series(
     source: TournamentSource,
     game: str,
     game_config: dict | None,
+    judge_panel: JudgePanelSnapshot | None,
 ) -> tuple[dict[str, float], dict | None]:
     """Validate a canonical completed prefix and derive its aggregate points."""
 
@@ -213,6 +215,12 @@ def _validate_completed_series(
     validated_game_config = game_config
     previous_finished_at: datetime | None = None
 
+    requires_panel = game == "creative_writing"
+    if requires_panel and judge_panel is None:
+        raise ValueError("创意循环赛必须冻结评审团快照")
+    if not requires_panel and judge_panel is not None:
+        raise ValueError("客观循环赛不能包含评审团快照")
+
     for spec, series in zip(schedule, completed_series):
         if series.schema_version != SERIES_SCHEMA_VERSION:
             raise ValueError("循环赛只接受 schema v2 双局赛档案")
@@ -220,6 +228,8 @@ def _validate_completed_series(
             raise ValueError("循环赛与双局赛档案来源必须一致")
         if series.game != game:
             raise ValueError("循环赛与双局赛项目必须一致")
+        if series.judge_panel != judge_panel:
+            raise ValueError("循环赛双局赛的评审团与赛事冻结快照不一致")
         if series.seed != spec.seed:
             raise ValueError("循环赛 pairing 与双局赛 seed 必须一致")
 
@@ -368,6 +378,7 @@ class TournamentCheckpoint(BaseModel):
     max_attempts: int
     players: tuple[dict, ...]
     schedule: tuple[RoundRobinPairingSpec, ...]
+    judge_panel: JudgePanelSnapshot | None = None
     completed_series: tuple[SeriesArchive, ...] = ()
     created_at: datetime
     updated_at: datetime
@@ -419,6 +430,7 @@ class TournamentCheckpoint(BaseModel):
             source=self.source,
             game=self.game,
             game_config=self.game_config,
+            judge_panel=self.judge_panel,
         )
 
         timestamps = (self.created_at, self.updated_at)
@@ -480,6 +492,7 @@ class TournamentArchive(BaseModel):
     points: dict[str, float]
     started_at: datetime
     finished_at: datetime
+    judge_panel: JudgePanelSnapshot | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -539,6 +552,7 @@ class TournamentArchive(BaseModel):
             source=self.source,
             game=self.game,
             game_config=None,
+            judge_panel=self.judge_panel,
         )
 
         timestamps = (self.started_at, self.finished_at)
@@ -580,6 +594,7 @@ def tournament_from_series(
     *,
     seed: int,
     tournament_id: str | None = None,
+    judge_panel: JudgePanelSnapshot | None = None,
 ) -> TournamentArchive:
     """Build a tournament archive from series in canonical input-pair order."""
 
@@ -618,6 +633,7 @@ def tournament_from_series(
         "points": points,
         "started_at": series_archives[0].started_at,
         "finished_at": series_archives[-1].finished_at,
+        "judge_panel": judge_panel,
     }
     if tournament_id is not None:
         values["tournament_id"] = tournament_id
@@ -678,10 +694,20 @@ def prepare_round_robin(
     max_attempts: int = 3,
     *,
     tournament_id: str | None = None,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> TournamentCheckpoint:
     """Preflight and freeze one tournament identity, configuration, and schedule."""
 
-    _, descriptors, game_config = _validated_round_robin_inputs(game, players, seed, max_attempts)
+    entrants, descriptors, game_config = _validated_round_robin_inputs(
+        game, players, seed, max_attempts
+    )
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    if requires_panel and judge_panel is None:
+        raise ValueError(f"项目 {game.name!r} 需要 LLM 评审团")
+    if not requires_panel and judge_panel is not None:
+        raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
+    if judge_panel is not None:
+        judge_panel.validate_contestants(list(entrants))
     created_at = datetime.now(UTC)
     values: dict[str, object] = {
         "schema_version": TOURNAMENT_CHECKPOINT_SCHEMA_VERSION,
@@ -692,6 +718,7 @@ def prepare_round_robin(
         "max_attempts": max_attempts,
         "players": descriptors,
         "schedule": _round_robin_schedule(descriptors, seed),
+        "judge_panel": None if judge_panel is None else judge_panel.snapshot(),
         "completed_series": (),
         "created_at": created_at,
         "updated_at": created_at,
@@ -725,6 +752,7 @@ async def resume_round_robin(
     on_event: TournamentEventCallback | None = None,
     on_checkpoint: TournamentCheckpointCallback | None = None,
     on_pairing_start: TournamentPairingStartCallback | None = None,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> TournamentArchive:
     """Continue only the unfinished suffix of a validated tournament checkpoint."""
 
@@ -742,6 +770,16 @@ async def resume_round_robin(
         raise ValueError("恢复循环赛的项目配置与 checkpoint 不一致")
     if _round_robin_schedule(descriptors, checkpoint.seed) != checkpoint.schedule:
         raise ValueError("恢复循环赛的赛程与 checkpoint 不一致")
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    if requires_panel and judge_panel is None:
+        raise ValueError(f"项目 {game.name!r} 需要 LLM 评审团")
+    if not requires_panel and judge_panel is not None:
+        raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
+    if judge_panel is not None:
+        judge_panel.validate_contestants(list(entrants))
+    runtime_snapshot = None if judge_panel is None else judge_panel.snapshot()
+    if runtime_snapshot != checkpoint.judge_panel:
+        raise ValueError("恢复循环赛的评审团与 checkpoint 冻结快照不一致")
 
     current = checkpoint
     for spec in current.schedule[len(current.completed_series) :]:
@@ -765,6 +803,7 @@ async def resume_round_robin(
             seed=spec.seed,
             max_attempts=current.max_attempts,
             on_event=event_callback,
+            judge_panel=judge_panel,
         )
         current = checkpoint_with_series(current, archive)
         if on_checkpoint is not None:
@@ -775,6 +814,7 @@ async def resume_round_robin(
         current.completed_series,
         seed=current.seed,
         tournament_id=current.tournament_id,
+        judge_panel=current.judge_panel,
     )
 
 
@@ -788,6 +828,7 @@ async def play_round_robin(
     tournament_id: str | None = None,
     on_checkpoint: TournamentCheckpointCallback | None = None,
     on_pairing_start: TournamentPairingStartCallback | None = None,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> TournamentArchive:
     """Play one swapped-order two-leg series for every entrant pair."""
 
@@ -797,6 +838,7 @@ async def play_round_robin(
         seed=seed,
         max_attempts=max_attempts,
         tournament_id=tournament_id,
+        judge_panel=judge_panel,
     )
     if on_checkpoint is not None:
         on_checkpoint(checkpoint)
@@ -807,4 +849,5 @@ async def play_round_robin(
         on_event=on_event,
         on_checkpoint=on_checkpoint,
         on_pairing_start=on_pairing_start,
+        judge_panel=judge_panel,
     )

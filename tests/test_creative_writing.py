@@ -99,26 +99,27 @@ def test_creative_writing_all_forfeit_has_rule_score() -> None:
     assert game.score(state) == {"甲": 0.0, "乙": 0.0}
 
 
-def test_creative_writing_capabilities_preserve_legacy_defaults() -> None:
+def test_creative_writing_supports_all_modes_and_preserves_legacy_defaults() -> None:
     class LegacyGame:
         name = "legacy-capability-test"
 
     GAME_REGISTRY[LegacyGame.name] = LegacyGame
     try:
         assert isinstance(create_game("creative_writing", mode="play"), CreativeWriting)
-        assert game_supports_mode("creative_writing", "play")
-        assert not game_supports_mode("creative_writing", "series")
-        assert not game_supports_mode("creative_writing", "round_robin")
-        assert "creative_writing" in list_games("play")
-        assert "creative_writing" not in list_games("series")
-        assert "creative_writing" not in list_games("round_robin")
+        assert all(
+            game_supports_mode("creative_writing", mode)
+            for mode in ("play", "series", "round_robin")
+        )
+        assert all(
+            "creative_writing" in list_games(mode)
+            for mode in ("play", "series", "round_robin")
+        )
         assert all(game_supports_mode(LegacyGame.name, mode) for mode in ("play", "series", "round_robin"))
         assert isinstance(create_game(LegacyGame.name, mode="series"), LegacyGame)
     finally:
         del GAME_REGISTRY[LegacyGame.name]
 
-    with pytest.raises(ValueError, match="不支持比赛模式"):
-        create_game("creative_writing", mode="series")
+    assert isinstance(create_game("creative_writing", mode="series"), CreativeWriting)
 
 
 @pytest.mark.parametrize(

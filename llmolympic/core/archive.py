@@ -177,7 +177,7 @@ class MatchArchive(BaseModel):
             if "judging" not in event.data:
                 continue
             # Local import avoids archive -> judge -> player -> archive at module load.
-            from llmolympic.core.judge import PanelVerdict
+            from llmolympic.core.judge import PanelVerdict, judging_request_digest
 
             try:
                 judging = PanelVerdict.model_validate(event.data["judging"])
@@ -211,7 +211,7 @@ class MatchArchive(BaseModel):
                 if set(judging.scores) - set(judging.fixed_scores) != accepted_players:
                     raise ValueError("创意裁决的送审作品与已接受提交不一致")
                 contestant_ids = {descriptor["entrant_id"] for descriptor in normalized}
-                if judging.schema_version == 2:
+                if judging.schema_version >= 2:
                     # PanelVerdict v2 guarantees a complete snapshot even when
                     # every contestant forfeits and no judge call is made.
                     panel = judging.panel
@@ -256,6 +256,38 @@ class MatchArchive(BaseModel):
                     or game_config.get("criteria") != judging.criteria
                 ):
                     raise ValueError("创意裁决与开赛时冻结的 rubric 不一致")
+                if judging.schema_version == 3:
+                    # Rebuild the creative state from the deterministic seed and
+                    # accepted/forfeited move events.  This binds the stored panel
+                    # result to the exact task and submissions instead of merely
+                    # checking that the same player names are present.
+                    from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError
+                    from llmolympic.games.creative_writing import CreativeWriting
+
+                    creative = CreativeWriting()
+                    state = creative.new_state(
+                        [descriptor["name"] for descriptor in normalized],
+                        self.seed,
+                    )
+                    try:
+                        for item in self.events:
+                            if item.player is None:
+                                continue
+                            if item.type == EventType.MOVE_RECEIVED:
+                                move = item.data.get("move")
+                                if not isinstance(move, str):
+                                    raise ValueError("创意作品事件缺少正文")
+                                creative.apply_move(state, item.player, move)
+                            elif (
+                                item.type == EventType.MOVE_REJECTED
+                                and item.data.get("forfeit") is True
+                            ):
+                                creative.apply_move(state, item.player, FORFEIT_MOVE)
+                        request = creative.judging_request(state)
+                    except (IllegalMoveError, TypeError, ValueError) as exc:
+                        raise ValueError("创意档案无法重建实际评审请求") from exc
+                    if judging.request_digest != judging_request_digest(request):
+                        raise ValueError("创意裁决与实际任务或作品不一致")
         if (
             self.source == "local_engine"
             and self.game == "creative_writing"
