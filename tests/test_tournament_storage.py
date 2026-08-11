@@ -456,7 +456,9 @@ from llmolympic.core.storage import SQLiteStore
 from llmolympic.core.tournament import TournamentCheckpoint
 
 store = SQLiteStore(sys.argv[1], create=False)
-claim = store.claim_tournament_runner(sys.argv[2], lease_seconds=1)
+# Give slower CI interpreters enough time to load and persist the first
+# checkpoint, then deliberately shorten the renewed lease for fast takeover.
+claim = store.claim_tournament_runner(sys.argv[2], lease_seconds=5)
 checkpoint = TournamentCheckpoint.model_validate_json(
     Path(sys.argv[3]).read_text(encoding="utf-8")
 )
