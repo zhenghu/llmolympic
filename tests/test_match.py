@@ -9,20 +9,68 @@ import pytest
 from llmolympic.core.archive import MatchArchive, MoveRecord, legacy_entrant_id
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import FORFEIT_MOVE, IllegalMoveError
-from llmolympic.core.match import MAX_MOVE_CHARS, Match, play_match
+from llmolympic.core.match import MAX_MOVE_CHARS, Match, _collect_move_outcomes, play_match
 from llmolympic.core.player import (
     LLMPlayer,
     Player,
     PlayerProviderError,
     PlayerTimeoutError,
 )
+from llmolympic.core.usage import (
+    BudgetExceededError,
+    BudgetLimits,
+    ProviderBudgetPolicy,
+    RouteBudgetPolicy,
+    UsageBudget,
+    UsageTotals,
+)
 from llmolympic.games import create_game
-from llmolympic.providers.base import Provider
+from llmolympic.providers.base import Provider, ProviderChatResult
 from llmolympic.providers.mock import MockProvider
 
 
 def _llm(name: str, strategy: str, seed: int | None = None) -> LLMPlayer:
     return LLMPlayer(name=name, provider=MockProvider(strategy=strategy, seed=seed), model=strategy)
+
+
+class _CountingMockProvider(MockProvider):
+    def __init__(self, strategy: str) -> None:
+        super().__init__(strategy)
+        self.calls = 0
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        self.calls += 1
+        return await super().achat_with_usage(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            output_token_cap=output_token_cap,
+            **params,
+        )
+
+
+def _bind_shared_budget(
+    players: list[LLMPlayer],
+    budget: UsageBudget,
+) -> ProviderBudgetPolicy:
+    policy = ProviderBudgetPolicy(
+        max_output_tokens_per_call=1024,
+        routes=tuple(
+            RouteBudgetPolicy(route_id=route_id)
+            for route_id in sorted({player.route_id for player in players})
+        ),
+    )
+    for player in players:
+        player.bind_usage_budget(budget, policy)
+    return policy
 
 
 class _SequencePlayer(Player):
@@ -183,6 +231,32 @@ class _ControlledTechnicalLossPlayer(Player):
         raise PlayerProviderError("failed", technical_loss=True)
 
 
+class _ControlledExceptionPlayer(Player):
+    kind = "controlled_exception"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        cancelled: asyncio.Event,
+    ) -> None:
+        super().__init__(name)
+        self.started = started
+        self.release = release
+        self.cancelled = cancelled
+
+    async def get_move(self, prompt: str) -> str:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise ValueError("downstream infra failure")
+
+
 def test_mock_match_completes_with_archive() -> None:
     players = [_llm("mock-a", "random", seed=1), _llm("mock-b", "random", seed=2)]
     archive = asyncio.run(play_match(create_game("math_quiz", rounds=5), players, seed=0))
@@ -332,6 +406,86 @@ def test_cancelling_a_simultaneous_batch_cancels_every_player_task() -> None:
     asyncio.run(scenario())
 
 
+def test_insufficient_batch_budget_starts_no_provider_call() -> None:
+    providers = [_CountingMockProvider("fixed"), _CountingMockProvider("random")]
+    players = [
+        LLMPlayer("first", providers[0], "first-model"),
+        LLMPlayer("second", providers[1], "second-model"),
+    ]
+    budget = UsageBudget(BudgetLimits(calls=1))
+    _bind_shared_budget(players, budget)
+
+    with pytest.raises(BudgetExceededError):
+        asyncio.run(play_match(_BlindBatchGame(), players))
+
+    assert [provider.calls for provider in providers] == [0, 0]
+    assert budget.spent == UsageTotals.zero()
+    assert budget.reserved == UsageTotals.zero()
+
+
+def test_retry_reserves_and_accounts_each_transport_attempt() -> None:
+    providers = [_CountingMockProvider("illegal"), _CountingMockProvider("fixed")]
+    players = [
+        LLMPlayer("illegal", providers[0], "ignored-a"),
+        LLMPlayer("fixed", providers[1], "ignored-b"),
+    ]
+    budget = UsageBudget(BudgetLimits(calls=3))
+    _bind_shared_budget(players, budget)
+
+    archive = asyncio.run(
+        play_match(
+            create_game("knowledge_quiz", rounds=1),
+            players,
+            max_attempts=2,
+        )
+    )
+
+    assert archive.scores["illegal"] == 0.0
+    assert [provider.calls for provider in providers] == [2, 1]
+    assert budget.spent.calls == 3
+    assert budget.reserved == UsageTotals.zero()
+
+
+def test_task_cancelled_before_first_execution_releases_its_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers = [_CountingMockProvider("fixed"), _CountingMockProvider("random")]
+    players = [
+        LLMPlayer("first", providers[0], "first-model"),
+        LLMPlayer("second", providers[1], "second-model"),
+    ]
+    budget = UsageBudget(BudgetLimits(calls=2))
+    _bind_shared_budget(players, budget)
+    real_create_task = asyncio.create_task
+    created = 0
+
+    def cancel_second_before_run(coroutine):
+        nonlocal created
+        created += 1
+        task = real_create_task(coroutine)
+        if created == 2:
+            task.cancel()
+        return task
+
+    monkeypatch.setattr(
+        "llmolympic.core.match.asyncio.create_task",
+        cancel_second_before_run,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await _collect_move_outcomes(
+                [(players[0], "first"), (players[1], "second")],
+                terminate_on_player_error=False,
+            )
+
+    asyncio.run(scenario())
+
+    assert [provider.calls for provider in providers] == [1, 0]
+    assert budget.spent.calls == 1
+    assert budget.reserved == UsageTotals.zero()
+
+
 def test_terminal_peer_failure_discards_completed_result_and_cancels_pending() -> None:
     async def scenario() -> tuple[MatchArchive, _ThreePlayerBlindBatchGame, asyncio.Event]:
         game = _ThreePlayerBlindBatchGame()
@@ -452,6 +606,58 @@ def test_simultaneous_terminal_failures_use_registration_order_tie_break() -> No
     assert pending_cancelled.is_set()
     assert [move.player for move in archive.moves] == ["first-failure"]
     assert archive.events[-1].data["forfeited_by"] == "first-failure"
+
+
+def test_non_player_failure_takes_precedence_over_match_technical_loss() -> None:
+    async def scenario() -> asyncio.Event:
+        infrastructure_cancelled = asyncio.Event()
+        pending_cancelled = asyncio.Event()
+        infra_started = asyncio.Event()
+        infra_release = asyncio.Event()
+        technical_started = asyncio.Event()
+        technical_release = asyncio.Event()
+        pending = _ControlledPlayer(
+            "pending",
+            started=asyncio.Event(),
+            release=asyncio.Event(),
+            finished=asyncio.Event(),
+            cancelled=pending_cancelled,
+            completion_order=[],
+            move="unused",
+        )
+        infrastructure = _ControlledExceptionPlayer(
+            "infra",
+            started=infra_started,
+            release=infra_release,
+            cancelled=infrastructure_cancelled,
+        )
+        technical = _ControlledTechnicalLossPlayer(
+            "tech",
+            started=technical_started,
+            release=technical_release,
+        )
+        match_task = asyncio.create_task(
+            play_match(
+                _ThreePlayerBlindBatchGame(),
+                [infrastructure, technical, pending],
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.gather(
+                infra_started.wait(),
+                technical_started.wait(),
+            ),
+            timeout=2.0,
+        )
+        infra_release.set()
+        technical_release.set()
+
+        with pytest.raises(ValueError, match="infra failure"):
+            await asyncio.wait_for(match_task, timeout=2.0)
+        return pending_cancelled
+
+    pending_cancelled = asyncio.run(scenario())
+    assert pending_cancelled.is_set()
 
 
 def test_non_string_response_terminates_batch_and_cancels_pending_peer() -> None:

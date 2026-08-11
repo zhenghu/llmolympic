@@ -16,7 +16,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from llmolympic.core.player import LLMPlayer, Player
+from llmolympic.core.player import (
+    LLMPlayer,
+    Player,
+    UsageReservationProtocol,
+    release_undispatched_reservations,
+    reserve_player_call_batch,
+)
+from llmolympic.core.usage import UsageError, UsageValidationError
 from llmolympic.providers.base import validate_route_id
 
 MIN_JUDGES = 3
@@ -386,6 +393,8 @@ async def score_judge_submission(
     request: JudgingRequest,
     label: str,
     submission: str,
+    *,
+    reservation: UsageReservationProtocol | None = None,
 ) -> tuple[dict[str, float], str]:
     """用正式匿名评审协议为一份作品评分。
 
@@ -402,6 +411,7 @@ async def score_judge_submission(
             rubric_version=request.rubric_version,
         ),
         system_prompt=JUDGE_SYSTEM_PROMPT,
+        reservation=reservation,
     )
     return _parse_response(response, label=label, criteria=list(request.criteria))
 
@@ -468,6 +478,24 @@ class LLMJudgePanel:
         }
         if contestant_routes & {judge.route_id for judge in self.judges}:
             raise ValueError("同一模型路由不能同时担任参赛者和评委")
+        llm_contestants = [
+            contestant for contestant in contestants if isinstance(contestant, LLMPlayer)
+        ]
+        all_llms = [*self.judges, *llm_contestants]
+        budgeted = [player for player in all_llms if player.usage_budget is not None]
+        if budgeted and len(budgeted) != len(all_llms):
+            raise UsageValidationError(
+                "contestants and judges cannot mix budgeted and unbudgeted LLM players"
+            )
+        if budgeted:
+            budget = budgeted[0].usage_budget
+            policy = budgeted[0].budget_policy
+            if any(player.usage_budget is not budget for player in budgeted[1:]):
+                raise UsageValidationError("contestants and judges must share one usage budget")
+            if any(player.budget_policy != policy for player in budgeted[1:]):
+                raise UsageValidationError(
+                    "contestants and judges must share one frozen budget policy"
+                )
 
     async def adjudicate(self, request: JudgingRequest, *, seed: int) -> PanelVerdict:
         """并发完成独立盲评并按评委完整交集形成多数裁决。"""
@@ -491,25 +519,56 @@ class LLMJudgePanel:
             )
 
         players = list(request.submissions)
-        tasks: list[asyncio.Task[tuple[dict[str, float], str]]] = []
         task_keys: list[tuple[int, str, str]] = []
+        task_specs: list[tuple[LLMPlayer, str, str, str]] = []
         label_maps: list[dict[str, str]] = []
         for judge_index, judge in enumerate(self.judges):
             ordered = _anonymous_order(players, seed=seed, judge_id=judge.entrant_id)
             label_map = {chr(ord("A") + index): player for index, player in enumerate(ordered)}
             label_maps.append(label_map)
             for label, player in label_map.items():
+                submission = request.submissions[player]
+                task_specs.append((judge, label, player, submission))
+                task_keys.append((judge_index, label, player))
+
+        reservations = reserve_player_call_batch(
+            (
+                judge,
+                _judge_prompt(
+                    task=request.task,
+                    criteria=request.criteria,
+                    label=label,
+                    submission=submission,
+                    rubric_version=request.rubric_version,
+                ),
+                JUDGE_SYSTEM_PROMPT,
+            )
+            for judge, label, _, submission in task_specs
+        )
+        tasks: list[asyncio.Task[tuple[dict[str, float], str]]] = []
+        try:
+            for (judge, label, _, submission), reservation in zip(
+                task_specs,
+                reservations,
+                strict=True,
+            ):
                 tasks.append(
                     asyncio.create_task(
                         score_judge_submission(
                             judge,
                             request,
                             label,
-                            request.submissions[player],
+                            submission,
+                            reservation=reservation,
                         )
                     )
                 )
-                task_keys.append((judge_index, label, player))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            release_undispatched_reservations(reservations)
+            raise
 
         try:
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -519,6 +578,14 @@ class LLMJudgePanel:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        finally:
+            # A sibling can be cancelled before its coroutine first runs.  Only
+            # those still-reserved calls are safe to release pre-dispatch.
+            release_undispatched_reservations(reservations)
+
+        for outcome in outcomes:
+            if isinstance(outcome, UsageError):
+                raise outcome
 
         by_judge: list[dict[str, tuple[dict[str, float], str]]] = [
             {} for _ in self.judges

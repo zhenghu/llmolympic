@@ -11,6 +11,8 @@ import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal
 from itertools import combinations
 from pathlib import Path
 from typing import Annotated
@@ -28,9 +30,16 @@ from llmolympic.cli.terminal import (
     PROMPT_DISPLAY_LIMIT,
     literal_text,
 )
-from llmolympic.config import get as cfg_get
-from llmolympic.config import get_profile
+from llmolympic.config import (
+    get as cfg_get,
+)
+from llmolympic.config import (
+    get_profile,
+    load_provider_pricing,
+    resolve_budget_settings,
+)
 from llmolympic.core.archive import MatchArchive
+from llmolympic.core.budget_config import ResolvedProviderBudget, resolve_provider_budget
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import (
     MAX_PLAYER_NAME_CHARS,
@@ -46,6 +55,7 @@ from llmolympic.core.player import (
     HumanPlayer,
     LLMPlayer,
     Player,
+    UsageBudgetProtocol,
     profile_entrant_id,
 )
 from llmolympic.core.series import SeriesArchive, play_two_leg_series
@@ -71,6 +81,13 @@ from llmolympic.core.tournament import (
     prepare_round_robin,
     resume_round_robin,
 )
+from llmolympic.core.usage import (
+    NANODOLLARS_PER_USD,
+    BudgetExceededError,
+    UsageBudget,
+    UsageError,
+    UsageTotals,
+)
 from llmolympic.diagnostics import run_diagnostics
 from llmolympic.games import create_game, list_games
 from llmolympic.providers import create_profile_provider, create_provider
@@ -90,6 +107,138 @@ DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
 DEFAULT_TOURNAMENT_SEED = 0
 TOURNAMENT_RUNNER_HEARTBEAT_SECONDS = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS / 4
 TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeBudget:
+    resolved: ResolvedProviderBudget
+    ledger: UsageBudgetProtocol
+
+
+def _budget_players(
+    players: list[Player],
+    judge_panel: LLMJudgePanel | None = None,
+) -> tuple[LLMPlayer, ...]:
+    values = [player for player in players if isinstance(player, LLMPlayer)]
+    if judge_panel is not None:
+        values.extend(judge_panel.judges)
+    return tuple(values)
+
+
+def _bind_runtime_budget(
+    players: list[Player],
+    judge_panel: LLMJudgePanel | None,
+    resolved: ResolvedProviderBudget,
+    ledger: UsageBudgetProtocol,
+) -> _RuntimeBudget:
+    llm_players = _budget_players(players, judge_panel)
+    for player in llm_players:
+        player.bind_usage_budget(ledger, resolved.policy)
+    if judge_panel is not None:
+        judge_panel.validate_contestants(players)
+    return _RuntimeBudget(resolved=resolved, ledger=ledger)
+
+
+def _resolve_budget_definition(
+    players: list[Player],
+    judge_panel: LLMJudgePanel | None,
+    *,
+    max_provider_calls: int | None,
+    max_input_tokens: int | None,
+    max_output_tokens_per_call: int | None,
+    max_total_output_tokens: int | None,
+    max_estimated_cost_usd: str | None,
+) -> ResolvedProviderBudget | None:
+    """Resolve trusted inputs before SQLite is opened or a call is authorized."""
+
+    try:
+        settings = resolve_budget_settings(
+            max_provider_calls=max_provider_calls,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens_per_call=max_output_tokens_per_call,
+            max_total_output_tokens=max_total_output_tokens,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+        )
+        return resolve_provider_budget(
+            _budget_players(players, judge_panel),
+            settings,
+            load_provider_pricing(),
+        )
+    except (TypeError, ValueError, UsageError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="Provider budget") from exc
+
+
+def _prepare_in_memory_budget(
+    players: list[Player],
+    judge_panel: LLMJudgePanel | None,
+    *,
+    max_provider_calls: int | None,
+    max_input_tokens: int | None,
+    max_output_tokens_per_call: int | None,
+    max_total_output_tokens: int | None,
+    max_estimated_cost_usd: str | None,
+) -> _RuntimeBudget | None:
+    """Resolve and bind a play/series budget before SQLite is opened."""
+
+    resolved = _resolve_budget_definition(
+        players,
+        judge_panel,
+        max_provider_calls=max_provider_calls,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens_per_call=max_output_tokens_per_call,
+        max_total_output_tokens=max_total_output_tokens,
+        max_estimated_cost_usd=max_estimated_cost_usd,
+    )
+    if resolved is None:
+        return None
+    try:
+        return _bind_runtime_budget(
+            players,
+            judge_panel,
+            resolved,
+            UsageBudget(resolved.limits),
+        )
+    except (TypeError, ValueError, UsageError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="Provider budget") from exc
+
+
+def _usage_totals(ledger: UsageBudgetProtocol) -> UsageTotals:
+    spent = getattr(ledger, "spent", None)
+    if not isinstance(spent, UsageTotals):
+        raise TypeError("usage ledger did not expose UsageTotals")
+    return spent
+
+
+def _render_usage_summary(runtime: _RuntimeBudget | None) -> None:
+    if runtime is None:
+        return
+    spent = _usage_totals(runtime.ledger)
+    line = Text("Provider 预算：", style="cyan")
+    line.append(f"{spent.calls} 次模型/算法调用")
+    line.append(f" · input {spent.input} tokens · output {spent.output} tokens")
+    line.append(" · 已计价约 $")
+    dollars = Decimal(spent.estimated_cost) / Decimal(NANODOLLARS_PER_USD)
+    line.append(format(dollars, "f"))
+    unpriced = sum(route.price is None for route in runtime.resolved.policy.routes)
+    if unpriced:
+        line.append(f" · {unpriced} 条路由未计价", style="yellow")
+    console.print(line)
+
+
+def _render_usage_error(exc: UsageError) -> None:
+    line = Text("Provider 预算中止；本次结果未存档且未更新 ELO：", style="red")
+    if isinstance(exc, BudgetExceededError):
+        names = {
+            "calls": "调用次数",
+            "input": "输入 Token",
+            "output": "输出 Token",
+            "estimated_cost": "预估费用",
+        }
+        line.append(names.get(exc.dimension, exc.dimension))
+        line.append("达到硬上限")
+    else:
+        line.append(getattr(exc, "reason_code", "usage_error"))
+    console.print(line)
 
 
 def _version_callback(value: bool) -> None:
@@ -1261,6 +1410,39 @@ def play(
             ),
         ),
     ] = None,
+    max_provider_calls: int | None = typer.Option(
+        None,
+        "--max-provider-calls",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="本次运行允许的模型/算法调用总数硬上限",
+    ),
+    max_input_tokens: int | None = typer.Option(
+        None,
+        "--max-input-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="本次运行累计输入 Token 硬上限",
+    ),
+    max_output_tokens_per_call: int | None = typer.Option(
+        None,
+        "--max-output-tokens-per-call",
+        min=1,
+        max=SQLITE_INT_MAX,
+        help="每次模型请求的输出 Token 上限（默认 1024）",
+    ),
+    max_total_output_tokens: int | None = typer.Option(
+        None,
+        "--max-total-output-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="本次运行累计输出 Token 硬上限",
+    ),
+    max_estimated_cost_usd: str | None = typer.Option(
+        None,
+        "--max-estimated-cost-usd",
+        help="按本地冻结价格计算的美元费用硬上限（不等同 Provider 最终账单）",
+    ),
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
@@ -1283,6 +1465,15 @@ def play(
         llm_timeout=llm_timeout,
         no_llm_timeout=no_llm_timeout,
     )
+    runtime_budget = _prepare_in_memory_budget(
+        selected_players,
+        judge_panel,
+        max_provider_calls=max_provider_calls,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens_per_call=max_output_tokens_per_call,
+        max_total_output_tokens=max_total_output_tokens,
+        max_estimated_cost_usd=max_estimated_cost_usd,
+    )
     store = _open_store(database)
     try:
         if judge_panel is None:
@@ -1297,6 +1488,9 @@ def play(
                     judge_panel=judge_panel,
                 )
             )
+    except UsageError as exc:
+        _render_usage_error(exc)
+        raise typer.Exit(code=1) from exc
     except JudgePanelError as exc:
         line = Text("评审失败，对局未存档且未更新 ELO：", style="red")
         line.append(literal_text(exc))
@@ -1323,6 +1517,8 @@ def play(
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
+    finally:
+        _best_effort_render(_render_usage_summary, runtime_budget)
 
 
 @app.command()
@@ -1371,6 +1567,39 @@ def series(
         "--no-llm-timeout",
         help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
+    max_provider_calls: int | None = typer.Option(
+        None,
+        "--max-provider-calls",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="两局合计模型/算法调用总数硬上限",
+    ),
+    max_input_tokens: int | None = typer.Option(
+        None,
+        "--max-input-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="两局合计输入 Token 硬上限",
+    ),
+    max_output_tokens_per_call: int | None = typer.Option(
+        None,
+        "--max-output-tokens-per-call",
+        min=1,
+        max=SQLITE_INT_MAX,
+        help="每次模型请求的输出 Token 上限（默认 1024）",
+    ),
+    max_total_output_tokens: int | None = typer.Option(
+        None,
+        "--max-total-output-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="两局合计输出 Token 硬上限",
+    ),
+    max_estimated_cost_usd: str | None = typer.Option(
+        None,
+        "--max-estimated-cost-usd",
+        help="两局按本地冻结价格计算的美元费用硬上限",
+    ),
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
@@ -1389,14 +1618,28 @@ def series(
         allow_human=False,
         mode="series",
     )
+    runtime_budget = _prepare_in_memory_budget(
+        selected_players,
+        None,
+        max_provider_calls=max_provider_calls,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens_per_call=max_output_tokens_per_call,
+        max_total_output_tokens=max_total_output_tokens,
+        max_estimated_cost_usd=max_estimated_cost_usd,
+    )
     store = _open_store(database)
     try:
         asyncio.run(_run_series(selected_game, selected_players, seed, store))
+    except UsageError as exc:
+        _render_usage_error(exc)
+        raise typer.Exit(code=1) from exc
     except (OSError, sqlite3.Error, StorageError) as exc:
         line = Text("双局赛已完成，但 SQLite 原子存档失败：", style="red")
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
+    finally:
+        _best_effort_render(_render_usage_summary, runtime_budget)
 
 
 @app.command(name="round-robin")
@@ -1449,6 +1692,39 @@ def round_robin(
         "--allow-large-tournament",
         help=("显式允许超过默认对局/调用阈值的大型循环赛；请先确认 Provider 费用预算"),
     ),
+    max_provider_calls: int | None = typer.Option(
+        None,
+        "--max-provider-calls",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项循环赛模型/算法调用总数硬上限",
+    ),
+    max_input_tokens: int | None = typer.Option(
+        None,
+        "--max-input-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项循环赛累计输入 Token 硬上限",
+    ),
+    max_output_tokens_per_call: int | None = typer.Option(
+        None,
+        "--max-output-tokens-per-call",
+        min=1,
+        max=SQLITE_INT_MAX,
+        help="每次模型请求的输出 Token 上限（默认 1024）",
+    ),
+    max_total_output_tokens: int | None = typer.Option(
+        None,
+        "--max-total-output-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项循环赛累计输出 Token 硬上限",
+    ),
+    max_estimated_cost_usd: str | None = typer.Option(
+        None,
+        "--max-estimated-cost-usd",
+        help="整项循环赛按本地冻结价格计算的美元费用硬上限",
+    ),
     resume: str | None = typer.Option(
         None,
         "--resume",
@@ -1462,6 +1738,8 @@ def round_robin(
     """新建或恢复 3–16 名非人类选手的交换顺序循环赛。"""
 
     resumed = resume is not None
+    resolved_budget: ResolvedProviderBudget | None = None
+    runtime_budget: _RuntimeBudget | None = None
     if resumed:
         conflicts = [
             option
@@ -1473,6 +1751,14 @@ def round_robin(
                 ("--llm-timeout", llm_timeout is not None),
                 ("--no-llm-timeout", no_llm_timeout),
                 ("--allow-large-tournament", allow_large_tournament),
+                ("--max-provider-calls", max_provider_calls is not None),
+                ("--max-input-tokens", max_input_tokens is not None),
+                (
+                    "--max-output-tokens-per-call",
+                    max_output_tokens_per_call is not None,
+                ),
+                ("--max-total-output-tokens", max_total_output_tokens is not None),
+                ("--max-estimated-cost-usd", max_estimated_cost_usd is not None),
             )
             if supplied
         ]
@@ -1513,6 +1799,15 @@ def round_robin(
             len(selected_players),
             allow_large=allow_large_tournament,
         )
+        resolved_budget = _resolve_budget_definition(
+            selected_players,
+            None,
+            max_provider_calls=max_provider_calls,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens_per_call=max_output_tokens_per_call,
+            max_total_output_tokens=max_total_output_tokens,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+        )
         checkpoint = prepare_round_robin(
             selected_game,
             selected_players,
@@ -1521,8 +1816,17 @@ def round_robin(
         )
         store = _open_store(database)
         try:
-            store.save_tournament_checkpoint(checkpoint)
-        except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
+            if resolved_budget is None:
+                store.save_tournament_checkpoint(checkpoint)
+            else:
+                budget_id = resolved_budget.budget_id_for(checkpoint.tournament_id)
+                store.create_tournament_checkpoint_with_provider_budget(
+                    checkpoint,
+                    budget_id,
+                    resolved_budget.limits,
+                    resolved_budget.policy,
+                )
+        except (OSError, sqlite3.Error, StorageError, UsageError, ValueError) as exc:
             line = Text("无法创建循环赛检查点：", style="red")
             line.append(literal_text(exc))
             console.print(line)
@@ -1539,6 +1843,30 @@ def round_robin(
 
     checkpoint = claim.checkpoint
     lease = claim.lease
+
+    try:
+        stored_budget = store.load_tournament_provider_budget(checkpoint.tournament_id)
+        if stored_budget is not None:
+            resolved_budget = ResolvedProviderBudget(
+                limits=stored_budget.limits,
+                policy=stored_budget.policy,
+            )
+            runtime_budget = _RuntimeBudget(
+                resolved=resolved_budget,
+                ledger=store.bind_tournament_usage_budget(
+                    checkpoint.tournament_id,
+                    lease=lease,
+                ),
+            )
+    except (OSError, sqlite3.Error, StorageError, UsageError, ValueError) as exc:
+        line = Text("无法恢复循环赛 Provider 预算：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        try:
+            store.release_tournament_runner(lease)
+        except (OSError, sqlite3.Error, StorageError, TypeError, ValueError):
+            pass
+        raise typer.Exit(code=1) from exc
 
     try:
         _best_effort_render(_render_checkpoint_ready, checkpoint, store, resumed)
@@ -1563,6 +1891,13 @@ def round_robin(
                     f"无法从检查点恢复比赛配置: {exc}",
                     param_hint="--resume",
                 ) from exc
+        if runtime_budget is not None:
+            runtime_budget = _bind_runtime_budget(
+                selected_players,
+                None,
+                runtime_budget.resolved,
+                runtime_budget.ledger,
+            )
         asyncio.run(
             _run_round_robin(
                 selected_game,
@@ -1579,6 +1914,15 @@ def round_robin(
             latest = checkpoint
         _best_effort_render(_render_tournament_interrupted, latest, store)
         raise typer.Exit(code=130) from exc
+    except UsageError as exc:
+        _render_usage_error(exc)
+        try:
+            latest = store.get_tournament_checkpoint(checkpoint.tournament_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_tournament_interrupted, latest, store)
+        raise typer.Exit(code=1) from exc
     except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
         line = Text("循环赛未完成：", style="red")
         line.append(literal_text(exc))
@@ -1597,6 +1941,7 @@ def round_robin(
             line = Text("警告：未能立即释放循环赛执行权；租约过期后可恢复：", style="yellow")
             line.append(literal_text(exc))
             console.print(line)
+        _best_effort_render(_render_usage_summary, runtime_budget)
 
 
 @app.command(name="games")

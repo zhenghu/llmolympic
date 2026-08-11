@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import sys
 import threading
@@ -17,7 +18,22 @@ from llmolympic.core.player import (
     PlayerProviderError,
     PlayerTimeoutError,
 )
-from llmolympic.providers.base import Provider
+from llmolympic.core.usage import (
+    BudgetLimits,
+    ProviderBudgetPolicy,
+    RouteBudgetPolicy,
+    TokenPrice,
+    UsageBudget,
+    UsageExceedsReservationError,
+    UsageValidationError,
+)
+from llmolympic.providers.base import (
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    Provider,
+    ProviderChatResult,
+    ProviderUsage,
+    UsageSupport,
+)
 
 
 class _SlowAsyncProvider(Provider):
@@ -87,6 +103,73 @@ class _ResponseAsyncProvider(Provider):
         return self.response  # type: ignore[return-value]
 
 
+class _UsageAsyncProvider(Provider):
+    name = "usage"
+
+    def __init__(self, result: ProviderChatResult) -> None:
+        self.result = result
+        self.calls = 0
+        self.received_messages: list[dict] = []
+        self.received_params: dict[str, object] = {}
+
+    def chat(self, messages: list[dict], *, model: str, **params) -> str:
+        raise AssertionError("usage test must use native async provider path")
+
+    def usage_support_for(self, model: str) -> UsageSupport:
+        return UsageSupport.REPORTED
+
+    def resolve_output_token_cap(
+        self,
+        model: str,
+        *,
+        requested_cap: int | None,
+        params: dict[str, object],
+    ) -> int | None:
+        if requested_cap is None:
+            return None
+        configured = params.get("max_tokens", requested_cap)
+        assert isinstance(configured, int)
+        return min(requested_cap, configured)
+
+    async def achat(self, messages: list[dict], *, model: str, **params) -> str:
+        raise AssertionError("usage test must use achat_with_usage")
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        **params,
+    ) -> ProviderChatResult:
+        self.calls += 1
+        self.received_messages = messages
+        self.received_params = params
+        return self.result
+
+
+class _BlockingUsageProvider(_UsageAsyncProvider):
+    def __init__(self) -> None:
+        super().__init__(ProviderChatResult(text="never"))
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        **params,
+    ) -> ProviderChatResult:
+        self.calls += 1
+        self.started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+
 class _ProfileAsyncProvider(_ResponseAsyncProvider):
     name = "profile-provider"
     profile_id = "stable-profile"
@@ -95,6 +178,18 @@ class _ProfileAsyncProvider(_ResponseAsyncProvider):
 class _InvalidRouteProvider(_ResponseAsyncProvider):
     def route_id_for(self, model: str) -> str:
         return "unsafe-route"
+
+
+def _budget_policy(
+    player: LLMPlayer,
+    *,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    price: TokenPrice | None = None,
+) -> ProviderBudgetPolicy:
+    return ProviderBudgetPolicy(
+        max_output_tokens_per_call=max_output_tokens,
+        routes=(RouteBudgetPolicy(route_id=player.route_id, price=price),),
+    )
 
 
 def test_native_async_provider_is_cancelled_at_llm_move_timeout() -> None:
@@ -210,6 +305,272 @@ def test_llm_response_limit_is_recorded_but_not_sent_to_provider() -> None:
     assert player.describe()["max_response_chars"] == 4
     assert provider.received_params["temperature"] == 0.2
     assert "max_response_chars" not in provider.received_params
+
+
+def test_complete_with_usage_preserves_metadata_while_text_apis_stay_compatible() -> None:
+    usage = ProviderUsage(input_tokens=5, output_tokens=2, total_tokens=7)
+    provider = _UsageAsyncProvider(
+        ProviderChatResult(text="answer", usage=usage, finish_reason="stop")
+    )
+    player = LLMPlayer("usage:model", provider, "model", temperature=0.2)
+
+    result = asyncio.run(player.complete_with_usage("prompt", system_prompt="system"))
+
+    assert result == ProviderChatResult(text="answer", usage=usage, finish_reason="stop")
+    assert provider.received_messages == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "prompt"},
+    ]
+    assert provider.received_params == {"request_timeout": 120.0, "temperature": 0.2}
+    assert asyncio.run(player.complete("prompt")) == "answer"
+    assert asyncio.run(player.get_move("prompt")) == "answer"
+    assert provider.calls == 3
+
+
+def test_complete_with_usage_wraps_legacy_async_provider_with_unknown_usage() -> None:
+    player = LLMPlayer("legacy-async:model", _ResponseAsyncProvider("A"), "model")
+
+    result = asyncio.run(player.complete_with_usage("prompt"))
+
+    assert result == ProviderChatResult(text="A")
+
+
+def test_usage_result_does_not_bypass_existing_response_size_error() -> None:
+    provider = _UsageAsyncProvider(
+        ProviderChatResult(
+            text="sensitive-response",
+            usage=ProviderUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+        )
+    )
+    player = LLMPlayer("usage:model", provider, "model", max_response_chars=4)
+
+    with pytest.raises(PlayerProviderError) as raised:
+        asyncio.run(player.complete_with_usage("prompt"))
+
+    assert raised.value.details["validation_error"] == "response_too_long"
+    assert "sensitive-response" not in str(raised.value)
+
+
+def test_budgeted_call_uses_canonical_byte_bound_exact_cap_and_ceiling_price() -> None:
+    provider = _UsageAsyncProvider(
+        ProviderChatResult(
+            text="answer",
+            usage=ProviderUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+        )
+    )
+    player = LLMPlayer("usage:model", provider, "model", max_tokens=19)
+    budget = UsageBudget(BudgetLimits(calls=1, input=10_000, output=19, estimated_cost=1_000))
+    price = TokenPrice(input_nanos_per_million=1, output_nanos_per_million=1)
+    player.bind_usage_budget(
+        budget,
+        _budget_policy(player, max_output_tokens=23, price=price),
+    )
+
+    bound = player.call_bounds("雪", system_prompt="system")
+    assert bound is not None
+    canonical = json.dumps(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "雪"},
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert bound.input == len(canonical)
+    assert bound.output == 19
+    assert bound.estimated_cost == 1
+    assert bound.route_id == player.route_id
+
+    result = asyncio.run(player.complete_with_usage("雪", system_prompt="system"))
+
+    assert result.text == "answer"
+    assert provider.received_params["output_token_cap"] == 19
+    assert budget.reserved.calls == 0
+    assert budget.spent.calls == 1
+    assert budget.spent.input == 5
+    assert budget.spent.output == 2
+    assert budget.spent.estimated_cost == 1
+
+
+def test_missing_usage_conservatively_charges_the_complete_bound() -> None:
+    provider = _UsageAsyncProvider(ProviderChatResult(text="answer", usage=None))
+    player = LLMPlayer("unknown-usage", provider, "model")
+    budget = UsageBudget(BudgetLimits(calls=1, input=10_000, output=7))
+    player.bind_usage_budget(
+        budget,
+        _budget_policy(player, max_output_tokens=7),
+    )
+    bound = player.call_bounds("prompt")
+    assert bound is not None
+
+    assert asyncio.run(player.complete("prompt")) == "answer"
+
+    assert budget.reserved.calls == 0
+    assert budget.spent == bound.as_totals()
+
+
+def test_invalid_reported_counter_charges_bound_and_propagates_usage_error() -> None:
+    provider = _UsageAsyncProvider(
+        ProviderChatResult(
+            text="answer",
+            usage=ProviderUsage(
+                input_tokens=2**63,
+                output_tokens=0,
+                total_tokens=2**63,
+            ),
+        )
+    )
+    player = LLMPlayer("invalid-counter", provider, "model")
+    budget = UsageBudget(BudgetLimits(calls=1, input=10_000, output=7))
+    player.bind_usage_budget(
+        budget,
+        _budget_policy(player, max_output_tokens=7),
+    )
+    bound = player.call_bounds("prompt")
+    assert bound is not None
+
+    with pytest.raises(UsageValidationError, match="SQLite"):
+        asyncio.run(player.complete("prompt"))
+
+    assert budget.spent == bound.as_totals()
+    assert budget.reserved.calls == 0
+
+
+def test_provider_failure_after_dispatch_charges_calls_only_bound() -> None:
+    player = LLMPlayer("failed-call", _FailingAsyncProvider(), "model")
+    budget = UsageBudget(BudgetLimits(calls=1))
+    player.bind_usage_budget(budget, _budget_policy(player))
+
+    with pytest.raises(PlayerProviderError):
+        asyncio.run(player.complete("prompt"))
+
+    assert budget.spent.calls == 1
+    assert budget.reserved.calls == 0
+
+
+def test_cancellation_after_dispatch_conservatively_charges_the_complete_bound() -> None:
+    async def scenario() -> tuple[_BlockingUsageProvider, UsageBudget, object]:
+        provider = _BlockingUsageProvider()
+        player = LLMPlayer(
+            "cancelled-usage",
+            provider,
+            "model",
+            move_timeout_seconds=None,
+        )
+        budget = UsageBudget(BudgetLimits(calls=1, input=10_000, output=11))
+        player.bind_usage_budget(
+            budget,
+            _budget_policy(player, max_output_tokens=11),
+        )
+        bound = player.call_bounds("prompt")
+        assert bound is not None
+        task = asyncio.create_task(player.complete("prompt"))
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return provider, budget, bound
+
+    provider, budget, bound = asyncio.run(scenario())
+
+    assert provider.cancelled
+    assert budget.reserved.calls == 0
+    assert budget.spent == bound.as_totals()  # type: ignore[union-attr]
+
+
+def test_reported_overrun_propagates_usage_error_without_provider_wrapping() -> None:
+    provider = _UsageAsyncProvider(
+        ProviderChatResult(
+            text="answer",
+            usage=ProviderUsage(input_tokens=10_000, output_tokens=1, total_tokens=10_001),
+        )
+    )
+    player = LLMPlayer("overrun", provider, "model")
+    budget = UsageBudget(BudgetLimits())
+    player.bind_usage_budget(
+        budget,
+        _budget_policy(player, max_output_tokens=4),
+    )
+
+    with pytest.raises(UsageExceedsReservationError):
+        asyncio.run(player.complete("prompt"))
+
+    assert provider.calls == 1
+    assert budget.poisoned
+    assert budget.reserved.calls == 0
+    assert budget.spent.input == 10_000
+
+
+def test_legacy_provider_only_allows_default_calls_only_budget_mode() -> None:
+    player = LLMPlayer("legacy-calls", _ResponseAsyncProvider("A"), "model")
+    calls_only = UsageBudget(BudgetLimits(calls=1))
+    player.bind_usage_budget(calls_only, _budget_policy(player))
+
+    assert asyncio.run(player.complete("prompt")) == "A"
+    assert calls_only.spent.calls == 1
+
+    token_limited = LLMPlayer("legacy-token", _ResponseAsyncProvider("A"), "model")
+    with pytest.raises(UsageValidationError, match="does not report usage"):
+        token_limited.bind_usage_budget(
+            UsageBudget(BudgetLimits(input=100)),
+            _budget_policy(token_limited),
+        )
+
+    custom_cap = LLMPlayer("legacy-cap", _ResponseAsyncProvider("A"), "model")
+    with pytest.raises(UsageValidationError, match="does not report usage"):
+        custom_cap.bind_usage_budget(
+            UsageBudget(BudgetLimits(calls=1)),
+            _budget_policy(custom_cap, max_output_tokens=17),
+        )
+
+
+def test_budget_binding_is_one_shot_and_must_precede_every_llm_call() -> None:
+    first = LLMPlayer("one-shot", _UsageAsyncProvider(ProviderChatResult("A")), "model")
+    budget = UsageBudget(BudgetLimits(calls=1))
+    policy = _budget_policy(first)
+    first.bind_usage_budget(budget, policy)
+
+    with pytest.raises(UsageValidationError, match="already bound"):
+        first.bind_usage_budget(budget, policy)
+
+    late = LLMPlayer("late-bind", _UsageAsyncProvider(ProviderChatResult("A")), "model")
+    asyncio.run(late.complete("prompt"))
+    with pytest.raises(UsageValidationError, match="after an LLM call started"):
+        late.bind_usage_budget(
+            UsageBudget(BudgetLimits(calls=1)),
+            _budget_policy(late),
+        )
+
+
+def test_budgeted_call_rejects_request_mutation_after_binding() -> None:
+    provider = _UsageAsyncProvider(ProviderChatResult(text="answer"))
+    player = LLMPlayer("mutating", provider, "model", temperature=0.2)
+    budget = UsageBudget(BudgetLimits(calls=1))
+    policy = _budget_policy(player)
+    player.bind_usage_budget(budget, policy)
+
+    player.model = "altered-model"
+    with pytest.raises(UsageValidationError, match="changed after binding"):
+        asyncio.run(player.get_move("prompt"))
+
+    player.model = "model"
+    player.sampling_params["max_tokens"] = 7
+    with pytest.raises(UsageValidationError, match="changed after binding"):
+        asyncio.run(player.get_move("prompt"))
+    assert provider.calls == 0
+
+
+def test_budgeted_call_rejects_new_forbidden_sampling_params_after_binding() -> None:
+    provider = _UsageAsyncProvider(ProviderChatResult(text="answer"))
+    player = LLMPlayer("forbidden", provider, "model")
+    budget = UsageBudget(BudgetLimits(calls=1))
+    player.bind_usage_budget(budget, _budget_policy(player))
+
+    player.sampling_params["extra_body"] = {"max_tokens": 8}
+    with pytest.raises(UsageValidationError, match="changed after binding"):
+        asyncio.run(player.get_move("prompt"))
+    assert provider.calls == 0
 
 
 def test_llm_response_over_limit_is_a_sanitized_technical_loss() -> None:

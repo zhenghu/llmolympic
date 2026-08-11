@@ -16,12 +16,13 @@ import re
 import secrets
 import sqlite3
 import warnings
+from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 from llmolympic.config import get as cfg_get
 from llmolympic.core.archive import (
@@ -47,8 +48,21 @@ from llmolympic.core.tournament import (
     TournamentCheckpoint,
     tournament_from_series,
 )
+from llmolympic.core.usage import (
+    BudgetExceededError,
+    BudgetLimits,
+    BudgetPoisonedError,
+    CallBounds,
+    ProviderBudgetPolicy,
+    ReservationStateError,
+    UsageCounterOverflowError,
+    UsageExceedsReservationError,
+    UsageTotals,
+    UsageValidationError,
+)
+from llmolympic.providers.base import validate_route_id
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 RatingSource = Literal["engine", "imported"]
 SQLITE_INT_MIN = -(2**63)
 SQLITE_INT_MAX = 2**63 - 1
@@ -58,6 +72,7 @@ _PRIVATE_FILE_MODE = 0o600
 _SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _SAFE_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _RUNNER_LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
+_USAGE_LEDGER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS = 60
 MAX_TOURNAMENT_RUNNER_LEASE_SECONDS = 86_400
 _IDENTITY_SAMPLING_KEYS = frozenset(
@@ -430,6 +445,18 @@ class TournamentRunnerLeaseLostError(TournamentRunnerLeaseError):
     """A runner no longer owns the active fencing generation."""
 
 
+class ProviderBudgetCollisionError(StorageError):
+    """A durable budget id is already attached to different limits or scope."""
+
+
+class ProviderCallAttemptCollisionError(StorageError):
+    """A provider-call attempt id is already present in the durable ledger."""
+
+
+class ProviderBudgetPendingError(StorageError):
+    """A budget or tournament cannot finalize with unresolved call attempts."""
+
+
 class UnsupportedSchemaError(StorageError):
     """The database was created by a newer, unsupported schema version."""
 
@@ -526,6 +553,264 @@ class TournamentRunnerClaim:
 
     checkpoint: TournamentCheckpoint
     lease: TournamentRunnerLease
+
+
+ProviderCallAttemptState = Literal[
+    "reserved",
+    "dispatched",
+    "settled",
+    "released_pre_dispatch",
+    "charged_unknown",
+    "violation",
+]
+
+
+@dataclass(frozen=True)
+class ProviderBudgetSnapshot:
+    """Disclosure-safe aggregate view of one durable Provider budget."""
+
+    budget_id: str
+    limits: BudgetLimits
+    policy: ProviderBudgetPolicy
+    spent: UsageTotals
+    reserved: UsageTotals
+    tournament_id: str | None
+    created_at_epoch: int
+    finalized_at_epoch: int | None
+    poison_reason_code: str | None
+
+    @property
+    def finalized(self) -> bool:
+        return self.finalized_at_epoch is not None
+
+    @property
+    def poisoned(self) -> bool:
+        return self.poison_reason_code is not None
+
+    @property
+    def state(self) -> Literal["open", "poisoned", "finalized"]:
+        if self.finalized:
+            return "finalized"
+        if self.poisoned:
+            return "poisoned"
+        return "open"
+
+
+@dataclass(frozen=True)
+class ProviderCallAttempt:
+    """One opaque, content-free Provider transport-attempt ledger row."""
+
+    attempt_id: str
+    budget_id: str
+    route_id: str
+    bounds: CallBounds
+    state: ProviderCallAttemptState
+    actual: UsageTotals | None
+    charged: UsageTotals | None
+    runner_generation: int | None
+    created_at_epoch: int
+    dispatched_at_epoch: int | None
+    finished_at_epoch: int | None
+
+    @property
+    def reservation_id(self) -> str:
+        """Compatibility alias for callers that call attempts reservations."""
+
+        return self.attempt_id
+
+
+class SQLiteUsageReservation:
+    """Protocol adapter for one durable Provider call-attempt reservation."""
+
+    __slots__ = ("_attempt", "_budget")
+
+    def __init__(
+        self,
+        budget: SQLiteUsageBudget,
+        attempt: ProviderCallAttempt,
+    ) -> None:
+        if not isinstance(budget, SQLiteUsageBudget):
+            raise TypeError("budget must be SQLiteUsageBudget")
+        if not isinstance(attempt, ProviderCallAttempt):
+            raise TypeError("attempt must be ProviderCallAttempt")
+        if attempt.budget_id != budget.budget_id:
+            raise ReservationStateError(
+                "Provider call attempt belongs to a different durable budget"
+            )
+        stored = budget._store.get_provider_call_attempt(attempt.attempt_id)
+        if stored != attempt:
+            raise ReservationStateError(
+                "Provider call attempt does not match its durable route and bounds"
+            )
+        self._budget = budget
+        self._attempt = attempt
+
+    @property
+    def reservation_id(self) -> str:
+        return self._attempt.attempt_id
+
+    @property
+    def budget_id(self) -> str:
+        return self._attempt.budget_id
+
+    @property
+    def bounds(self) -> CallBounds:
+        return self._attempt.bounds
+
+    def _reload(self) -> ProviderCallAttempt:
+        attempt = self._budget._store.get_provider_call_attempt(self.reservation_id)
+        if attempt is None or attempt.budget_id != self._budget.budget_id:
+            raise StorageError("durable Provider call attempt disappeared")
+        if (
+            attempt.route_id != self._attempt.route_id
+            or attempt.bounds != self._attempt.bounds
+            or attempt.runner_generation != self._attempt.runner_generation
+            or attempt.created_at_epoch != self._attempt.created_at_epoch
+        ):
+            raise ReservationStateError(
+                "Provider call attempt immutable reservation fields changed"
+            )
+        self._attempt = attempt
+        return attempt
+
+    @property
+    def state(self) -> str:
+        return self._reload().state
+
+    @property
+    def actual(self) -> UsageTotals | None:
+        return self._reload().actual
+
+    def dispatch(self) -> Self:
+        self._reload()
+        self._attempt = self._budget._store.mark_provider_call_dispatched(
+            self.reservation_id,
+            lease=self._budget._lease,
+        )
+        return self
+
+    def settle(self, usage: UsageTotals | None) -> UsageTotals:
+        self._reload()
+        self._attempt = self._budget._store.settle_provider_call(
+            self.reservation_id,
+            usage,
+            lease=self._budget._lease,
+        )
+        if self._attempt.charged is None:
+            raise StorageError("settled Provider call attempt has no durable charge")
+        return self._attempt.charged
+
+    def release_pre_dispatch(self) -> None:
+        self._reload()
+        self._attempt = self._budget._store.release_provider_call_pre_dispatch(
+            self.reservation_id,
+            lease=self._budget._lease,
+        )
+
+    def charge_unknown(self) -> UsageTotals:
+        self._reload()
+        self._attempt = self._budget._store.charge_provider_call_unknown(
+            self.reservation_id,
+            lease=self._budget._lease,
+        )
+        if self._attempt.charged is None:
+            raise StorageError("unknown Provider call attempt has no durable charge")
+        return self._attempt.charged
+
+    def __enter__(self) -> Self:
+        return self.dispatch()
+
+    def _charge_context_if_dispatched(self, *, preserve_original: bool) -> None:
+        try:
+            if self.state == "dispatched":
+                self.charge_unknown()
+        except BaseException:
+            if not preserve_original:
+                raise
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        self._charge_context_if_dispatched(preserve_original=exc_type is not None)
+        return False
+
+    async def __aenter__(self) -> Self:
+        return self.dispatch()
+
+    async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        self._charge_context_if_dispatched(preserve_original=exc_type is not None)
+        return False
+
+
+class SQLiteUsageBudget:
+    """Durable adapter satisfying the Player usage-budget structural protocol."""
+
+    __slots__ = ("_budget_id", "_lease", "_store")
+
+    def __init__(
+        self,
+        store: SQLiteStore,
+        budget_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> None:
+        self._store = store
+        self._budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        self._lease = lease
+        if self._store.load_provider_budget(self.budget_id) is None:
+            raise StorageError("Provider budget does not exist")
+
+    @property
+    def budget_id(self) -> str:
+        return self._budget_id
+
+    @property
+    def snapshot(self) -> ProviderBudgetSnapshot:
+        snapshot = self._store.load_provider_budget(self.budget_id)
+        if snapshot is None:
+            raise StorageError("Provider budget does not exist")
+        return snapshot
+
+    @property
+    def limits(self) -> BudgetLimits:
+        return self.snapshot.limits
+
+    def owns(self, reservation: object) -> bool:
+        return isinstance(reservation, SQLiteUsageReservation) and reservation._budget is self
+
+    @property
+    def policy(self) -> ProviderBudgetPolicy:
+        return self.snapshot.policy
+
+    @property
+    def spent(self) -> UsageTotals:
+        return self.snapshot.spent
+
+    @property
+    def reserved(self) -> UsageTotals:
+        return self.snapshot.reserved
+
+    @property
+    def poisoned(self) -> bool:
+        return self.snapshot.poisoned
+
+    def reserve(self, bounds: CallBounds) -> SQLiteUsageReservation:
+        return self.reserve_many((bounds,))[0]
+
+    def reserve_many(
+        self,
+        bounds: Iterable[CallBounds],
+    ) -> tuple[SQLiteUsageReservation, ...]:
+        attempts = self._store.reserve_provider_call_batch(
+            self.budget_id,
+            bounds,
+            lease=self._lease,
+        )
+        return tuple(SQLiteUsageReservation(self, attempt) for attempt in attempts)
+
+    def finalize(self) -> ProviderBudgetSnapshot:
+        return self._store.finalize_provider_budget(
+            self.budget_id,
+            lease=self._lease,
+        )
 
 
 @dataclass(frozen=True)
@@ -683,6 +968,73 @@ def _validate_runner_lease_handle(
     return _runner_lease_token_digest(lease.token)
 
 
+def _validate_usage_ledger_id(value: object, field: str) -> str:
+    if not isinstance(value, str) or not _USAGE_LEDGER_ID_RE.fullmatch(value):
+        raise UsageValidationError(
+            f"{field} must be a 1-128 character opaque ASCII identifier"
+        )
+    return value
+
+
+def _usage_from_bounds(bounds: CallBounds) -> UsageTotals:
+    if not isinstance(bounds, CallBounds):
+        raise UsageValidationError("bounds must contain only CallBounds")
+    return UsageTotals(
+        calls=1,
+        input=bounds.input,
+        output=bounds.output,
+        estimated_cost=bounds.estimated_cost,
+    )
+
+
+def _checked_usage_add(left: UsageTotals, right: UsageTotals) -> UsageTotals:
+    values: dict[str, int] = {}
+    for dimension in ("calls", "input", "output", "estimated_cost"):
+        value = getattr(left, dimension) + getattr(right, dimension)
+        if value > SQLITE_INT_MAX:
+            raise UsageCounterOverflowError(f"usage counter overflow for {dimension}")
+        values[dimension] = value
+    return UsageTotals(**values)
+
+
+def _checked_usage_subtract(left: UsageTotals, right: UsageTotals) -> UsageTotals:
+    values: dict[str, int] = {}
+    for dimension in ("calls", "input", "output", "estimated_cost"):
+        value = getattr(left, dimension) - getattr(right, dimension)
+        if value < 0:
+            raise ReservationStateError(f"usage counter underflow for {dimension}")
+        values[dimension] = value
+    return UsageTotals(**values)
+
+
+def _sum_call_bounds(bounds: tuple[CallBounds, ...]) -> UsageTotals:
+    total = UsageTotals.zero()
+    for bound in bounds:
+        total = _checked_usage_add(total, _usage_from_bounds(bound))
+    return total
+
+
+def _validate_durable_budget_definition(
+    limits: object,
+    policy: object,
+) -> tuple[BudgetLimits, ProviderBudgetPolicy]:
+    if not isinstance(limits, BudgetLimits):
+        raise UsageValidationError("limits must be BudgetLimits")
+    if not isinstance(policy, ProviderBudgetPolicy):
+        raise UsageValidationError("policy must be ProviderBudgetPolicy")
+    if not policy.routes:
+        raise UsageValidationError("budget policy must contain at least one route")
+    if len(policy.canonical_json()) > 65_536:
+        raise UsageValidationError("budget policy JSON exceeds the durable size limit")
+    if limits.estimated_cost is not None and any(
+        route.price is None for route in policy.routes
+    ):
+        raise UsageValidationError(
+            "cost-limited budget requires a frozen price for every route"
+        )
+    return limits, policy
+
+
 def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
     """Inspect SQLite without creating, chmodding, migrating, or writing sidecars.
 
@@ -738,6 +1090,8 @@ def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
                 SQLiteStore._verify_v5_schema(connection)
             elif version == 6:
                 SQLiteStore._verify_v6_schema(connection)
+            elif version == 7:
+                SQLiteStore._verify_v7_schema(connection)
             else:
                 SQLiteStore._verify_schema(connection)
             SQLiteStore._verify_foreign_keys(connection)
@@ -852,6 +1206,15 @@ def audit_tournament(
                 connection,
                 tournament_id,
             )
+            budget_rows = connection.execute(
+                "SELECT budget_id FROM provider_budgets WHERE tournament_id = ?",
+                (tournament_id,),
+            ).fetchall()
+            for budget_row in budget_rows:
+                verifier._provider_budget_snapshot_in_transaction(
+                    connection,
+                    budget_row["budget_id"],
+                )
             if loaded_checkpoint is None and loaded_tournament is None:
                 raise TournamentAuditError("tournament_not_found")
 
@@ -1098,7 +1461,7 @@ class SQLiteStore:
             # requires foreign-key enforcement to be disabled before the transaction
             # starts.  The migration still runs a full foreign_key_check before commit
             # and enforcement is restored in ``finally`` on every path.
-            foreign_keys_disabled = 1 <= version < SCHEMA_VERSION
+            foreign_keys_disabled = 1 <= version < 7
             if foreign_keys_disabled:
                 connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
@@ -1126,6 +1489,8 @@ class SQLiteStore:
                     self._verify_v5_schema(connection)
                 elif locked_version == 6:
                     self._verify_v6_schema(connection)
+                elif locked_version == 7:
+                    self._verify_v7_schema(connection)
                 if locked_version < 4:
                     self._create_tournament_schema(connection)
                 if locked_version < 5:
@@ -1137,9 +1502,11 @@ class SQLiteStore:
                         self._canonicalize_archive_tables(connection)
                     self._create_rating_operation_schema(connection)
                     self._backfill_rating_operations(connection)
+                if locked_version < 8:
+                    self._create_provider_usage_schema(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
-                if 0 < locked_version < SCHEMA_VERSION:
+                if 0 < locked_version < 7:
                     # A v1-v6 database has no durable operation sequence.  Rowid
                     # order is the best available backfill source, but it is not
                     # itself an integrity guarantee (rowids can be rewritten).
@@ -1626,6 +1993,224 @@ class SQLiteStore:
                     + (tournament_id IS NOT NULL) = 1
                 )
             )
+            """
+        )
+
+    @staticmethod
+    def _create_provider_usage_schema(connection: sqlite3.Connection) -> None:
+        """Create the content-free, integer-only Provider budget ledger."""
+
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS provider_budgets (
+                budget_id TEXT PRIMARY KEY
+                    CHECK (length(budget_id) BETWEEN 1 AND 128
+                           AND instr(budget_id, char(0)) = 0),
+                tournament_id TEXT UNIQUE
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                policy_json TEXT NOT NULL
+                    CHECK (length(policy_json) BETWEEN 1 AND 65536),
+                policy_digest TEXT NOT NULL CHECK (
+                    length(policy_digest) = 64
+                    AND policy_digest = lower(policy_digest)
+                    AND policy_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+                limit_calls INTEGER CHECK (limit_calls IS NULL OR limit_calls >= 0),
+                limit_input_tokens INTEGER
+                    CHECK (limit_input_tokens IS NULL OR limit_input_tokens >= 0),
+                limit_output_tokens INTEGER
+                    CHECK (limit_output_tokens IS NULL OR limit_output_tokens >= 0),
+                limit_estimated_cost_nanos INTEGER
+                    CHECK (limit_estimated_cost_nanos IS NULL
+                           OR limit_estimated_cost_nanos >= 0),
+                spent_calls INTEGER NOT NULL CHECK (spent_calls >= 0),
+                spent_input_tokens INTEGER NOT NULL CHECK (spent_input_tokens >= 0),
+                spent_output_tokens INTEGER NOT NULL CHECK (spent_output_tokens >= 0),
+                spent_estimated_cost_nanos INTEGER NOT NULL
+                    CHECK (spent_estimated_cost_nanos >= 0),
+                reserved_calls INTEGER NOT NULL CHECK (reserved_calls >= 0),
+                reserved_input_tokens INTEGER NOT NULL CHECK (reserved_input_tokens >= 0),
+                reserved_output_tokens INTEGER NOT NULL CHECK (reserved_output_tokens >= 0),
+                reserved_estimated_cost_nanos INTEGER NOT NULL
+                    CHECK (reserved_estimated_cost_nanos >= 0),
+                poison_reason_code TEXT CHECK (
+                    poison_reason_code IS NULL OR poison_reason_code IN (
+                        'usage_exceeds_reservation', 'usage_counter_overflow'
+                    )
+                ),
+                created_at_epoch INTEGER NOT NULL CHECK (created_at_epoch >= 0),
+                finalized_at_epoch INTEGER CHECK (
+                    finalized_at_epoch IS NULL OR finalized_at_epoch >= created_at_epoch
+                ),
+                CHECK (spent_calls <= {SQLITE_INT_MAX} - reserved_calls),
+                CHECK (spent_input_tokens <= {SQLITE_INT_MAX} - reserved_input_tokens),
+                CHECK (spent_output_tokens <= {SQLITE_INT_MAX} - reserved_output_tokens),
+                CHECK (
+                    spent_estimated_cost_nanos
+                    <= {SQLITE_INT_MAX} - reserved_estimated_cost_nanos
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_calls IS NULL
+                    OR (spent_calls <= limit_calls
+                        AND reserved_calls <= limit_calls - spent_calls)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_input_tokens IS NULL
+                    OR (spent_input_tokens <= limit_input_tokens
+                        AND reserved_input_tokens <= limit_input_tokens - spent_input_tokens)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_output_tokens IS NULL
+                    OR (spent_output_tokens <= limit_output_tokens
+                        AND reserved_output_tokens <= limit_output_tokens - spent_output_tokens)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_estimated_cost_nanos IS NULL
+                    OR (spent_estimated_cost_nanos <= limit_estimated_cost_nanos
+                        AND reserved_estimated_cost_nanos
+                            <= limit_estimated_cost_nanos - spent_estimated_cost_nanos)
+                )
+            ) STRICT
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_call_attempts (
+                attempt_id TEXT PRIMARY KEY
+                    CHECK (length(attempt_id) BETWEEN 1 AND 128
+                           AND instr(attempt_id, char(0)) = 0),
+                budget_id TEXT NOT NULL
+                    REFERENCES provider_budgets(budget_id) ON DELETE RESTRICT,
+                route_id TEXT NOT NULL CHECK (
+                    length(route_id) = 73
+                    AND substr(route_id, 1, 9) = 'route:v1:'
+                    AND substr(route_id, 10) = lower(substr(route_id, 10))
+                    AND substr(route_id, 10) NOT GLOB '*[^0-9a-f]*'
+                ),
+                state TEXT NOT NULL CHECK (state IN (
+                    'reserved', 'dispatched', 'settled',
+                    'released_pre_dispatch', 'charged_unknown', 'violation'
+                )),
+                runner_generation INTEGER
+                    CHECK (runner_generation IS NULL OR runner_generation >= 1),
+                bound_calls INTEGER NOT NULL CHECK (bound_calls = 1),
+                bound_input_tokens INTEGER NOT NULL CHECK (bound_input_tokens >= 0),
+                bound_output_tokens INTEGER NOT NULL CHECK (bound_output_tokens >= 0),
+                bound_estimated_cost_nanos INTEGER NOT NULL
+                    CHECK (bound_estimated_cost_nanos >= 0),
+                actual_calls INTEGER CHECK (actual_calls IS NULL OR actual_calls >= 0),
+                actual_input_tokens INTEGER
+                    CHECK (actual_input_tokens IS NULL OR actual_input_tokens >= 0),
+                actual_output_tokens INTEGER
+                    CHECK (actual_output_tokens IS NULL OR actual_output_tokens >= 0),
+                actual_estimated_cost_nanos INTEGER CHECK (
+                    actual_estimated_cost_nanos IS NULL OR actual_estimated_cost_nanos >= 0
+                ),
+                charged_calls INTEGER CHECK (charged_calls IS NULL OR charged_calls >= 0),
+                charged_input_tokens INTEGER CHECK (
+                    charged_input_tokens IS NULL OR charged_input_tokens >= 0
+                ),
+                charged_output_tokens INTEGER CHECK (
+                    charged_output_tokens IS NULL OR charged_output_tokens >= 0
+                ),
+                charged_estimated_cost_nanos INTEGER CHECK (
+                    charged_estimated_cost_nanos IS NULL
+                    OR charged_estimated_cost_nanos >= 0
+                ),
+                created_at_epoch INTEGER NOT NULL CHECK (created_at_epoch >= 0),
+                dispatched_at_epoch INTEGER CHECK (
+                    dispatched_at_epoch IS NULL OR dispatched_at_epoch >= created_at_epoch
+                ),
+                finished_at_epoch INTEGER CHECK (
+                    finished_at_epoch IS NULL OR finished_at_epoch >= created_at_epoch
+                ),
+                CHECK (
+                    (actual_calls IS NULL AND actual_input_tokens IS NULL
+                     AND actual_output_tokens IS NULL
+                     AND actual_estimated_cost_nanos IS NULL)
+                    OR
+                    (actual_calls IS NOT NULL AND actual_input_tokens IS NOT NULL
+                     AND actual_output_tokens IS NOT NULL
+                     AND actual_estimated_cost_nanos IS NOT NULL)
+                ),
+                CHECK (
+                    (charged_calls IS NULL AND charged_input_tokens IS NULL
+                     AND charged_output_tokens IS NULL
+                     AND charged_estimated_cost_nanos IS NULL)
+                    OR
+                    (charged_calls IS NOT NULL AND charged_input_tokens IS NOT NULL
+                     AND charged_output_tokens IS NOT NULL
+                     AND charged_estimated_cost_nanos IS NOT NULL)
+                ),
+                CHECK (
+                    (state = 'reserved'
+                     AND dispatched_at_epoch IS NULL AND finished_at_epoch IS NULL
+                     AND actual_calls IS NULL AND charged_calls IS NULL)
+                    OR
+                    (state = 'dispatched'
+                     AND dispatched_at_epoch IS NOT NULL AND finished_at_epoch IS NULL
+                     AND actual_calls IS NULL AND charged_calls IS NULL)
+                    OR
+                    (state = 'released_pre_dispatch'
+                     AND dispatched_at_epoch IS NULL AND finished_at_epoch IS NOT NULL
+                     AND actual_calls IS NULL AND charged_calls IS NULL)
+                    OR
+                    (state = 'settled'
+                     AND dispatched_at_epoch IS NOT NULL
+                     AND finished_at_epoch >= dispatched_at_epoch
+                     AND actual_calls = 1
+                     AND actual_input_tokens <= bound_input_tokens
+                     AND actual_output_tokens <= bound_output_tokens
+                     AND actual_estimated_cost_nanos <= bound_estimated_cost_nanos
+                     AND charged_calls = actual_calls
+                     AND charged_input_tokens = actual_input_tokens
+                     AND charged_output_tokens = actual_output_tokens
+                     AND charged_estimated_cost_nanos = actual_estimated_cost_nanos)
+                    OR
+                    (state = 'charged_unknown'
+                     AND finished_at_epoch IS NOT NULL
+                     AND (dispatched_at_epoch IS NULL
+                          OR finished_at_epoch >= dispatched_at_epoch)
+                     AND actual_calls IS NULL
+                     AND charged_calls = bound_calls
+                     AND charged_input_tokens = bound_input_tokens
+                     AND charged_output_tokens = bound_output_tokens
+                     AND charged_estimated_cost_nanos = bound_estimated_cost_nanos)
+                    OR
+                    (state = 'violation'
+                     AND dispatched_at_epoch IS NOT NULL
+                     AND finished_at_epoch >= dispatched_at_epoch
+                     AND actual_calls IS NOT NULL AND charged_calls IS NOT NULL
+                     AND (actual_calls > bound_calls
+                          OR actual_input_tokens > bound_input_tokens
+                          OR actual_output_tokens > bound_output_tokens
+                          OR actual_estimated_cost_nanos > bound_estimated_cost_nanos)
+                     AND (
+                         (charged_calls = actual_calls
+                          AND charged_input_tokens = actual_input_tokens
+                          AND charged_output_tokens = actual_output_tokens
+                          AND charged_estimated_cost_nanos = actual_estimated_cost_nanos)
+                         OR
+                         (charged_calls = bound_calls
+                          AND charged_input_tokens = bound_input_tokens
+                          AND charged_output_tokens = bound_output_tokens
+                          AND charged_estimated_cost_nanos = bound_estimated_cost_nanos)
+                     ))
+                )
+            ) STRICT
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS provider_call_attempts_budget_state_idx
+            ON provider_call_attempts(budget_id, state, attempt_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS provider_call_attempts_generation_state_idx
+            ON provider_call_attempts(budget_id, runner_generation, state)
+            WHERE runner_generation IS NOT NULL
             """
         )
 
@@ -2297,8 +2882,8 @@ class SQLiteStore:
 
     @staticmethod
     @lru_cache(maxsize=1)
-    def _expected_schema_manifest() -> SchemaManifest:
-        """Build the canonical current-schema manifest with the same SQLite runtime."""
+    def _expected_v7_schema_manifest() -> SchemaManifest:
+        """Build the canonical pre-budget v7 manifest for migration validation."""
 
         with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
             SQLiteStore._create_base_schema(reference)
@@ -2310,11 +2895,33 @@ class SQLiteStore:
             return introspect_schema(reference)
 
     @staticmethod
+    @lru_cache(maxsize=1)
+    def _expected_schema_manifest() -> SchemaManifest:
+        """Build the canonical current-schema manifest with the same SQLite runtime."""
+
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
+            SQLiteStore._create_base_schema(reference)
+            SQLiteStore._create_series_schema(reference)
+            SQLiteStore._create_tournament_schema(reference)
+            SQLiteStore._create_checkpoint_schema(reference)
+            SQLiteStore._create_runner_lease_schema(reference)
+            SQLiteStore._create_rating_operation_schema(reference)
+            SQLiteStore._create_provider_usage_schema(reference)
+            return introspect_schema(reference)
+
+    @staticmethod
+    def _verify_v7_schema(connection: sqlite3.Connection) -> None:
+        try:
+            verify_schema_manifest(connection, SQLiteStore._expected_v7_schema_manifest())
+        except SchemaManifestError as exc:
+            raise StorageError(f"SQLite 数据库结构与 v7 manifest 不一致：{exc}") from exc
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         try:
             verify_schema_manifest(connection, SQLiteStore._expected_schema_manifest())
         except SchemaManifestError as exc:
-            raise StorageError(f"SQLite 数据库结构与 v7 manifest 不一致：{exc}") from exc
+            raise StorageError(f"SQLite 数据库结构与 v8 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:
@@ -4127,6 +4734,1414 @@ class SQLiteStore:
         return value
 
     @staticmethod
+    def _usage_totals_from_columns(
+        row: sqlite3.Row,
+        *,
+        calls: str,
+        input_tokens: str,
+        output_tokens: str,
+        estimated_cost_nanos: str,
+        optional: bool = False,
+    ) -> UsageTotals | None:
+        values = (
+            row[calls],
+            row[input_tokens],
+            row[output_tokens],
+            row[estimated_cost_nanos],
+        )
+        if optional and all(value is None for value in values):
+            return None
+        if any(value is None for value in values):
+            raise StorageError("Provider usage ledger has partial aggregate values")
+        try:
+            return UsageTotals(
+                calls=values[0],
+                input=values[1],
+                output=values[2],
+                estimated_cost=values[3],
+            )
+        except UsageValidationError as exc:
+            raise StorageError("Provider usage ledger contains invalid integer values") from exc
+
+    @staticmethod
+    def _provider_attempt_from_row(row: sqlite3.Row) -> ProviderCallAttempt:
+        try:
+            attempt_id = _validate_usage_ledger_id(row["attempt_id"], "attempt_id")
+            budget_id = _validate_usage_ledger_id(row["budget_id"], "budget_id")
+            route_id = validate_route_id(row["route_id"])
+            bounds = CallBounds(
+                input=row["bound_input_tokens"],
+                output=row["bound_output_tokens"],
+                estimated_cost=row["bound_estimated_cost_nanos"],
+                route_id=route_id,
+            )
+        except (UsageValidationError, ValueError) as exc:
+            raise StorageError("Provider call-attempt ledger row is invalid") from exc
+        if row["bound_calls"] != 1:
+            raise StorageError("Provider call-attempt ledger row has an invalid call bound")
+        state = row["state"]
+        if state not in {
+            "reserved",
+            "dispatched",
+            "settled",
+            "released_pre_dispatch",
+            "charged_unknown",
+            "violation",
+        }:
+            raise StorageError("Provider call-attempt ledger row has an invalid state")
+        actual = SQLiteStore._usage_totals_from_columns(
+            row,
+            calls="actual_calls",
+            input_tokens="actual_input_tokens",
+            output_tokens="actual_output_tokens",
+            estimated_cost_nanos="actual_estimated_cost_nanos",
+            optional=True,
+        )
+        charged = SQLiteStore._usage_totals_from_columns(
+            row,
+            calls="charged_calls",
+            input_tokens="charged_input_tokens",
+            output_tokens="charged_output_tokens",
+            estimated_cost_nanos="charged_estimated_cost_nanos",
+            optional=True,
+        )
+        generation = row["runner_generation"]
+        if generation is not None and (
+            isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            raise StorageError("Provider call-attempt ledger row has invalid fencing")
+        timestamps = (
+            row["created_at_epoch"],
+            row["dispatched_at_epoch"],
+            row["finished_at_epoch"],
+        )
+        if timestamps[0] is None or any(
+            value is not None
+            and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+            for value in timestamps
+        ):
+            raise StorageError("Provider call-attempt ledger row has invalid timestamps")
+        created_at, dispatched_at, finished_at = timestamps
+        bound_totals = _usage_from_bounds(bounds)
+        lifecycle_valid = False
+        if state == "reserved":
+            lifecycle_valid = (
+                dispatched_at is None
+                and finished_at is None
+                and actual is None
+                and charged is None
+            )
+        elif state == "dispatched":
+            lifecycle_valid = (
+                dispatched_at is not None
+                and dispatched_at >= created_at
+                and finished_at is None
+                and actual is None
+                and charged is None
+            )
+        elif state == "released_pre_dispatch":
+            lifecycle_valid = (
+                dispatched_at is None
+                and finished_at is not None
+                and finished_at >= created_at
+                and actual is None
+                and charged is None
+            )
+        elif state == "settled" and actual is not None:
+            lifecycle_valid = (
+                dispatched_at is not None
+                and finished_at is not None
+                and created_at <= dispatched_at <= finished_at
+                and actual.calls == 1
+                and all(
+                    getattr(actual, dimension) <= getattr(bound_totals, dimension)
+                    for dimension in ("calls", "input", "output", "estimated_cost")
+                )
+                and charged == actual
+            )
+        elif state == "charged_unknown":
+            lifecycle_valid = (
+                finished_at is not None
+                and finished_at >= created_at
+                and (dispatched_at is None or created_at <= dispatched_at <= finished_at)
+                and actual is None
+                and charged == bound_totals
+            )
+        elif state == "violation" and actual is not None and charged is not None:
+            lifecycle_valid = (
+                dispatched_at is not None
+                and finished_at is not None
+                and created_at <= dispatched_at <= finished_at
+                and any(
+                    getattr(actual, dimension) > getattr(bound_totals, dimension)
+                    for dimension in ("calls", "input", "output", "estimated_cost")
+                )
+                and charged in (actual, bound_totals)
+            )
+        if not lifecycle_valid:
+            raise StorageError("Provider call-attempt lifecycle invariant failed")
+        return ProviderCallAttempt(
+            attempt_id=attempt_id,
+            budget_id=budget_id,
+            route_id=route_id,
+            bounds=bounds,
+            state=state,
+            actual=actual,
+            charged=charged,
+            runner_generation=generation,
+            created_at_epoch=created_at,
+            dispatched_at_epoch=dispatched_at,
+            finished_at_epoch=finished_at,
+        )
+
+    @staticmethod
+    def _provider_budget_snapshot_in_transaction(
+        connection: sqlite3.Connection,
+        budget_id: str,
+    ) -> ProviderBudgetSnapshot | None:
+        row = connection.execute(
+            "SELECT * FROM provider_budgets WHERE budget_id = ?",
+            (budget_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            stored_budget_id = _validate_usage_ledger_id(row["budget_id"], "budget_id")
+            limits = BudgetLimits(
+                calls=row["limit_calls"],
+                input=row["limit_input_tokens"],
+                output=row["limit_output_tokens"],
+                estimated_cost=row["limit_estimated_cost_nanos"],
+            )
+            policy = ProviderBudgetPolicy.from_canonical_json(row["policy_json"])
+        except UsageValidationError as exc:
+            raise StorageError("Provider budget ledger row is invalid") from exc
+        if row["policy_digest"] != policy.digest:
+            raise StorageError("Provider budget policy digest does not match its payload")
+        if not policy.routes:
+            raise StorageError("Provider budget policy has no frozen routes")
+        if limits.estimated_cost is not None and any(
+            route.price is None for route in policy.routes
+        ):
+            raise StorageError("Cost-limited Provider budget contains an unpriced route")
+        stored_spent = SQLiteStore._usage_totals_from_columns(
+            row,
+            calls="spent_calls",
+            input_tokens="spent_input_tokens",
+            output_tokens="spent_output_tokens",
+            estimated_cost_nanos="spent_estimated_cost_nanos",
+        )
+        stored_reserved = SQLiteStore._usage_totals_from_columns(
+            row,
+            calls="reserved_calls",
+            input_tokens="reserved_input_tokens",
+            output_tokens="reserved_output_tokens",
+            estimated_cost_nanos="reserved_estimated_cost_nanos",
+        )
+        if stored_spent is None or stored_reserved is None:
+            raise StorageError("Provider budget ledger has missing aggregates")
+
+        tournament_id = row["tournament_id"]
+        if tournament_id is not None and (
+            not isinstance(tournament_id, str) or not tournament_id.strip()
+        ):
+            raise StorageError("Provider budget ledger has invalid tournament scope")
+        poison_reason = row["poison_reason_code"]
+        if poison_reason not in {
+            None,
+            UsageExceedsReservationError.reason_code,
+            UsageCounterOverflowError.reason_code,
+        }:
+            raise StorageError("Provider budget ledger has an invalid poison reason")
+        created_at = row["created_at_epoch"]
+        finalized_at = row["finalized_at_epoch"]
+        if (
+            isinstance(created_at, bool)
+            or not isinstance(created_at, int)
+            or created_at < 0
+            or (
+                finalized_at is not None
+                and (
+                    isinstance(finalized_at, bool)
+                    or not isinstance(finalized_at, int)
+                    or finalized_at < created_at
+                )
+            )
+        ):
+            raise StorageError("Provider budget ledger has invalid timestamps")
+
+        calculated_spent = UsageTotals.zero()
+        calculated_reserved = UsageTotals.zero()
+        unresolved = 0
+        saw_violation = False
+        attempt_rows = connection.execute(
+            "SELECT * FROM provider_call_attempts WHERE budget_id = ? ORDER BY attempt_id",
+            (stored_budget_id,),
+        ).fetchall()
+        try:
+            for attempt_row in attempt_rows:
+                attempt = SQLiteStore._provider_attempt_from_row(attempt_row)
+                try:
+                    price = policy.price_for(attempt.route_id)
+                except UsageValidationError as exc:
+                    raise StorageError(
+                        "Provider call attempt uses a route outside its frozen policy"
+                    ) from exc
+                if attempt.bounds.output > policy.max_output_tokens_per_call:
+                    raise StorageError(
+                        "Provider call attempt exceeds its frozen per-call output cap"
+                    )
+                try:
+                    expected_cost = (
+                        0
+                        if price is None
+                        else price.estimate(
+                            input_tokens=attempt.bounds.input,
+                            output_tokens=attempt.bounds.output,
+                        )
+                    )
+                except (UsageCounterOverflowError, UsageValidationError) as exc:
+                    raise StorageError(
+                        "Provider call attempt cannot be priced by its frozen policy"
+                    ) from exc
+                if attempt.bounds.estimated_cost != expected_cost:
+                    raise StorageError(
+                        "Provider call attempt cost differs from its frozen price policy"
+                    )
+                if (tournament_id is None) != (attempt.runner_generation is None):
+                    raise StorageError(
+                        "Provider call-attempt fencing does not match its budget scope"
+                    )
+                if attempt.state in {"reserved", "dispatched"}:
+                    calculated_reserved = _checked_usage_add(
+                        calculated_reserved,
+                        _usage_from_bounds(attempt.bounds),
+                    )
+                    unresolved += 1
+                elif attempt.state in {"settled", "charged_unknown", "violation"}:
+                    if attempt.charged is None:
+                        raise StorageError("Provider terminal attempt has no durable charge")
+                    calculated_spent = _checked_usage_add(calculated_spent, attempt.charged)
+                if attempt.state == "violation":
+                    saw_violation = True
+        except (ReservationStateError, UsageCounterOverflowError) as exc:
+            raise StorageError("Provider usage ledger aggregates overflow") from exc
+
+        if calculated_spent != stored_spent or calculated_reserved != stored_reserved:
+            raise StorageError("Provider usage ledger aggregate invariant failed")
+        if saw_violation != (poison_reason is not None):
+            raise StorageError("Provider usage ledger poison invariant failed")
+        if finalized_at is not None and unresolved:
+            raise StorageError("Finalized Provider budget contains unresolved attempts")
+        if poison_reason is None:
+            try:
+                committed = _checked_usage_add(stored_spent, stored_reserved)
+            except UsageCounterOverflowError as exc:
+                raise StorageError("Provider usage ledger aggregates overflow") from exc
+            for dimension in ("calls", "input", "output", "estimated_cost"):
+                limit = getattr(limits, dimension)
+                if limit is not None and getattr(committed, dimension) > limit:
+                    raise StorageError("Provider usage ledger exceeds an unpoisoned limit")
+
+        return ProviderBudgetSnapshot(
+            budget_id=stored_budget_id,
+            limits=limits,
+            policy=policy,
+            spent=stored_spent,
+            reserved=stored_reserved,
+            tournament_id=tournament_id,
+            created_at_epoch=created_at,
+            finalized_at_epoch=finalized_at,
+            poison_reason_code=poison_reason,
+        )
+
+    @staticmethod
+    def _update_provider_budget_counters(
+        connection: sqlite3.Connection,
+        snapshot: ProviderBudgetSnapshot,
+        *,
+        spent: UsageTotals,
+        reserved: UsageTotals,
+        poison_reason_code: str | None = None,
+    ) -> None:
+        _checked_usage_add(spent, reserved)
+        updated = connection.execute(
+            """
+            UPDATE provider_budgets
+            SET spent_calls = ?, spent_input_tokens = ?, spent_output_tokens = ?,
+                spent_estimated_cost_nanos = ?, reserved_calls = ?,
+                reserved_input_tokens = ?, reserved_output_tokens = ?,
+                reserved_estimated_cost_nanos = ?, poison_reason_code = ?
+            WHERE budget_id = ?
+            """,
+            (
+                spent.calls,
+                spent.input,
+                spent.output,
+                spent.estimated_cost,
+                reserved.calls,
+                reserved.input,
+                reserved.output,
+                reserved.estimated_cost,
+                poison_reason_code,
+                snapshot.budget_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StorageError("Provider budget disappeared during an atomic update")
+
+    @staticmethod
+    def _load_provider_attempt_in_transaction(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+    ) -> ProviderCallAttempt | None:
+        row = connection.execute(
+            "SELECT * FROM provider_call_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return None if row is None else SQLiteStore._provider_attempt_from_row(row)
+
+    def _require_provider_attempt_fence(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: ProviderBudgetSnapshot,
+        attempt: ProviderCallAttempt,
+        lease: TournamentRunnerLease | None,
+    ) -> None:
+        if snapshot.tournament_id is None:
+            if lease is not None:
+                raise ValueError("non-tournament Provider budget does not accept a runner lease")
+            if attempt.runner_generation is not None:
+                raise StorageError("Provider call-attempt fencing is invalid")
+            return
+        active = self._require_active_tournament_runner(
+            connection,
+            snapshot.tournament_id,
+            lease,
+        )
+        if attempt.runner_generation != active.generation:
+            raise TournamentRunnerLeaseLostError(
+                "Provider call attempt belongs to a stale runner generation"
+            )
+
+    def _insert_provider_budget_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        budget_id: str,
+        limits: BudgetLimits,
+        policy: ProviderBudgetPolicy,
+        *,
+        tournament_id: str | None,
+    ) -> ProviderBudgetSnapshot:
+        now = self._database_epoch(connection)
+        connection.execute(
+            """
+            INSERT INTO provider_budgets (
+                budget_id, tournament_id, policy_json, policy_digest,
+                limit_calls, limit_input_tokens,
+                limit_output_tokens, limit_estimated_cost_nanos,
+                spent_calls, spent_input_tokens, spent_output_tokens,
+                spent_estimated_cost_nanos, reserved_calls,
+                reserved_input_tokens, reserved_output_tokens,
+                reserved_estimated_cost_nanos, poison_reason_code,
+                created_at_epoch, finalized_at_epoch
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, NULL, ?, NULL)
+            """,
+            (
+                budget_id,
+                tournament_id,
+                policy.canonical_json(),
+                policy.digest,
+                limits.calls,
+                limits.input,
+                limits.output,
+                limits.estimated_cost,
+                now,
+            ),
+        )
+        snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+        if snapshot is None:
+            raise StorageError("Provider budget was not durably created")
+        return snapshot
+
+    def create_provider_budget(
+        self,
+        budget_id: str,
+        limits: BudgetLimits,
+        policy: ProviderBudgetPolicy,
+        *,
+        tournament_id: str | None = None,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderBudgetSnapshot:
+        """Create one durable hard-budget scope, idempotently for identical inputs."""
+
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        limits, policy = _validate_durable_budget_definition(limits, policy)
+        if tournament_id is not None and (
+            not isinstance(tournament_id, str) or not tournament_id.strip()
+        ):
+            raise ValueError("tournament_id must be a non-empty string")
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            if existing is not None:
+                if (
+                    existing.limits != limits
+                    or existing.policy != policy
+                    or existing.tournament_id != tournament_id
+                ):
+                    raise ProviderBudgetCollisionError(
+                        "budget_id is already attached to a different budget"
+                    )
+                connection.commit()
+                return existing
+            if tournament_id is not None:
+                checkpoint = connection.execute(
+                    "SELECT status FROM tournament_checkpoints WHERE tournament_id = ?",
+                    (tournament_id,),
+                ).fetchone()
+                if checkpoint is None or checkpoint["status"] != "in_progress":
+                    raise StorageError(
+                        "tournament Provider budget requires an in-progress checkpoint"
+                    )
+                self._require_active_tournament_runner(
+                    connection,
+                    tournament_id,
+                    lease,
+                )
+                collision = connection.execute(
+                    "SELECT 1 FROM provider_budgets WHERE tournament_id = ?",
+                    (tournament_id,),
+                ).fetchone()
+                if collision is not None:
+                    raise ProviderBudgetCollisionError(
+                        "tournament checkpoint already has a Provider budget"
+                    )
+            snapshot = self._insert_provider_budget_in_transaction(
+                connection,
+                budget_id,
+                limits,
+                policy,
+                tournament_id=tournament_id,
+            )
+            connection.commit()
+            return snapshot
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def load_provider_budget(self, budget_id: str) -> ProviderBudgetSnapshot | None:
+        """Load and recompute one budget, rejecting any aggregate drift."""
+
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            try:
+                snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return snapshot
+
+    def get_provider_budget_snapshot(self, budget_id: str) -> ProviderBudgetSnapshot | None:
+        """Alias for :meth:`load_provider_budget`."""
+
+        return self.load_provider_budget(budget_id)
+
+    def load_tournament_provider_budget(
+        self,
+        tournament_id: str,
+    ) -> ProviderBudgetSnapshot | None:
+        """Load the unique frozen budget policy owned by a tournament checkpoint."""
+
+        if not isinstance(tournament_id, str) or not tournament_id.strip():
+            raise ValueError("tournament_id must be a non-empty string")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT budget_id FROM provider_budgets WHERE tournament_id = ?",
+                    (tournament_id,),
+                ).fetchone()
+                snapshot = (
+                    None
+                    if row is None
+                    else self._provider_budget_snapshot_in_transaction(
+                        connection,
+                        row["budget_id"],
+                    )
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return snapshot
+
+    def bind_provider_usage_budget(
+        self,
+        budget_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> SQLiteUsageBudget:
+        """Return the protocol adapter used by budget-aware Player calls."""
+
+        return SQLiteUsageBudget(self, budget_id, lease=lease)
+
+    def bind_tournament_usage_budget(
+        self,
+        tournament_id: str,
+        *,
+        lease: TournamentRunnerLease,
+    ) -> SQLiteUsageBudget | None:
+        """Bind the frozen durable budget for one claimed tournament, if configured."""
+
+        snapshot = self.load_tournament_provider_budget(tournament_id)
+        if snapshot is None:
+            return None
+        if lease.tournament_id != tournament_id:
+            raise ValueError("runner lease does not belong to this tournament")
+        return SQLiteUsageBudget(self, snapshot.budget_id, lease=lease)
+
+    def reserve_provider_call_batch(
+        self,
+        budget_id: str,
+        bounds: Iterable[CallBounds],
+        *,
+        route_ids: Iterable[str] | None = None,
+        attempt_ids: Iterable[str] | None = None,
+        lease: TournamentRunnerLease | None = None,
+    ) -> tuple[ProviderCallAttempt, ...]:
+        """Reserve an entire call batch under ``BEGIN IMMEDIATE``, or reserve none."""
+
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        try:
+            requested = tuple(bounds)
+        except TypeError as exc:
+            raise UsageValidationError("bounds must be an iterable of CallBounds") from exc
+        for bound in requested:
+            if not isinstance(bound, CallBounds):
+                raise UsageValidationError("bounds must contain only CallBounds")
+            if bound.route_id is None:
+                raise UsageValidationError(
+                    "durable call bounds must contain a frozen route_id"
+                )
+        batch = _sum_call_bounds(requested)
+        if route_ids is None:
+            requested_route_ids = None
+        else:
+            try:
+                requested_route_ids = tuple(validate_route_id(value) for value in route_ids)
+            except (TypeError, ValueError) as exc:
+                raise UsageValidationError(
+                    "route_ids must be an iterable of valid route_id values"
+                ) from exc
+            if len(requested_route_ids) != len(requested):
+                raise UsageValidationError("route_ids must have the same length as bounds")
+        if attempt_ids is None:
+            ids = tuple(secrets.token_hex(16) for _ in requested)
+        else:
+            try:
+                ids = tuple(
+                    _validate_usage_ledger_id(value, "attempt_id") for value in attempt_ids
+                )
+            except TypeError as exc:
+                raise UsageValidationError("attempt_ids must be an iterable of strings") from exc
+            if len(ids) != len(requested):
+                raise UsageValidationError("attempt_ids must have the same length as bounds")
+        if len(set(ids)) != len(ids):
+            raise ProviderCallAttemptCollisionError("attempt ids must be unique within a batch")
+        if not requested:
+            return ()
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            if snapshot.finalized:
+                raise ReservationStateError("cannot reserve against a finalized budget")
+            if snapshot.poisoned:
+                raise BudgetPoisonedError(
+                    f"usage budget is poisoned by {snapshot.poison_reason_code}"
+                )
+            bound_route_ids = tuple(bound.route_id for bound in requested)
+            if requested_route_ids is not None and requested_route_ids != bound_route_ids:
+                raise UsageValidationError(
+                    "route_ids must exactly match the route_id frozen in each CallBounds"
+                )
+            resolved_route_ids = bound_route_ids
+            for route_id, bound in zip(resolved_route_ids, requested, strict=True):
+                price = snapshot.policy.price_for(route_id)
+                if bound.output > snapshot.policy.max_output_tokens_per_call:
+                    raise BudgetExceededError("output_per_call")
+                expected_cost = (
+                    0
+                    if price is None
+                    else price.estimate(
+                        input_tokens=bound.input,
+                        output_tokens=bound.output,
+                    )
+                )
+                if bound.estimated_cost != expected_cost:
+                    raise UsageValidationError(
+                        "call bound estimated_cost must match the frozen route price"
+                    )
+            if snapshot.tournament_id is None:
+                if lease is not None:
+                    raise ValueError(
+                        "non-tournament Provider budget does not accept a runner lease"
+                    )
+                generation = None
+            else:
+                active = self._require_active_tournament_runner(
+                    connection,
+                    snapshot.tournament_id,
+                    lease,
+                )
+                generation = active.generation
+
+            committed = _checked_usage_add(snapshot.spent, snapshot.reserved)
+            prospective = _checked_usage_add(committed, batch)
+            for dimension in ("calls", "input", "output", "estimated_cost"):
+                limit = getattr(snapshot.limits, dimension)
+                if limit is not None and getattr(prospective, dimension) > limit:
+                    raise BudgetExceededError(dimension)
+            if any(
+                connection.execute(
+                    "SELECT 1 FROM provider_call_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                for attempt_id in ids
+            ):
+                raise ProviderCallAttemptCollisionError("attempt_id is already present")
+
+            new_reserved = _checked_usage_add(snapshot.reserved, batch)
+            self._update_provider_budget_counters(
+                connection,
+                snapshot,
+                spent=snapshot.spent,
+                reserved=new_reserved,
+                poison_reason_code=snapshot.poison_reason_code,
+            )
+            now = self._database_epoch(connection)
+            connection.executemany(
+                """
+                INSERT INTO provider_call_attempts (
+                    attempt_id, budget_id, route_id, state, runner_generation,
+                    bound_calls, bound_input_tokens, bound_output_tokens,
+                    bound_estimated_cost_nanos, actual_calls,
+                    actual_input_tokens, actual_output_tokens,
+                    actual_estimated_cost_nanos, charged_calls,
+                    charged_input_tokens, charged_output_tokens,
+                    charged_estimated_cost_nanos, created_at_epoch,
+                    dispatched_at_epoch, finished_at_epoch
+                ) VALUES (?, ?, ?, 'reserved', ?, 1, ?, ?, ?, NULL, NULL, NULL,
+                          NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL)
+                """,
+                [
+                    (
+                        attempt_id,
+                        budget_id,
+                        route_id,
+                        generation,
+                        bound.input,
+                        bound.output,
+                        bound.estimated_cost,
+                        now,
+                    )
+                    for attempt_id, route_id, bound in zip(
+                        ids,
+                        resolved_route_ids,
+                        requested,
+                        strict=True,
+                    )
+                ],
+            )
+            result = tuple(
+                self._load_provider_attempt_in_transaction(connection, attempt_id)
+                for attempt_id in ids
+            )
+            if any(attempt is None for attempt in result):
+                raise StorageError("Provider call reservations were not durably created")
+            self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            connection.commit()
+            return result  # type: ignore[return-value]
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _finish_provider_attempt_in_transaction(
+        connection: sqlite3.Connection,
+        snapshot: ProviderBudgetSnapshot,
+        attempt: ProviderCallAttempt,
+        *,
+        state: Literal["settled", "charged_unknown", "violation"],
+        charged: UsageTotals,
+        actual: UsageTotals | None,
+        poison_reason_code: str | None,
+        finished_at_epoch: int,
+    ) -> ProviderCallAttempt:
+        finished_at_epoch = max(
+            finished_at_epoch,
+            attempt.created_at_epoch,
+            attempt.dispatched_at_epoch or 0,
+        )
+        bound = _usage_from_bounds(attempt.bounds)
+        reserved = _checked_usage_subtract(snapshot.reserved, bound)
+        spent = _checked_usage_add(snapshot.spent, charged)
+        SQLiteStore._update_provider_budget_counters(
+            connection,
+            snapshot,
+            spent=spent,
+            reserved=reserved,
+            poison_reason_code=poison_reason_code,
+        )
+        actual_values: tuple[int | None, ...]
+        if actual is None:
+            actual_values = (None, None, None, None)
+        else:
+            actual_values = (
+                actual.calls,
+                actual.input,
+                actual.output,
+                actual.estimated_cost,
+            )
+        updated = connection.execute(
+            """
+            UPDATE provider_call_attempts
+            SET state = ?, actual_calls = ?, actual_input_tokens = ?,
+                actual_output_tokens = ?, actual_estimated_cost_nanos = ?,
+                charged_calls = ?, charged_input_tokens = ?,
+                charged_output_tokens = ?, charged_estimated_cost_nanos = ?,
+                finished_at_epoch = ?
+            WHERE attempt_id = ? AND state IN ('reserved', 'dispatched')
+            """,
+            (
+                state,
+                *actual_values,
+                charged.calls,
+                charged.input,
+                charged.output,
+                charged.estimated_cost,
+                finished_at_epoch,
+                attempt.attempt_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ReservationStateError("Provider call attempt changed concurrently")
+        result = SQLiteStore._load_provider_attempt_in_transaction(
+            connection,
+            attempt.attempt_id,
+        )
+        if result is None:
+            raise StorageError("Provider call attempt disappeared during settlement")
+        return result
+
+    @staticmethod
+    def _provider_violation_charge(
+        snapshot: ProviderBudgetSnapshot,
+        bound: UsageTotals,
+        actual: UsageTotals,
+    ) -> tuple[UsageTotals, str]:
+        """Choose an exact charge unless all live aggregates would overflow SQLite."""
+
+        try:
+            remaining_reserved = _checked_usage_subtract(snapshot.reserved, bound)
+            spent = _checked_usage_add(snapshot.spent, actual)
+            _checked_usage_add(spent, remaining_reserved)
+        except (ReservationStateError, UsageCounterOverflowError):
+            return bound, UsageCounterOverflowError.reason_code
+        return actual, UsageExceedsReservationError.reason_code
+
+    @staticmethod
+    def _provider_policy_cost(
+        policy: ProviderBudgetPolicy,
+        route_id: str,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> int:
+        price = policy.price_for(route_id)
+        if price is None:
+            return 0
+        return price.estimate(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def get_provider_call_attempt(self, attempt_id: str) -> ProviderCallAttempt | None:
+        """Load one opaque call-attempt record without any Provider content."""
+
+        attempt_id = _validate_usage_ledger_id(attempt_id, "attempt_id")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            try:
+                attempt = self._load_provider_attempt_in_transaction(connection, attempt_id)
+                if attempt is not None:
+                    self._provider_budget_snapshot_in_transaction(
+                        connection,
+                        attempt.budget_id,
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return attempt
+
+    def mark_provider_call_dispatched(
+        self,
+        attempt_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderCallAttempt:
+        """Durably mark a reservation dispatched before any network I/O."""
+
+        attempt_id = _validate_usage_ledger_id(attempt_id, "attempt_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if attempt is None:
+                raise StorageError("Provider call attempt does not exist")
+            snapshot = self._provider_budget_snapshot_in_transaction(
+                connection,
+                attempt.budget_id,
+            )
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            self._require_provider_attempt_fence(
+                connection,
+                snapshot,
+                attempt,
+                lease,
+            )
+            if attempt.state == "dispatched":
+                connection.commit()
+                return attempt
+            if attempt.state != "reserved":
+                raise ReservationStateError(
+                    f"cannot dispatch reservation in state {attempt.state}"
+                )
+            if snapshot.finalized:
+                raise ReservationStateError("cannot dispatch from a finalized budget")
+            if snapshot.poisoned:
+                raise BudgetPoisonedError(
+                    f"usage budget is poisoned by {snapshot.poison_reason_code}"
+                )
+            now = max(self._database_epoch(connection), attempt.created_at_epoch)
+            updated = connection.execute(
+                """
+                UPDATE provider_call_attempts
+                SET state = 'dispatched', dispatched_at_epoch = ?
+                WHERE attempt_id = ? AND state = 'reserved'
+                """,
+                (now, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise ReservationStateError("Provider call attempt changed concurrently")
+            result = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if result is None:
+                raise StorageError("Provider call attempt disappeared during dispatch")
+            self._provider_budget_snapshot_in_transaction(connection, attempt.budget_id)
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def charge_provider_call_unknown(
+        self,
+        attempt_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderCallAttempt:
+        """Conservatively charge the complete bound when actual usage is unknown."""
+
+        attempt_id = _validate_usage_ledger_id(attempt_id, "attempt_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if attempt is None:
+                raise StorageError("Provider call attempt does not exist")
+            snapshot = self._provider_budget_snapshot_in_transaction(
+                connection,
+                attempt.budget_id,
+            )
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            self._require_provider_attempt_fence(
+                connection,
+                snapshot,
+                attempt,
+                lease,
+            )
+            if attempt.state == "charged_unknown":
+                connection.commit()
+                return attempt
+            if attempt.state not in {"reserved", "dispatched"}:
+                raise ReservationStateError(
+                    f"cannot charge unknown reservation in state {attempt.state}"
+                )
+            now = max(self._database_epoch(connection), attempt.created_at_epoch)
+            result = self._finish_provider_attempt_in_transaction(
+                connection,
+                snapshot,
+                attempt,
+                state="charged_unknown",
+                charged=_usage_from_bounds(attempt.bounds),
+                actual=None,
+                poison_reason_code=snapshot.poison_reason_code,
+                finished_at_epoch=now,
+            )
+            self._provider_budget_snapshot_in_transaction(connection, attempt.budget_id)
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release_provider_call_pre_dispatch(
+        self,
+        attempt_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderCallAttempt:
+        """Release only a reservation proven not to have reached network dispatch."""
+
+        attempt_id = _validate_usage_ledger_id(attempt_id, "attempt_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if attempt is None:
+                raise StorageError("Provider call attempt does not exist")
+            snapshot = self._provider_budget_snapshot_in_transaction(
+                connection,
+                attempt.budget_id,
+            )
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            self._require_provider_attempt_fence(
+                connection,
+                snapshot,
+                attempt,
+                lease,
+            )
+            if attempt.state == "released_pre_dispatch":
+                connection.commit()
+                return attempt
+            if attempt.state != "reserved":
+                raise ReservationStateError(
+                    f"cannot release reservation in state {attempt.state}"
+                )
+            reserved = _checked_usage_subtract(
+                snapshot.reserved,
+                _usage_from_bounds(attempt.bounds),
+            )
+            self._update_provider_budget_counters(
+                connection,
+                snapshot,
+                spent=snapshot.spent,
+                reserved=reserved,
+                poison_reason_code=snapshot.poison_reason_code,
+            )
+            now = max(
+                self._database_epoch(connection),
+                attempt.created_at_epoch,
+                attempt.dispatched_at_epoch or 0,
+            )
+            updated = connection.execute(
+                """
+                UPDATE provider_call_attempts
+                SET state = 'released_pre_dispatch', finished_at_epoch = ?
+                WHERE attempt_id = ? AND state = 'reserved'
+                """,
+                (now, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise ReservationStateError("Provider call attempt changed concurrently")
+            result = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if result is None:
+                raise StorageError("Provider call attempt disappeared during release")
+            self._provider_budget_snapshot_in_transaction(connection, attempt.budget_id)
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def settle_provider_call(
+        self,
+        attempt_id: str,
+        usage: UsageTotals | None,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderCallAttempt:
+        """Settle reported usage, or charge the full bound when it is unknown."""
+
+        attempt_id = _validate_usage_ledger_id(attempt_id, "attempt_id")
+        connection = self._connect()
+        deferred_error: Exception | None = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            attempt = self._load_provider_attempt_in_transaction(connection, attempt_id)
+            if attempt is None:
+                raise StorageError("Provider call attempt does not exist")
+            snapshot = self._provider_budget_snapshot_in_transaction(
+                connection,
+                attempt.budget_id,
+            )
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            self._require_provider_attempt_fence(
+                connection,
+                snapshot,
+                attempt,
+                lease,
+            )
+            if attempt.state == "settled":
+                if usage == attempt.actual:
+                    connection.commit()
+                    return attempt
+                raise ReservationStateError("settlement conflicts with settled usage")
+            if attempt.state == "charged_unknown":
+                if usage is None:
+                    connection.commit()
+                    return attempt
+                raise ReservationStateError("unknown usage charge cannot be replaced")
+            if attempt.state == "violation":
+                if usage == attempt.actual:
+                    raise UsageExceedsReservationError("usage exceeded reservation")
+                raise ReservationStateError("settlement conflicts with recorded overrun")
+            if attempt.state != "dispatched":
+                raise ReservationStateError(
+                    f"cannot settle reservation in state {attempt.state}"
+                )
+
+            now = self._database_epoch(connection)
+            bound = _usage_from_bounds(attempt.bounds)
+            if usage is None:
+                result = self._finish_provider_attempt_in_transaction(
+                    connection,
+                    snapshot,
+                    attempt,
+                    state="charged_unknown",
+                    charged=bound,
+                    actual=None,
+                    poison_reason_code=snapshot.poison_reason_code,
+                    finished_at_epoch=now,
+                )
+            elif not isinstance(usage, UsageTotals):
+                result = self._finish_provider_attempt_in_transaction(
+                    connection,
+                    snapshot,
+                    attempt,
+                    state="charged_unknown",
+                    charged=bound,
+                    actual=None,
+                    poison_reason_code=snapshot.poison_reason_code,
+                    finished_at_epoch=now,
+                )
+                deferred_error = UsageValidationError(
+                    "settled usage must be UsageTotals or None"
+                )
+            elif usage.calls != 1:
+                if usage.calls == 0:
+                    result = self._finish_provider_attempt_in_transaction(
+                        connection,
+                        snapshot,
+                        attempt,
+                        state="charged_unknown",
+                        charged=bound,
+                        actual=None,
+                        poison_reason_code=snapshot.poison_reason_code,
+                        finished_at_epoch=now,
+                    )
+                    deferred_error = UsageValidationError(
+                        "settled usage calls must equal one"
+                    )
+                else:
+                    charged, poison_reason = self._provider_violation_charge(
+                        snapshot,
+                        bound,
+                        usage,
+                    )
+                    result = self._finish_provider_attempt_in_transaction(
+                        connection,
+                        snapshot,
+                        attempt,
+                        state="violation",
+                        charged=charged,
+                        actual=usage,
+                        poison_reason_code=poison_reason,
+                        finished_at_epoch=now,
+                    )
+                    deferred_error = UsageExceedsReservationError(
+                        "reported call count exceeded reservation"
+                    )
+            elif usage.estimated_cost != self._provider_policy_cost(
+                snapshot.policy,
+                attempt.route_id,
+                input_tokens=usage.input,
+                output_tokens=usage.output,
+            ):
+                result = self._finish_provider_attempt_in_transaction(
+                    connection,
+                    snapshot,
+                    attempt,
+                    state="charged_unknown",
+                    charged=bound,
+                    actual=None,
+                    poison_reason_code=snapshot.poison_reason_code,
+                    finished_at_epoch=now,
+                )
+                deferred_error = UsageValidationError(
+                    "settled estimated_cost must match the frozen route price"
+                )
+            elif any(
+                getattr(usage, dimension) > getattr(bound, dimension)
+                for dimension in ("calls", "input", "output", "estimated_cost")
+            ):
+                charged, poison_reason = self._provider_violation_charge(
+                    snapshot,
+                    bound,
+                    usage,
+                )
+                result = self._finish_provider_attempt_in_transaction(
+                    connection,
+                    snapshot,
+                    attempt,
+                    state="violation",
+                    charged=charged,
+                    actual=usage,
+                    poison_reason_code=poison_reason,
+                    finished_at_epoch=now,
+                )
+                deferred_error = UsageExceedsReservationError(
+                    "reported usage exceeded reservation"
+                )
+            else:
+                result = self._finish_provider_attempt_in_transaction(
+                    connection,
+                    snapshot,
+                    attempt,
+                    state="settled",
+                    charged=usage,
+                    actual=usage,
+                    poison_reason_code=snapshot.poison_reason_code,
+                    finished_at_epoch=now,
+                )
+            self._provider_budget_snapshot_in_transaction(connection, attempt.budget_id)
+            connection.commit()
+            if deferred_error is not None:
+                raise deferred_error
+            return result
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_provider_budget(
+        self,
+        budget_id: str,
+        *,
+        lease: TournamentRunnerLease | None = None,
+    ) -> ProviderBudgetSnapshot:
+        """Seal a budget only after every reservation reaches a terminal state."""
+
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            if snapshot is None:
+                raise StorageError("Provider budget does not exist")
+            if snapshot.finalized:
+                connection.commit()
+                return snapshot
+            if snapshot.tournament_id is None:
+                if lease is not None:
+                    raise ValueError(
+                        "non-tournament Provider budget does not accept a runner lease"
+                    )
+            else:
+                self._require_active_tournament_runner(
+                    connection,
+                    snapshot.tournament_id,
+                    lease,
+                )
+            pending = connection.execute(
+                """
+                SELECT count(*) AS count
+                FROM provider_call_attempts
+                WHERE budget_id = ? AND state IN ('reserved', 'dispatched')
+                """,
+                (budget_id,),
+            ).fetchone()["count"]
+            if pending:
+                raise ProviderBudgetPendingError(
+                    "Provider budget has unresolved call attempts"
+                )
+            now = self._database_epoch(connection)
+            updated = connection.execute(
+                """
+                UPDATE provider_budgets
+                SET finalized_at_epoch = ?
+                WHERE budget_id = ? AND finalized_at_epoch IS NULL
+                """,
+                (now, budget_id),
+            )
+            if updated.rowcount != 1:
+                raise StorageError("Provider budget changed concurrently during finalization")
+            result = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            if result is None:
+                raise StorageError("Provider budget disappeared during finalization")
+            connection.commit()
+            return result
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _close_stale_provider_attempts(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+        generation: int,
+        *,
+        finished_at_epoch: int,
+    ) -> None:
+        """Resolve every old-generation reservation before a lease takeover."""
+
+        budget_rows = connection.execute(
+            "SELECT budget_id FROM provider_budgets WHERE tournament_id = ?",
+            (tournament_id,),
+        ).fetchall()
+        for budget_row in budget_rows:
+            budget_id = budget_row["budget_id"]
+            snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
+            if snapshot is None:
+                raise StorageError("Tournament Provider budget disappeared during takeover")
+            attempt_rows = connection.execute(
+                """
+                SELECT * FROM provider_call_attempts
+                WHERE budget_id = ? AND runner_generation = ?
+                  AND state IN ('reserved', 'dispatched')
+                ORDER BY attempt_id
+                """,
+                (budget_id, generation),
+            ).fetchall()
+            for attempt_row in attempt_rows:
+                attempt = self._provider_attempt_from_row(attempt_row)
+                snapshot = self._provider_budget_snapshot_in_transaction(
+                    connection,
+                    budget_id,
+                )
+                if snapshot is None:
+                    raise StorageError("Tournament Provider budget disappeared during takeover")
+                if attempt.state == "reserved":
+                    reserved = _checked_usage_subtract(
+                        snapshot.reserved,
+                        _usage_from_bounds(attempt.bounds),
+                    )
+                    self._update_provider_budget_counters(
+                        connection,
+                        snapshot,
+                        spent=snapshot.spent,
+                        reserved=reserved,
+                        poison_reason_code=snapshot.poison_reason_code,
+                    )
+                    updated = connection.execute(
+                        """
+                        UPDATE provider_call_attempts
+                        SET state = 'released_pre_dispatch', finished_at_epoch = ?
+                        WHERE attempt_id = ? AND state = 'reserved'
+                        """,
+                        (
+                            max(finished_at_epoch, attempt.created_at_epoch),
+                            attempt.attempt_id,
+                        ),
+                    )
+                    if updated.rowcount != 1:
+                        raise StorageError(
+                            "Provider reservation changed during runner takeover"
+                        )
+                else:
+                    self._finish_provider_attempt_in_transaction(
+                        connection,
+                        snapshot,
+                        attempt,
+                        state="charged_unknown",
+                        charged=_usage_from_bounds(attempt.bounds),
+                        actual=None,
+                        poison_reason_code=snapshot.poison_reason_code,
+                        finished_at_epoch=finished_at_epoch,
+                    )
+            self._provider_budget_snapshot_in_transaction(connection, budget_id)
+
+    def _finalize_tournament_provider_budgets(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+    ) -> None:
+        """Audit and seal all budgets owned by a checkpoint in the caller's transaction."""
+
+        budget_rows = connection.execute(
+            "SELECT budget_id FROM provider_budgets WHERE tournament_id = ? ORDER BY budget_id",
+            (tournament_id,),
+        ).fetchall()
+        for row in budget_rows:
+            snapshot = self._provider_budget_snapshot_in_transaction(
+                connection,
+                row["budget_id"],
+            )
+            if snapshot is None:
+                raise StorageError("Tournament Provider budget disappeared during finalization")
+            if snapshot.poisoned:
+                raise BudgetPoisonedError(
+                    f"Tournament Provider budget {row['budget_id']} is poisoned by "
+                    f"{snapshot.poison_reason_code}"
+                )
+            if snapshot.reserved != UsageTotals.zero():
+                raise ProviderBudgetPendingError(
+                    "Tournament has unresolved Provider call attempts"
+                )
+        if budget_rows:
+            now = self._database_epoch(connection)
+            connection.execute(
+                """
+                UPDATE provider_budgets
+                SET finalized_at_epoch = coalesce(finalized_at_epoch, ?)
+                WHERE tournament_id = ?
+                """,
+                (now, tournament_id),
+            )
+            for row in budget_rows:
+                self._provider_budget_snapshot_in_transaction(
+                    connection,
+                    row["budget_id"],
+                )
+
+    @staticmethod
     def _load_tournament_runner_lease(
         connection: sqlite3.Connection,
         tournament_id: str,
@@ -4273,6 +6288,15 @@ class SQLiteStore:
                     "循环赛 checkpoint 正由另一个执行者运行；请稍后重试"
                 )
 
+            if state is not None:
+                self._close_stale_provider_attempts(
+                    connection,
+                    tournament_id,
+                    state.generation,
+                    finished_at_epoch=now,
+                )
+            if state is not None and state.generation >= SQLITE_INT_MAX:
+                raise StorageError("循环赛 runner lease generation 已达到 SQLite 整数上限")
             generation = 1 if state is None else state.generation + 1
             token = secrets.token_hex(32)
             digest = _runner_lease_token_digest(token)
@@ -4560,6 +6584,134 @@ class SQLiteStore:
         self._verify_checkpoint_entrant_bindings(connection, checkpoint)
         return checkpoint, status
 
+    @staticmethod
+    def _insert_empty_tournament_checkpoint_in_transaction(
+        connection: sqlite3.Connection,
+        checkpoint: TournamentCheckpoint,
+        *,
+        payload: dict,
+        config_json: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO tournament_checkpoints (
+                tournament_id, schema_version, source, format,
+                pairing_policy, seed_policy, game, seed, players_json,
+                game_config_json, schedule_json, max_attempts,
+                pairing_count, created_at, updated_at, status,
+                finalized_at, final_tournament_id, config_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+            """,
+            (
+                checkpoint.tournament_id,
+                checkpoint.schema_version,
+                checkpoint.source,
+                checkpoint.format,
+                checkpoint.pairing_policy,
+                checkpoint.seed_policy,
+                checkpoint.game,
+                checkpoint.seed,
+                _canonical_json(payload["players"]),
+                _canonical_json(payload["game_config"]),
+                _canonical_json(payload["schedule"]),
+                checkpoint.max_attempts,
+                len(checkpoint.schedule),
+                checkpoint.created_at.astimezone(UTC).isoformat(),
+                checkpoint.updated_at.astimezone(UTC).isoformat(),
+                "in_progress",
+                config_json,
+            ),
+        )
+
+    def create_tournament_checkpoint_with_provider_budget(
+        self,
+        checkpoint: TournamentCheckpoint,
+        budget_id: str,
+        limits: BudgetLimits,
+        policy: ProviderBudgetPolicy,
+    ) -> tuple[TournamentCheckpointSaveResult, ProviderBudgetSnapshot]:
+        """Atomically create an empty checkpoint and its frozen Provider budget."""
+
+        checkpoint, _ = self._validate_checkpoint(checkpoint)
+        if checkpoint.completed_series:
+            raise StorageError("new tournament checkpoint must have empty progress")
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        limits, policy = _validate_durable_budget_definition(limits, policy)
+        payload = checkpoint.model_dump(mode="json")
+        config_json = _canonical_json(self._checkpoint_config_payload(checkpoint))
+        pairing_count = len(checkpoint.schedule)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._verify_checkpoint_entrant_bindings(connection, checkpoint)
+            loaded = self._load_tournament_checkpoint(
+                connection,
+                checkpoint.tournament_id,
+            )
+            if loaded is None:
+                if connection.execute(
+                    "SELECT 1 FROM tournament_archives WHERE tournament_id = ?",
+                    (checkpoint.tournament_id,),
+                ).fetchone():
+                    raise TournamentCheckpointCollisionError(
+                        f"tournament_id {checkpoint.tournament_id!r} 已有正式循环赛档案"
+                    )
+                if self._provider_budget_snapshot_in_transaction(connection, budget_id):
+                    raise ProviderBudgetCollisionError("budget_id is already present")
+                self._insert_empty_tournament_checkpoint_in_transaction(
+                    connection,
+                    checkpoint,
+                    payload=payload,
+                    config_json=config_json,
+                )
+                budget = self._insert_provider_budget_in_transaction(
+                    connection,
+                    budget_id,
+                    limits,
+                    policy,
+                    tournament_id=checkpoint.tournament_id,
+                )
+                inserted = True
+            else:
+                stored, status = loaded
+                if (
+                    status != "in_progress"
+                    or stored.completed_series
+                    or _canonical_json(self._checkpoint_config_payload(stored)) != config_json
+                ):
+                    raise TournamentCheckpointCollisionError(
+                        f"tournament_id {checkpoint.tournament_id!r} 已对应另一份 checkpoint"
+                    )
+                budget = self._provider_budget_snapshot_in_transaction(
+                    connection,
+                    budget_id,
+                )
+                if (
+                    budget is None
+                    or budget.tournament_id != checkpoint.tournament_id
+                    or budget.limits != limits
+                    or budget.policy != policy
+                ):
+                    raise ProviderBudgetCollisionError(
+                        "checkpoint exists without the identical frozen Provider budget"
+                    )
+                inserted = False
+            connection.commit()
+            return (
+                TournamentCheckpointSaveResult(
+                    inserted=inserted,
+                    completed_pairing_count=0,
+                    pairing_count=pairing_count,
+                ),
+                budget,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def save_tournament_checkpoint(
         self,
         checkpoint: TournamentCheckpoint,
@@ -4595,35 +6747,11 @@ class SQLiteStore:
                     raise TournamentCheckpointCollisionError(
                         f"tournament_id {checkpoint.tournament_id!r} 已有正式循环赛档案"
                     )
-                connection.execute(
-                    """
-                    INSERT INTO tournament_checkpoints (
-                        tournament_id, schema_version, source, format,
-                        pairing_policy, seed_policy, game, seed, players_json,
-                        game_config_json, schedule_json, max_attempts,
-                        pairing_count, created_at, updated_at, status,
-                        finalized_at, final_tournament_id, config_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-                    """,
-                    (
-                        checkpoint.tournament_id,
-                        checkpoint.schema_version,
-                        checkpoint.source,
-                        checkpoint.format,
-                        checkpoint.pairing_policy,
-                        checkpoint.seed_policy,
-                        checkpoint.game,
-                        checkpoint.seed,
-                        _canonical_json(payload["players"]),
-                        _canonical_json(payload["game_config"]),
-                        _canonical_json(payload["schedule"]),
-                        checkpoint.max_attempts,
-                        pairing_count,
-                        checkpoint.created_at.astimezone(UTC).isoformat(),
-                        checkpoint.updated_at.astimezone(UTC).isoformat(),
-                        "in_progress",
-                        config_json,
-                    ),
+                self._insert_empty_tournament_checkpoint_in_transaction(
+                    connection,
+                    checkpoint,
+                    payload=payload,
+                    config_json=config_json,
                 )
                 connection.commit()
                 return TournamentCheckpointSaveResult(
@@ -4784,6 +6912,7 @@ class SQLiteStore:
                     lease,
                     renew_seconds=DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
                 )
+            self._finalize_tournament_provider_budgets(connection, tournament_id)
             tournament = tournament_from_series(
                 checkpoint.players,
                 checkpoint.completed_series,

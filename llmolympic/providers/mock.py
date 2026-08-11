@@ -13,7 +13,13 @@ import json
 import random
 import re
 
-from llmolympic.providers.base import Provider, _stable_route_id
+from llmolympic.providers.base import (
+    Provider,
+    ProviderChatResult,
+    ProviderUsage,
+    UsageSupport,
+    _stable_route_id,
+)
 
 _CHOICE_RE = re.compile(r"^A[.、)]", re.MULTILINE)
 _GOMOKU_ROW_RE = re.compile(
@@ -165,6 +171,20 @@ class MockProvider(Provider):
             model="",
         )
 
+    def usage_support_for(self, model: str) -> UsageSupport:
+        del model
+        return UsageSupport.EXACT_ZERO
+
+    def resolve_output_token_cap(
+        self,
+        model: str,
+        *,
+        requested_cap: int | None,
+        params: dict[str, object],
+    ) -> int:
+        del model, requested_cap, params
+        return 0
+
     def chat(
         self,
         messages: list[dict],
@@ -224,5 +244,43 @@ class MockProvider(Provider):
             messages,
             model=model,
             request_timeout=request_timeout,
+            **params,
+        )
+
+    def chat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        if output_token_cap not in (None, 0):
+            raise ValueError("Mock Provider 的输出 Token 用量必须为 0")
+        return ProviderChatResult(
+            text=self.chat(
+                messages,
+                model=model,
+                request_timeout=request_timeout,
+                **params,
+            ),
+            usage=ProviderUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+        )
+
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        return self.chat_with_usage(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            output_token_cap=output_token_cap,
             **params,
         )

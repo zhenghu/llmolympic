@@ -28,7 +28,16 @@ from llmolympic.core.game import (
     validate_players,
 )
 from llmolympic.core.judge import LLMJudgePanel
-from llmolympic.core.player import DEFAULT_MAX_RESPONSE_CHARS, Player, PlayerActionError
+from llmolympic.core.player import (
+    DEFAULT_MAX_RESPONSE_CHARS,
+    SYSTEM_PROMPT,
+    LLMPlayer,
+    Player,
+    PlayerActionError,
+    UsageReservationProtocol,
+    release_undispatched_reservations,
+    reserve_player_call_batch,
+)
 
 _FEEDBACK_PREVIEW_LIMIT = 200
 MAX_MOVE_CHARS = DEFAULT_MAX_RESPONSE_CHARS
@@ -79,27 +88,69 @@ async def _collect_move_outcomes(
     Provider 传播取消；线程支撑的旧同步调用仍受 Python 无法强制停止线程的限制。
     """
 
+    reservations = reserve_player_call_batch(
+        (player, prompt, SYSTEM_PROMPT) for player, prompt in requests
+    )
+
+    async def get_move(
+        player: Player,
+        prompt: str,
+        reservation: UsageReservationProtocol | None,
+    ) -> str:
+        if isinstance(player, LLMPlayer):
+            return await player.get_move(prompt, reservation=reservation)
+        return await player.get_move(prompt)
+
     # Preserve the original strict turn-based path: a single Player runs in the
     # caller task, with the same cancellation and context-variable behaviour.
     if len(requests) == 1:
         player, prompt = requests[0]
         try:
-            return [(0, _validate_move_response(await player.get_move(prompt)), None)]
+            return [
+                (
+                    0,
+                    _validate_move_response(
+                        await get_move(player, prompt, reservations[0])
+                    ),
+                    None,
+                )
+            ]
         except asyncio.CancelledError:
             raise
         except PlayerActionError as exc:
             return [(0, None, exc)]
 
-    tasks = [asyncio.create_task(player.get_move(prompt)) for player, prompt in requests]
+    tasks: list[asyncio.Task[str]] = []
+    try:
+        for (player, prompt), reservation in zip(requests, reservations, strict=True):
+            tasks.append(asyncio.create_task(get_move(player, prompt, reservation)))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        release_undispatched_reservations(reservations)
+        raise
 
     def task_outcome(task: asyncio.Task) -> tuple[object | None, BaseException | None]:
-        error = task.exception()
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return None, None
         if error is not None:
             return None, error
         try:
             return _validate_move_response(task.result()), None
         except PlayerActionError as exc:
             return None, exc
+
+    def is_terminal(error: BaseException | None) -> bool:
+        if isinstance(error, asyncio.CancelledError):
+            return False
+        return error is not None and (
+            not isinstance(error, PlayerActionError)
+            or error.technical_loss
+            or terminate_on_player_error
+        )
 
     try:
         pending_tasks = set(tasks)
@@ -120,37 +171,41 @@ async def _collect_move_outcomes(
                 raise asyncio.CancelledError
 
             completed_outcomes = {task: task_outcome(task) for task in completed}
-            terminal_tasks = {
-                task
-                for task, (_, error) in completed_outcomes.items()
-                if error is not None
-                and (
-                    not isinstance(error, PlayerActionError)
-                    or error.technical_loss
-                    or terminate_on_player_error
-                )
-            }
+            terminal_tasks = {task for task, (_, error) in completed_outcomes.items() if is_terminal(error)}
             if terminal_tasks:
                 still_pending = [task for task in tasks if task not in completed]
                 for task in still_pending:
                     task.cancel()
-                await asyncio.gather(*still_pending, return_exceptions=True)
-                # Once this batch terminates the match, successful and ordinary
-                # turn-forfeit results must not mutate state.  Otherwise a peer
-                # completing just before the failure would produce a different
-                # archive from the same peer completing just after it.  Keep only
-                # terminal errors; enumeration preserves registration-order tie-breaks.
-                return [
-                    (index, *completed_outcomes[task])
+                await asyncio.gather(*tasks, return_exceptions=True)
+                outcomes_by_index: list[tuple[int, object | None, BaseException | None]] = [
+                    (index, *task_outcome(task))
                     for index, task in enumerate(tasks)
-                    if task in terminal_tasks
                 ]
+                terminal_outcomes = [
+                    outcome
+                    for outcome in outcomes_by_index
+                    if is_terminal(outcome[2])
+                ]
+                for index, _, error in terminal_outcomes:
+                    if error is not None and not isinstance(error, PlayerActionError):
+                        raise error
+                # Once this batch terminates the match, successful and ordinary
+                # turn-forfeit results must not mutate state. Otherwise a peer
+                # completing just before the failure would produce a different
+                # archive from the same peer completing just after it. Keep only
+                # terminal errors; enumeration preserves registration-order tie-breaks.
+                return terminal_outcomes
     except BaseException:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        # A peer may make the batch terminal before another newly-created task
+        # receives its first event-loop turn.  Such a task never dispatches its
+        # Provider call, so its reservation must be released instead of charged.
+        release_undispatched_reservations(reservations)
 
     return [(index, *task_outcome(task)) for index, task in enumerate(tasks)]
 

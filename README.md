@@ -79,12 +79,6 @@ base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 display_name = "DeepSeek"
 
-[profiles.local]
-provider = "ollama"
-default_model = "llama3.1:8b"
-base_url = "http://localhost:11434"
-display_name = "Local Llama"
-
 [storage]
 # database = "~/.llmolympic/llmolympic.db"
 
@@ -118,9 +112,10 @@ chmod 600 config.toml
 ### 升级已有数据库
 
 首次用当前源码版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
-v7 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
-评分操作序号，并把历史迁移产生的 `matches` / `series_archives` 表规范化成与新建 v7
-数据库相同的结构，同时原样保留归档 JSON。升级前请停止所有正在写入该数据库的赛事进程，
+v8 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
+评分操作序号，并把历史迁移产生的 `matches` / `series_archives` 表规范化；v8 新增无内容的
+Provider 预算与调用尝试账本。旧 checkpoint 不会被追溯附加预算。升级前请停止所有正在写入
+该数据库的赛事进程，
 并使用 SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和
 `-shm` 文件。升级后的数据库不应再交给只支持旧 schema 的版本打开。可先运行
 `llmolympic doctor --db 路径` 进行只读检查；`doctor` 不执行迁移。
@@ -148,8 +143,8 @@ export DEEPSEEK_API_KEY="..."
 # 使用各 Profile 的 default_model
 llmolympic play --game math_quiz --players profile:kimi,profile:deepseek --seed 42
 
-# 只覆盖某个 Profile 的模型（模型名中可继续包含冒号）
-llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
+# 本地 LLM 直接使用 Ollama spec（模型名中可继续包含冒号）
+llmolympic play --game chess --players ollama:llama3.1:8b,mock:fixed
 ```
 
 命名 Profile 选手的稳定身份为 `profile:<id>:<model>`；`display_name`
@@ -164,6 +159,59 @@ llmolympic play --game chess --players profile:local:llama3.1:8b,mock:fixed
 字段规避自评检查。`route_id` 不参与 ELO，也不会写入 `entrants.identity_json`。
 第三方可配置端点的 Provider 应覆盖 `route_id_for()`，否则默认实现会保守地把
 同一适配器类型和模型视为同一路由。
+
+### Provider 硬预算
+
+`play`、`series` 和 `round-robin` 提供五个逐字段解析的 Provider 预算项；优先级均为
+CLI > 环境变量 > `[budget]` > 默认值：
+
+| 语义 | CLI | 环境变量 | `config.toml` |
+|---|---|---|---|
+| 调用总数 | `--max-provider-calls` | `LLMOLYMPIC_MAX_PROVIDER_CALLS` | `max_provider_calls` |
+| 累计输入 | `--max-input-tokens` | `LLMOLYMPIC_MAX_INPUT_TOKENS` | `max_input_tokens` |
+| 单次输出上限 | `--max-output-tokens-per-call` | `LLMOLYMPIC_MAX_OUTPUT_TOKENS_PER_CALL` | `max_output_tokens_per_call` |
+| 累计输出 | `--max-total-output-tokens` | `LLMOLYMPIC_MAX_TOTAL_OUTPUT_TOKENS` | `max_total_output_tokens` |
+| 本地预估美元 | `--max-estimated-cost-usd` | `LLMOLYMPIC_MAX_ESTIMATED_COST_USD` | `max_estimated_cost_usd` |
+
+总预算默认不启用；单次输出默认仍限制为 1024 Token。调用数按实际 Provider transport
+attempt 计数，包含非法答案重试和创意评委请求。调度前，input 用完整 system/user messages
+的规范 JSON UTF-8 字节数作 tokenizer-independent 保守上界，output 使用 Provider 真正下发的
+单次 Token cap；成功返回可信 usage 后再按报告的 input/output Token 结算。Provider 未报告
+usage、返回无效 usage、超时、异常或调度后被取消时，整份预留上界都会计入；尚未调度的取消
+任务才释放预留。同一并发批次先原子预留全部调用，任一上限不足就一个请求也不发出。
+
+美元项只接受十进制字符串并使用整数纳美元记账，不经过二进制浮点：美元上限向下取整到
+纳美元，用户填写的 USD/百万 Token 价格向上取整到纳美元/百万 Token，每次调用估价再向上
+取整到 1 纳美元。云端价格不会联网猜测，必须按精确 spec 显式冻结：
+
+```toml
+[budget]
+max_provider_calls = 200
+max_input_tokens = 500000
+max_output_tokens_per_call = 1024
+max_total_output_tokens = 200000
+max_estimated_cost_usd = "5.00"
+
+[pricing."openai:gpt-4o-mini"]
+input_usd_per_million_tokens = "0.15"
+output_usd_per_million_tokens = "0.60"
+
+[pricing."profile:kimi:moonshot-v1-128k"]
+input_usd_per_million_tokens = "0.50"
+output_usd_per_million_tokens = "2.00"
+```
+
+启用美元硬上限时，每条云端路由都必须有与 `openai:<model>` 或
+`profile:<id>:<model>` 完全匹配的价格；动态 OpenRouter 路由会被拒绝。OpenAI 和命名
+Provider Profiles 都按云端 LLM 管理，Ollama 是本地 LLM，mock 是本地算法，human 是人；
+Ollama 和 mock 未显式配置价格时按零估价。美元数值只是按这份本地冻结价格得到的保守估算，
+不是 Provider 最终账单或账户级支付保护；仍须在 Provider 账户或网关设置独立费用上限。
+
+`play` 的所有参赛者与创意评委共享一个内存账本；`series` 的两局共享同一内存账本，不能
+在第二局重新获得额度。`round-robin` 则使用 SQLite v8 持久化整项赛事的冻结 policy、限额、
+预留与实际用量，跨进程恢复也不会重置预算。预算表只保存 opaque `route_id`、整数限额/计数、
+状态、时间与 lease generation，不保存 API Key、原始端点、请求头、模型名、prompt、response
+或 Provider 原始异常。
 
 ## 运行
 
@@ -215,7 +263,7 @@ llmolympic series --game gomoku --players mock:random,mock:fixed --seed 42
 
 # 三名以上非人类选手循环赛：每一对选手交换顺序各赛一局
 llmolympic round-robin --game knowledge_quiz \
-  --players profile:kimi,profile:deepseek,profile:local --rounds 5 --seed 42
+  --players profile:kimi,profile:deepseek,ollama:llama3.1:8b --rounds 5 --seed 42
 
 # 从开赛时显示的赛事 ID 恢复中断的循环赛（自定义数据库需再次指定）
 llmolympic round-robin --resume <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
@@ -302,7 +350,8 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 进程或机器中断后，使用 `round-robin --resume <TOURNAMENT_ID>` 会跳过已保存的完整
 对阵，从下一组继续。中断时尚未完成的当前一组不会保存，恢复时会整组重跑。
 
-恢复时不能重新指定 `--game`、`--players`、`--rounds`、`--seed` 或超时选项：
+恢复时不能重新指定 `--game`、`--players`、`--rounds`、`--seed`、超时选项、
+`--allow-large-tournament` 或任何 `--max-provider-*` / `--max-*-tokens` / 费用预算选项：
 项目配置、顺序敏感的选手身份和模型、seed、超时及赛程已由检查点冻结。Profile
 恢复规格会使用开赛时已解析的显式模型，因此之后修改 `default_model` 不会偷换参赛
 模型。检查点只保存无密钥的选手描述，不保存 API Key、Key 哈希或 Provider 客户端；
@@ -310,6 +359,10 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 使用了自定义 `--db`，恢复时也必须指向同一数据库。
 创建和恢复 checkpoint 时会先核对已有可信 `entrant_id` 的身份绑定；若同一稳定 ID 已绑定
 到不同模型/Profile 身份，会在首次或下一次 Provider 调用前拒绝，避免跑完整场后才封存失败。
+若新赛事启用了预算，checkpoint 与 SQLite v8 预算 policy 会在同一事务中创建；恢复只读取
+已冻结的限额、精确 route 价格和单次输出 cap，明确忽略当前进程中的 `[budget]`、`[pricing]`
+及相应预算环境变量。旧版创建的无预算 checkpoint 仍可恢复，并继续保持无预算，不会因当前
+配置新增预算而改变赛事合同。
 
 每个进行中的 checkpoint 都由 SQLite 跨进程 runner lease 保护。新赛事会在首次模型调用前
 创建空 checkpoint 并领取执行权；恢复进程则会先在短写事务中原子领取执行权并重载 checkpoint。
@@ -318,7 +371,9 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 后台续租，并在每组双局赛开赛前再次续租；checkpoint 追加也会在同一事务中校验并延长租约。
 租约 token 只在领取进程内持有，
 数据库仅保存摘要；单调递增的 generation 会 fencing 已过期或已被接管的旧执行者，使其不能
-继续保存进度、封存赛事或更新 ELO。
+继续保存进度、封存赛事或更新 ELO。预算调用尝试也绑定同一 generation：接管时，旧 runner
+尚未调度的预留会释放，已标记调度但无法确认 usage 的调用会按完整上界计费，然后新 runner
+才可继续使用剩余额度。
 
 `Ctrl-C` 和正常错误路径会尽力立即释放租约；进程或机器崩溃后，其他进程可在租约过期后接管，
 无需手工清理。心跳丢失会中止当前循环赛任务；临时 SQLite `BUSY`/`LOCKED` 会在当前租约
@@ -334,7 +389,7 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 
 `audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
 权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
-schema v7 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
+schema v8 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
 正式赛事、参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分
 赛事的稳定身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
 已封存赛事会验证正式档案。manifest 会核对表与列、PK、UNIQUE、CHECK、FK、显式索引及
@@ -360,7 +415,8 @@ Typer 参数错误使用退出码 `2`；`--json` 输出不包含选手、模型�
 `2*N*(N-1)*rounds` 个选手回合；16 人 × 100 轮为 48,000 回合，默认最多
 重试 3 次时理论上限为 144,000 次选手调用。超过保守阈值会在建库和调用前拒绝；
 确认费用和超时风险后才使用 `--allow-large-tournament`，并先在 Provider
-账户或网关设置整场费用上限。
+账户或网关设置整场费用上限。该选项只绕过静态赛事规模确认，不能提高、禁用或绕过任何
+已配置的 Provider 硬预算。
 
 LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 `LLMOLYMPIC_LLM_TIMEOUT` 或 `[match] llm_timeout_seconds` 调整。OpenAI、Ollama
@@ -421,15 +477,16 @@ quorum 时命令失败，不写入对局，也不更新 ELO。
 保存在 `match_finished.data.judging`。新裁决使用 `PanelVerdict` schema v2，并在
 `panel` 中冻结完整评审团及每名评委的 `route_id`；即使全部参赛者都已技术放弃、没有
 实际评委调用，也能复核评委路由唯一性。旧 schema v1 裁决仍可读取，但因没有路由快照，
-不能被视为已验证路由独立。SQLite 仍使用 schema v7，最终双人比分继续进入总榜和
+不能被视为已验证路由独立。SQLite 当前使用 schema v8，最终双人比分继续进入总榜和
 `creative_writing` 项目榜。
 
 评委原始响应、API Key、原始端点和请求头不会进入档案。`route_id` 是稳定、可跨档案
 关联的端点伪名；常见端点可能通过字典枚举被猜出，因此它不是加密或保密边界。路由检查
 只证明本地配置的请求路径不同，无法通过 DNS/CNAME、供应商模型别名或动态后端证明底层
 基础模型必然不同。
-当前首个切片只支持 `play`，尚未把评委配置、费用估算和恢复语义接入 `series` 或
-`round-robin`，因此这两种模式会在建库和模型调用前明确拒绝创意项目。
+当前首个切片只支持 `play`；参赛模型与评委调用已经共享同一 Provider 硬预算，但评委配置
+尚未接入 `series` 或 `round-robin` 的 checkpoint、恢复和审计，因此这两种模式仍会在建库
+和模型调用前明确拒绝创意项目。
 
 技术负也会生成完整档案并正常更新双人 ELO。事件中的 `reason_code`、
 `forfeit_scope`、`termination`、`forfeited_by` 等字段可供程序稳定统计；CLI

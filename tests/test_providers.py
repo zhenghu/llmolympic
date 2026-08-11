@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import openai
@@ -13,8 +14,11 @@ from llmolympic.config import ProviderProfile
 from llmolympic.providers import create_profile_provider
 from llmolympic.providers.base import (
     Provider,
+    ProviderChatResult,
     ProviderConfigurationError,
     ProviderTimeoutError,
+    ProviderUsage,
+    UsageSupport,
     validate_route_id,
 )
 from llmolympic.providers.mock import MockProvider
@@ -40,6 +44,37 @@ class _OpenAIClient:
     def with_options(self, **options):
         self.options = options
         return self
+
+
+class _SyncResponseCompletions:
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.calls = 0
+        self.last_params: dict[str, object] = {}
+
+    def create(self, **params) -> object:
+        self.calls += 1
+        self.last_params = params
+        return self.response
+
+
+class _AsyncResponseCompletions(_SyncResponseCompletions):
+    async def create(self, **params) -> object:
+        self.calls += 1
+        self.last_params = params
+        return self.response
+
+
+def _openai_response(*, usage: object | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="  accounted response  "),
+                finish_reason="stop",
+            )
+        ],
+        usage=usage,
+    )
 
 
 class _FallbackRouteProvider(Provider):
@@ -86,6 +121,138 @@ def test_openai_async_timeout_is_converted_to_stable_provider_error() -> None:
     assert client.options == {"timeout": 0.25, "max_retries": 0}
 
 
+def test_provider_usage_is_strict_and_chat_result_metadata_is_typed() -> None:
+    usage = ProviderUsage(input_tokens=2, output_tokens=3, total_tokens=5)
+
+    assert ProviderChatResult("ok", usage, "stop").usage == usage
+    with pytest.raises(TypeError, match="input_tokens"):
+        ProviderUsage(input_tokens=True, output_tokens=0, total_tokens=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="output_tokens"):
+        ProviderUsage(input_tokens=0, output_tokens=1.5, total_tokens=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="input_tokens"):
+        ProviderUsage(input_tokens=-1, output_tokens=1, total_tokens=0)
+    with pytest.raises(ValueError, match="total_tokens"):
+        ProviderUsage(input_tokens=2, output_tokens=3, total_tokens=6)
+    with pytest.raises(TypeError, match="usage"):
+        ProviderChatResult("ok", usage={})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="finish_reason"):
+        ProviderChatResult("ok", finish_reason=1)  # type: ignore[arg-type]
+
+
+def test_default_usage_wrappers_preserve_legacy_provider_contract() -> None:
+    provider = _FallbackRouteProvider(
+        name="fallback",
+        api_key="sensitive-key",
+        base_url="https://sensitive.example/v1",
+    )
+
+    sync_result = provider.chat_with_usage([], model="model")
+    async_result = asyncio.run(provider.achat_with_usage([], model="model"))
+
+    assert provider.chat([], model="model") == "ok"
+    assert sync_result == ProviderChatResult(text="ok")
+    assert async_result == ProviderChatResult(text="ok")
+    assert provider.usage_support_for("model") is UsageSupport.NONE
+    assert (
+        provider.resolve_output_token_cap("model", requested_cap=64, params={}) is None
+    )
+    with pytest.raises(ProviderConfigurationError, match="Token 上限"):
+        provider.chat_with_usage([], model="model", output_token_cap=64)
+
+
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+def test_openai_usage_is_captured_from_the_same_response_and_retry_is_disabled(
+    async_mode: bool,
+) -> None:
+    response = _openai_response(
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18)
+    )
+    completions = (
+        _AsyncResponseCompletions(response) if async_mode else _SyncResponseCompletions(response)
+    )
+    client = _OpenAIClient(completions)
+    provider = object.__new__(OpenAIProvider)
+    if async_mode:
+        provider._async_client = client
+        result = asyncio.run(provider.achat_with_usage([], model="test-model"))
+    else:
+        provider._client = client
+        result = provider.chat_with_usage([], model="test-model")
+
+    assert result == ProviderChatResult(
+        text="accounted response",
+        usage=ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18),
+        finish_reason="stop",
+    )
+    assert completions.calls == 1
+    assert client.options == {"max_retries": 0}
+    assert provider.usage_support_for("test-model") is UsageSupport.REPORTED
+
+
+def test_openai_chat_still_returns_text_and_missing_usage_is_not_fabricated() -> None:
+    completions = _SyncResponseCompletions(_openai_response(usage=None))
+    provider = object.__new__(OpenAIProvider)
+    provider._client = _OpenAIClient(completions)
+
+    assert provider.chat([], model="test-model") == "accounted response"
+    result = provider.chat_with_usage([], model="test-model")
+
+    assert result.text == "accounted response"
+    assert result.usage is None
+    assert completions.calls == 2
+
+
+def test_openai_incomplete_usage_is_none_but_invalid_usage_is_rejected() -> None:
+    incomplete = _openai_response(
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=None, total_tokens=2)
+    )
+    invalid = _openai_response(
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=4)
+    )
+
+    assert OpenAIProvider._result_from_response(incomplete).usage is None
+    with pytest.raises(ValueError, match="total_tokens"):
+        OpenAIProvider._result_from_response(invalid)
+
+
+def test_openai_output_cap_is_negotiated_and_sent_exactly() -> None:
+    response = _openai_response(
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5)
+    )
+    completions = _SyncResponseCompletions(response)
+    provider = object.__new__(OpenAIProvider)
+    provider._client = _OpenAIClient(completions)
+
+    assert provider.resolve_output_token_cap(
+        "gpt-4o-mini",
+        requested_cap=64,
+        params={"max_tokens": 32},
+    ) == 32
+    result = provider.chat_with_usage(
+        [],
+        model="gpt-4o-mini",
+        output_token_cap=32,
+        max_tokens=128,
+    )
+
+    assert result.text == "accounted response"
+    assert completions.last_params["max_tokens"] == 32
+    assert "max_completion_tokens" not in completions.last_params
+
+
+def test_openai_budget_cap_rejects_ambiguous_or_multi_choice_params() -> None:
+    provider = object.__new__(OpenAIProvider)
+
+    with pytest.raises(ProviderConfigurationError, match="n=1"):
+        provider.resolve_output_token_cap("model", requested_cap=64, params={"n": 2})
+    with pytest.raises(ProviderConfigurationError, match="不能同时"):
+        provider.resolve_output_token_cap(
+            "model",
+            requested_cap=64,
+            params={"max_tokens": 32, "max_completion_tokens": 32},
+        )
+
+
 def test_openai_requests_have_a_default_output_token_budget() -> None:
     assert OpenAIProvider._completion_params({}, model="gpt-4o-mini") == {"max_tokens": 1024}
     assert OpenAIProvider._completion_params({}, model="o3-mini") == {"max_completion_tokens": 1024}
@@ -101,9 +268,109 @@ def test_openai_requests_have_a_default_output_token_budget() -> None:
 def test_ollama_requests_have_a_default_output_token_budget() -> None:
     default = OllamaProvider._payload([], "model", {})
     explicit = OllamaProvider._payload([], "model", {"num_predict": 64})
+    hard_cap = OllamaProvider._payload(
+        [],
+        "model",
+        {"num_predict": 256},
+        output_token_cap=32,
+    )
 
     assert default["options"]["num_predict"] == 1024
     assert explicit["options"]["num_predict"] == 64
+    assert hard_cap["options"]["num_predict"] == 32
+
+
+def test_ollama_sync_usage_is_captured_from_one_json_response(monkeypatch) -> None:
+    class Response:
+        def __init__(self) -> None:
+            self.json_calls = 0
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            self.json_calls += 1
+            return {
+                "message": {"content": "  local response  "},
+                "prompt_eval_count": 9,
+                "eval_count": 4,
+                "done_reason": "stop",
+            }
+
+    response = Response()
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: response)
+    provider = OllamaProvider("http://localhost:11434")
+
+    assert provider.resolve_output_token_cap(
+        "model",
+        requested_cap=64,
+        params={"num_predict": 32},
+    ) == 32
+    result = provider.chat_with_usage([], model="model", output_token_cap=32)
+
+    assert result == ProviderChatResult(
+        text="local response",
+        usage=ProviderUsage(input_tokens=9, output_tokens=4, total_tokens=13),
+        finish_reason="stop",
+    )
+    assert response.json_calls == 1
+    assert provider.usage_support_for("model") is UsageSupport.REPORTED
+
+
+def test_ollama_async_usage_is_captured_and_missing_counts_are_none(monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"message": {"content": "local response"}, "done_reason": "load"}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        async def post(self, *args, **kwargs) -> Response:
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
+    provider = OllamaProvider("http://localhost:11434")
+
+    result = asyncio.run(provider.achat_with_usage([], model="model"))
+
+    assert result == ProviderChatResult(
+        text="local response",
+        usage=None,
+        finish_reason="load",
+    )
+
+
+def test_ollama_usage_rejects_invalid_counts() -> None:
+    with pytest.raises(TypeError, match="input_tokens"):
+        OllamaProvider._usage_from_payload(
+            {"prompt_eval_count": "2", "eval_count": "3"}
+        )
+    with pytest.raises(ValueError, match="output_tokens"):
+        OllamaProvider._usage_from_payload({"prompt_eval_count": 2, "eval_count": -1})
+
+
+def test_mock_reports_exact_zero_usage_without_changing_text_contract() -> None:
+    provider = MockProvider("fixed")
+    messages = [{"role": "user", "content": "answer this"}]
+
+    result = asyncio.run(provider.achat_with_usage(messages, model="ignored"))
+
+    assert provider.chat(messages, model="ignored") == "42"
+    assert result == ProviderChatResult(
+        text="42",
+        usage=ProviderUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+    )
+    assert provider.usage_support_for("ignored") is UsageSupport.EXACT_ZERO
+    assert provider.resolve_output_token_cap(
+        "ignored", requested_cap=64, params={}
+    ) == 0
 
 
 def test_default_route_identity_is_stable_without_inspecting_instance_attributes() -> None:

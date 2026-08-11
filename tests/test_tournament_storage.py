@@ -17,7 +17,9 @@ from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.series import series_from_legs
 from llmolympic.core.storage import (
     SCHEMA_VERSION,
+    BudgetPoisonedError,
     MatchIdCollisionError,
+    ProviderBudgetPendingError,
     SeriesIdCollisionError,
     SQLiteStore,
     StorageError,
@@ -32,8 +34,24 @@ from llmolympic.core.tournament import (
     round_robin_pair_seed,
     tournament_from_series,
 )
+from llmolympic.core.usage import (
+    BudgetLimits,
+    CallBounds,
+    ProviderBudgetPolicy,
+    RouteBudgetPolicy,
+    UsageExceedsReservationError,
+    UsageTotals,
+)
 
 STARTED = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+USAGE_ROUTE_ID = "route:v1:" + "2" * 64
+
+
+def _usage_policy(*, max_output_tokens_per_call: int = 100) -> ProviderBudgetPolicy:
+    return ProviderBudgetPolicy(
+        max_output_tokens_per_call=max_output_tokens_per_call,
+        routes=(RouteBudgetPolicy(route_id=USAGE_ROUTE_ID),),
+    )
 
 
 def _descriptor(name: str) -> dict:
@@ -438,7 +456,9 @@ from llmolympic.core.storage import SQLiteStore
 from llmolympic.core.tournament import TournamentCheckpoint
 
 store = SQLiteStore(sys.argv[1], create=False)
-claim = store.claim_tournament_runner(sys.argv[2], lease_seconds=1)
+# Give slower CI interpreters enough time to load and persist the first
+# checkpoint, then deliberately shorten the renewed lease for fast takeover.
+claim = store.claim_tournament_runner(sys.argv[2], lease_seconds=5)
 checkpoint = TournamentCheckpoint.model_validate_json(
     Path(sys.argv[3]).read_text(encoding="utf-8")
 )
@@ -610,6 +630,222 @@ def test_expired_lease_takeover_fences_every_stale_write(tmp_path) -> None:
         assert (
             connection.execute("SELECT count(*) FROM tournament_runner_leases").fetchone()[0] == 0
         )
+
+
+def test_checkpoint_and_frozen_provider_budget_are_created_atomically(tmp_path) -> None:
+    path = tmp_path / "atomic-checkpoint-budget.db"
+    tournament = _tournament(tournament_id="atomic-checkpoint-budget")
+    checkpoint = _checkpoint(tournament)
+    policy = _usage_policy(max_output_tokens_per_call=64)
+    store = SQLiteStore(path)
+
+    checkpoint_result, budget = store.create_tournament_checkpoint_with_provider_budget(
+        checkpoint,
+        "tournament-budget",
+        BudgetLimits(calls=10, output=100),
+        policy,
+    )
+
+    assert checkpoint_result.inserted
+    assert budget.tournament_id == tournament.tournament_id
+    assert budget.policy == policy
+    repeated, repeated_budget = store.create_tournament_checkpoint_with_provider_budget(
+        checkpoint,
+        "tournament-budget",
+        BudgetLimits(calls=10, output=100),
+        policy,
+    )
+    assert not repeated.inserted
+    assert repeated_budget == budget
+    assert store.load_tournament_provider_budget(tournament.tournament_id) == budget
+
+
+def test_v7_to_v8_migration_preserves_in_progress_checkpoint_and_active_lease(
+    tmp_path,
+) -> None:
+    path = tmp_path / "v7-checkpoint-to-v8.db"
+    tournament = _tournament(tournament_id="v7-checkpoint-to-v8")
+    store = SQLiteStore(path)
+    checkpoint = _checkpoint(tournament)
+    store.save_tournament_checkpoint(checkpoint)
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            DROP TABLE provider_call_attempts;
+            DROP TABLE provider_budgets;
+            PRAGMA user_version = 7;
+            """
+        )
+
+    migrated = SQLiteStore(path, create=False)
+
+    assert migrated.get_tournament_checkpoint(tournament.tournament_id) == checkpoint
+    assert migrated.load_tournament_provider_budget(tournament.tournament_id) is None
+    renewed = migrated.renew_tournament_runner(lease)
+    assert renewed.generation == lease.generation
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+
+def test_failed_atomic_checkpoint_budget_creation_rolls_back_both_rows(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "atomic-checkpoint-budget-rollback.db"
+    tournament = _tournament(tournament_id="atomic-checkpoint-budget-rollback")
+    store = SQLiteStore(path)
+
+    def fail_budget_insert(*args, **kwargs):
+        raise RuntimeError("injected budget insert failure")
+
+    monkeypatch.setattr(store, "_insert_provider_budget_in_transaction", fail_budget_insert)
+    with pytest.raises(RuntimeError, match="injected budget insert failure"):
+        store.create_tournament_checkpoint_with_provider_budget(
+            _checkpoint(tournament),
+            "tournament-budget",
+            BudgetLimits(calls=10),
+            _usage_policy(),
+        )
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM tournament_checkpoints").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM provider_budgets").fetchone()[0] == 0
+
+
+def test_expired_lease_takeover_closes_old_generation_provider_attempts(tmp_path) -> None:
+    path = tmp_path / "provider-ledger-takeover.db"
+    tournament = _tournament(tournament_id="provider-ledger-takeover")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    stale = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.create_provider_budget(
+        "tournament-budget",
+        BudgetLimits(calls=3, input=30, output=30),
+        _usage_policy(),
+        tournament_id=tournament.tournament_id,
+        lease=stale,
+    )
+    dispatched, reserved = store.reserve_provider_call_batch(
+        "tournament-budget",
+        (
+            CallBounds(input=4, output=5, route_id=USAGE_ROUTE_ID),
+            CallBounds(input=7, output=8, route_id=USAGE_ROUTE_ID),
+        ),
+        attempt_ids=("old-dispatched", "old-reserved"),
+        lease=stale,
+    )
+    store.mark_provider_call_dispatched(dispatched.attempt_id, lease=stale)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE tournament_runner_leases
+            SET acquired_at_epoch = 0, renewed_at_epoch = 0, expires_at_epoch = 1
+            WHERE tournament_id = ?
+            """,
+            (tournament.tournament_id,),
+        )
+
+    active = store.claim_tournament_runner(tournament.tournament_id).lease
+
+    assert active.generation == stale.generation + 1
+    old_dispatched = store.get_provider_call_attempt(dispatched.attempt_id)
+    old_reserved = store.get_provider_call_attempt(reserved.attempt_id)
+    assert old_dispatched is not None and old_dispatched.state == "charged_unknown"
+    assert old_dispatched.charged == dispatched.bounds.as_totals()
+    assert old_reserved is not None and old_reserved.state == "released_pre_dispatch"
+    snapshot = store.load_provider_budget("tournament-budget")
+    assert snapshot is not None
+    assert snapshot.spent == dispatched.bounds.as_totals()
+    assert snapshot.reserved == UsageTotals.zero()
+    with pytest.raises(TournamentRunnerLeaseLostError):
+        store.charge_provider_call_unknown(dispatched.attempt_id, lease=stale)
+
+    (current,) = store.reserve_provider_call_batch(
+        "tournament-budget",
+        (CallBounds(route_id=USAGE_ROUTE_ID),),
+        attempt_ids=("current",),
+        lease=active,
+    )
+    assert current.runner_generation == active.generation
+    store.release_provider_call_pre_dispatch(current.attempt_id, lease=active)
+
+
+def test_checkpoint_finalize_rejects_pending_provider_attempt_and_seals_budget(
+    tmp_path,
+) -> None:
+    path = tmp_path / "provider-ledger-finalize.db"
+    tournament = _tournament(tournament_id="provider-ledger-finalize")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.create_provider_budget(
+        "tournament-budget",
+        BudgetLimits(calls=1, output=20),
+        _usage_policy(max_output_tokens_per_call=20),
+        tournament_id=tournament.tournament_id,
+        lease=lease,
+    )
+    (attempt,) = store.reserve_provider_call_batch(
+        "tournament-budget",
+        (CallBounds(output=20, route_id=USAGE_ROUTE_ID),),
+        attempt_ids=("pending",),
+        lease=lease,
+    )
+    store.mark_provider_call_dispatched(attempt.attempt_id, lease=lease)
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(
+            _checkpoint(tournament, completed_count),
+            lease=lease,
+        )
+
+    with pytest.raises(ProviderBudgetPendingError, match="unresolved"):
+        store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
+    assert store.get_tournament(tournament.tournament_id) is None
+    assert not store.load_provider_budget("tournament-budget").finalized
+
+    store.charge_provider_call_unknown(attempt.attempt_id, lease=lease)
+    result = store.finalize_tournament_checkpoint(
+        tournament.tournament_id,
+        lease=lease,
+    )
+    assert result.inserted
+    budget = store.load_provider_budget("tournament-budget")
+    assert budget is not None and budget.finalized
+    assert budget.spent == UsageTotals(calls=1, input=0, output=20, estimated_cost=0)
+
+
+def test_checkpoint_finalize_rejects_poisoned_provider_budget(tmp_path) -> None:
+    path = tmp_path / "provider-ledger-poisoned-finalize.db"
+    tournament = _tournament(tournament_id="provider-ledger-poison-finalize")
+    store = SQLiteStore(path)
+    store.save_tournament_checkpoint(_checkpoint(tournament))
+    lease = store.claim_tournament_runner(tournament.tournament_id).lease
+    store.create_provider_budget(
+        "tournament-budget",
+        BudgetLimits(calls=1, input=2),
+        _usage_policy(),
+        tournament_id=tournament.tournament_id,
+        lease=lease,
+    )
+    (attempt,) = store.reserve_provider_call_batch(
+        "tournament-budget",
+        (CallBounds(input=2, route_id=USAGE_ROUTE_ID),),
+        attempt_ids=("overrun",),
+        lease=lease,
+    )
+    store.mark_provider_call_dispatched(attempt.attempt_id, lease=lease)
+    with pytest.raises(UsageExceedsReservationError):
+        store.settle_provider_call(
+            attempt.attempt_id,
+            UsageTotals(calls=1, input=4, output=0, estimated_cost=0),
+            lease=lease,
+        )
+    for completed_count in range(1, 4):
+        store.save_tournament_checkpoint(_checkpoint(tournament, completed_count), lease=lease)
+
+    with pytest.raises(BudgetPoisonedError, match="poisoned"):
+        store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
 
 def test_expire_runner_leases_preserves_generation_for_next_claim(tmp_path) -> None:

@@ -11,8 +11,11 @@ from llmolympic.config import get as cfg_get
 from llmolympic.providers.base import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     Provider,
+    ProviderChatResult,
     ProviderConfigurationError,
     ProviderTimeoutError,
+    ProviderUsage,
+    UsageSupport,
     _endpoint_fingerprint,
     _stable_route_id,
     validate_base_url,
@@ -139,18 +142,179 @@ class OpenAIProvider(Provider):
             model=model,
         )
 
-    @classmethod
-    def _completion_params(cls, params: dict, *, model: str) -> dict:
-        limited = dict(params)
-        if "max_tokens" not in limited and "max_completion_tokens" not in limited:
-            model_name = model.rsplit("/", 1)[-1].lower()
-            uses_completion_tokens = any(
-                model_name == prefix or model_name.startswith((f"{prefix}-", f"{prefix}."))
-                for prefix in cls._COMPLETION_TOKEN_MODELS
+    def usage_support_for(self, model: str) -> UsageSupport:
+        del model
+        return UsageSupport.REPORTED
+
+    @staticmethod
+    def _strict_output_token_cap(value: object, *, source: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ProviderConfigurationError(f"{source} 必须是正整数")
+        return value
+
+    def resolve_output_token_cap(
+        self,
+        model: str,
+        *,
+        requested_cap: int | None,
+        params: dict[str, object],
+    ) -> int:
+        del self
+        if requested_cap is not None:
+            requested_cap = OpenAIProvider._strict_output_token_cap(
+                requested_cap,
+                source="LLM 单次输出 Token 上限",
             )
-            limit_key = "max_completion_tokens" if uses_completion_tokens else "max_tokens"
-            limited[limit_key] = DEFAULT_MAX_OUTPUT_TOKENS
+        n = params.get("n", 1)
+        if isinstance(n, bool) or not isinstance(n, int) or n != 1:
+            raise ProviderConfigurationError("Provider 用量预算模式仅支持 n=1")
+        configured = [key for key in ("max_tokens", "max_completion_tokens") if key in params]
+        if len(configured) > 1:
+            raise ProviderConfigurationError(
+                "max_tokens 与 max_completion_tokens 不能同时设置"
+            )
+        configured_cap = (
+            DEFAULT_MAX_OUTPUT_TOKENS
+            if not configured
+            else OpenAIProvider._strict_output_token_cap(
+                params[configured[0]],
+                source=configured[0],
+            )
+        )
+        return configured_cap if requested_cap is None else min(configured_cap, requested_cap)
+
+    @classmethod
+    def _completion_params(
+        cls,
+        params: dict,
+        *,
+        model: str,
+        output_token_cap: int | None = None,
+    ) -> dict:
+        limited = dict(params)
+        if output_token_cap is not None:
+            cap = cls._strict_output_token_cap(
+                output_token_cap,
+                source="Provider 输出 Token 上限",
+            )
+            n = limited.get("n", 1)
+            if isinstance(n, bool) or not isinstance(n, int) or n != 1:
+                raise ProviderConfigurationError("Provider 用量预算模式仅支持 n=1")
+            configured = [
+                key for key in ("max_tokens", "max_completion_tokens") if key in limited
+            ]
+            if len(configured) > 1:
+                raise ProviderConfigurationError(
+                    "max_tokens 与 max_completion_tokens 不能同时设置"
+                )
+            limit_key = configured[0] if configured else cls._completion_limit_key(model)
+            limited.pop("max_tokens", None)
+            limited.pop("max_completion_tokens", None)
+            limited[limit_key] = cap
+            return limited
+        if "max_tokens" not in limited and "max_completion_tokens" not in limited:
+            limited[cls._completion_limit_key(model)] = DEFAULT_MAX_OUTPUT_TOKENS
         return limited
+
+    @classmethod
+    def _completion_limit_key(cls, model: str) -> str:
+        model_name = model.rsplit("/", 1)[-1].lower()
+        uses_completion_tokens = any(
+            model_name == prefix or model_name.startswith((f"{prefix}-", f"{prefix}."))
+            for prefix in cls._COMPLETION_TOKEN_MODELS
+        )
+        return "max_completion_tokens" if uses_completion_tokens else "max_tokens"
+
+    @staticmethod
+    def _usage_from_response(response: object) -> ProviderUsage | None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+
+        def field(name: str) -> object:
+            if isinstance(usage, dict):
+                return usage.get(name)
+            return getattr(usage, name, None)
+
+        input_tokens = field("prompt_tokens")
+        output_tokens = field("completion_tokens")
+        total_tokens = field("total_tokens")
+        if input_tokens is None or output_tokens is None or total_tokens is None:
+            return None
+        return ProviderUsage(
+            input_tokens=input_tokens,  # type: ignore[arg-type]
+            output_tokens=output_tokens,  # type: ignore[arg-type]
+            total_tokens=total_tokens,  # type: ignore[arg-type]
+        )
+
+    @classmethod
+    def _result_from_response(cls, response: object) -> ProviderChatResult:
+        choice = response.choices[0]  # type: ignore[attr-defined]
+        return ProviderChatResult(
+            text=(choice.message.content or "").strip(),
+            usage=cls._usage_from_response(response),
+            finish_reason=getattr(choice, "finish_reason", None),
+        )
+
+    def _sync_completion(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> object:
+        from openai import APITimeoutError
+
+        options: dict[str, object] = {"max_retries": 0}
+        if request_timeout is not None:
+            options["timeout"] = request_timeout
+        client = self._client.with_options(**options)
+        if getattr(self, "_isolate_sdk_environment", False):
+            client = _isolate_client(client)
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **self._completion_params(
+                    params,
+                    model=model,
+                    output_token_cap=output_token_cap,
+                ),
+            )
+        except APITimeoutError as exc:
+            raise ProviderTimeoutError("OpenAI 请求超时") from exc
+
+    async def _async_completion(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> object:
+        from openai import APITimeoutError
+
+        options: dict[str, object] = {"max_retries": 0}
+        if request_timeout is not None:
+            options["timeout"] = request_timeout
+        client = self._async_client.with_options(**options)
+        if getattr(self, "_isolate_sdk_environment", False):
+            client = _isolate_client(client)
+        try:
+            return await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **self._completion_params(
+                    params,
+                    model=model,
+                    output_token_cap=output_token_cap,
+                ),
+            )
+        except APITimeoutError as exc:
+            raise ProviderTimeoutError("OpenAI 请求超时") from exc
 
     def chat(
         self,
@@ -160,22 +324,32 @@ class OpenAIProvider(Provider):
         request_timeout: float | None = None,
         **params,
     ) -> str:
-        from openai import APITimeoutError
+        response = self._sync_completion(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            **params,
+        )
+        choice = response.choices[0]  # type: ignore[attr-defined]
+        return (choice.message.content or "").strip()
 
-        client = self._client
-        if request_timeout is not None:
-            client = client.with_options(timeout=request_timeout, max_retries=0)
-            if getattr(self, "_isolate_sdk_environment", False):
-                client = _isolate_client(client)
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **self._completion_params(params, model=model),
-            )
-        except APITimeoutError as exc:
-            raise ProviderTimeoutError("OpenAI 请求超时") from exc
-        return (resp.choices[0].message.content or "").strip()
+    def chat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        response = self._sync_completion(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            output_token_cap=output_token_cap,
+            **params,
+        )
+        return self._result_from_response(response)
 
     async def achat(
         self,
@@ -185,19 +359,29 @@ class OpenAIProvider(Provider):
         request_timeout: float | None = None,
         **params,
     ) -> str:
-        from openai import APITimeoutError
+        response = await self._async_completion(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            **params,
+        )
+        choice = response.choices[0]  # type: ignore[attr-defined]
+        return (choice.message.content or "").strip()
 
-        client = self._async_client
-        if request_timeout is not None:
-            client = client.with_options(timeout=request_timeout, max_retries=0)
-            if getattr(self, "_isolate_sdk_environment", False):
-                client = _isolate_client(client)
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **self._completion_params(params, model=model),
-            )
-        except APITimeoutError as exc:
-            raise ProviderTimeoutError("OpenAI 请求超时") from exc
-        return (resp.choices[0].message.content or "").strip()
+    async def achat_with_usage(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        request_timeout: float | None = None,
+        output_token_cap: int | None = None,
+        **params,
+    ) -> ProviderChatResult:
+        response = await self._async_completion(
+            messages,
+            model=model,
+            request_timeout=request_timeout,
+            output_token_cap=output_token_cap,
+            **params,
+        )
+        return self._result_from_response(response)
