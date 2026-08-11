@@ -7,18 +7,21 @@
 - 启动第三阶段：新增双人 `creative_writing` 开放作答项目，以及 3–9 名 LLM 组成的匿名
   评审团。每名评委分别盲评每份作品，完整评委交集达到严格多数 quorum 后，以版本化 rubric
   的加权总分中位数生成 0–1 最终比分。
-- `play` 新增可重复的 `--judge`；禁止重复评委、自评和人类评委。个别评委失败可在 quorum
-  内降级，未达 quorum 则不存档、不更新 ELO。创意项目首切明确不开放 `series` 和
-  `round-robin`。
+- `play`、`series` 和 `round-robin` 新增可重复的 `--judge`；禁止重复评委、自评和人类评委。
+  个别评委失败可在 quorum 内降级，未达 quorum 则不存档、不更新 ELO。双局赛冻结并复用
+  同一评审团；循环赛在 checkpoint 中冻结无凭据快照，跨进程恢复时严格核对后再调用模型。
 - 评审协议严格拒绝缺失/额外字段、布尔值、NaN、Infinity、越界分数和超长理由；作品按
   不可信数据隔离，评委题面不包含参赛者或模型身份。档案只保存安全白名单评委描述、匿名
   映射、逐维裁决与可重算聚合，不保存原始响应、凭据或端点。
 - 新增与 `entrant_id` / ELO 分离的 Provider `route_id`：同一规范化端点和模型不能通过
   direct/Profile、Key、名称或采样参数变化重复担任评委或规避自评。`PanelVerdict` 升至
-  schema v2 并冻结完整评审团；旧 v1 裁决保持可读，MatchArchive v2 不变。路由摘要不保存
-  原始端点，但它可关联且可能被字典猜测，不作为保密或远端模型真实性证明。
+  schema v3，冻结完整评审团并绑定任务、rubric、匿名映射和作品正文的请求摘要；旧 v1/v2
+  裁决保持可读，MatchArchive v2 不变。路由摘要不保存原始端点，但它可关联且可能被字典
+  猜测，不作为保密或远端模型真实性证明。
 - 创意裁决使用当前 SQLite schema v8，在 `match_finished.data.judging` 中持久化，并复用
-  现有双人总榜和分项目 ELO。`play.command` 新增完全离线的创意写作 + 三算法评委入口。
+  现有双人总榜和分项目 ELO。系列与赛事档案逐层冻结同一评审团，严格只读审计会按事件重建
+  裁决请求，并复核关系表、评分账本与 ELO。`play.command` 新增完全离线的创意单场、双局赛
+  和三人循环赛入口。
 - 新增手动触发的 `Live Provider Smoke` GitHub Actions 工作流：使用受 Environment 保护的
   OpenRouter Secret，按顺序从 3–9 个候选中探针选出最先通过严格评审协议的三个模型，再以
   两名 mock 参赛者执行固定 6 次正式评审请求。单次运行最多 15 次可能计费调用，正式阶段仍

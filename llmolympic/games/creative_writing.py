@@ -45,7 +45,7 @@ class CreativeWriting:
     min_players = 2
     max_players = 2
     requires_judge_panel = True
-    supported_modes = frozenset({"play"})
+    supported_modes = frozenset({"play", "series", "round_robin"})
 
     def describe_config(self) -> dict[str, object]:
         return {

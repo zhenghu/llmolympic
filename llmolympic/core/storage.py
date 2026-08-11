@@ -6568,6 +6568,7 @@ class SQLiteStore:
                 checkpoint.completed_series,
                 seed=checkpoint.seed,
                 tournament_id=checkpoint.tournament_id,
+                judge_panel=checkpoint.judge_panel,
             )
             try:
                 stored_tournament = self._semantic_tournament_json(final_row["tournament_json"])
@@ -6918,6 +6919,7 @@ class SQLiteStore:
                 checkpoint.completed_series,
                 seed=checkpoint.seed,
                 tournament_id=checkpoint.tournament_id,
+                judge_panel=checkpoint.judge_panel,
             )
             if (
                 status == "in_progress"

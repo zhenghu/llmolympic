@@ -368,7 +368,8 @@ def test_one_incomplete_judge_is_excluded_but_majority_quorum_still_aggregates()
     verdict = asyncio.run(panel.adjudicate(_request(), seed=17))
 
     assert verdict.quorum == 2
-    assert verdict.schema_version == 2
+    assert verdict.schema_version == 3
+    assert verdict.request_digest is not None
     assert verdict.successful_judges == 2
     assert verdict.panel is not None
     assert len(verdict.panel) == verdict.panel_size == 3
@@ -570,7 +571,7 @@ def test_duplicate_judge_routes_and_contestant_route_overlap_are_rejected() -> N
     assert all(not provider.calls for provider in [first.provider, same_route.provider])
 
 
-def test_panel_verdict_v2_freezes_and_authenticates_the_complete_panel() -> None:
+def test_panel_verdict_v3_freezes_and_authenticates_the_complete_panel() -> None:
     scores = {
         "WORK_ALPHA": {"originality": 7.0, "clarity": 6.0},
         "WORK_BETA": {"originality": 6.0, "clarity": 7.0},
@@ -587,7 +588,8 @@ def test_panel_verdict_v2_freezes_and_authenticates_the_complete_panel() -> None
 
     verdict = asyncio.run(panel.adjudicate(_request(), seed=71))
 
-    assert verdict.schema_version == 2
+    assert verdict.schema_version == 3
+    assert verdict.request_digest is not None
     assert verdict.panel is not None
     assert len(verdict.panel) == verdict.panel_size == 3
     assert len({judge.judge_id for judge in verdict.panel}) == 3
@@ -612,7 +614,7 @@ def test_panel_verdict_v2_freezes_and_authenticates_the_complete_panel() -> None
         PanelVerdict.model_validate(mismatched_output)
 
 
-def test_fixed_scores_v2_freezes_panel_without_calling_judges() -> None:
+def test_fixed_scores_v3_freezes_panel_without_calling_judges() -> None:
     providers = [
         _ScriptedJudgeProvider(f"fixed-provider-{index}", {}) for index in range(3)
     ]
@@ -629,7 +631,8 @@ def test_fixed_scores_v2_freezes_panel_without_calling_judges() -> None:
 
     verdict = asyncio.run(panel.adjudicate(request, seed=72))
 
-    assert verdict.schema_version == 2
+    assert verdict.schema_version == 3
+    assert verdict.request_digest is not None
     assert verdict.aggregation == "fixed-scores-v1"
     assert verdict.panel is not None
     assert len(verdict.panel) == verdict.panel_size == 3

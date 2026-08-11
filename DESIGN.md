@@ -164,18 +164,23 @@ class Game(Protocol):
 | 猜谜 riddle_quiz | 多题问答 | 规则（结构化线索 + 选项/别名匹配） | ✅ 已实现 |
 | 五子棋 gomoku | 多轮有状态 | 15×15 自由规则（五连胜负） | ✅ 已实现 |
 | 国际象棋 chess | 多轮有状态 | 标准规则（SAN/UCI、胜负与和棋） | ✅ 已实现 |
-| 创意写作 creative_writing | 单轮开放作答 | LLM 评审团（匿名、独立盲评、加权中位数） | 🟡 阶段三首切已实现 |
+| 创意写作 creative_writing | 单轮开放作答 | LLM 评审团（匿名、独立盲评、加权中位数） | ✅ 阶段三已实现 |
 
-创意写作首切限定两名参赛者和单场 `play`。Game 在全部作品收齐后提供版本化
+创意写作的每局限定两名参赛者。Game 在全部作品收齐后提供版本化
 `JudgingRequest`；Match 在同步 `score()` 路径之前调用异步评审团，并把完整可重算裁决
 放入 `match_finished.data.judging`。评委规模为 3–9 名，法定人数采用严格多数；同一评委
 必须完整评完全部有效作品才能参与聚合。每份作品单独送审，题面只含匿名标签，不含参赛者
-或模型身份；正文被视为不可信数据。`PanelVerdict` schema v2 冻结完整 `panel`，要求
+或模型身份；正文被视为不可信数据。`PanelVerdict` schema v3 冻结完整 `panel`，要求
 评委 ID 和 `route_id` 均唯一，正常裁决的成功/失败记录必须精确覆盖该快照；全固定分路径
-虽然不调用评委，也仍保留同一快照。旧 v1 裁决可兼容读取，但不具备已验证的路由独立性。
-嵌套裁决版本升级不改变 MatchArchive v2；当前 SQLite schema v8 另行承载 Provider
-预算账本。创意 `play` 的参赛者与评委已共享预算，但仍不支持创意双局赛或循环赛，避免在
-checkpoint、恢复与审计尚未冻结评委配置时产生不可复核赛事。
+虽然不调用评委，也仍保留同一快照。v3 额外绑定规范化请求摘要，将任务、rubric、匿名映射
+和作品正文与裁决证据连接；深度审计按事件重建请求并复核摘要。旧 v1/v2 裁决兼容读取，
+但 v1 不具备已验证的路由独立性。嵌套裁决版本升级不改变 MatchArchive v2；当前 SQLite
+schema v8 另行承载 Provider 预算账本。
+
+创意 `series` 的两局复用一个 `JudgePanelSnapshot` 并原子计分；`round-robin` 在零进度
+checkpoint 中冻结同一快照，恢复时由当前凭据重建评委并在模型调用前验证安全描述与路由。
+每个系列、最终赛事档案和所有非技术负裁决都必须与顶层快照一致。参赛者和评委共享预算；
+SQLite v8 账本、runner lease、接管封账与深度审计覆盖整项创意循环赛。
 
 持久化的 `route_id` 是对配置路由的稳定伪名，不包含 Key、请求头或原始端点，但常见端点
 仍可能被字典枚举，不能把它当作保密机制。规范化不会执行 DNS 查询，也不会合并 CNAME、
@@ -291,10 +296,9 @@ CLI（今天）          WebSocket（将来）
    公平循环赛与 SQLite v4 迁移 ✅；逐对阵 checkpoint/resume 与 SQLite v5 迁移 ✅；
    循环赛严格只读深度审计与恢复完成态校验 ✅；跨进程 runner lease、fencing 与
    SQLite v6 迁移 ✅；全局评分操作账本、确定性 ELO 重放与 SQLite v7 迁移 ✅。
-3. **创意 + LLM 评审团（进行中）**：双人创意写作与单场 CLI ✅；逐作品匿名盲评、
+3. **创意 + LLM 评审团（已完成）**：双人创意写作与单场 CLI ✅；逐作品匿名盲评、
    3–9 名评委多数 quorum、严格 JSON 与加权中位数聚合 ✅；双人档案与 ELO ✅；
-   Provider 硬预算与创意 `play` 参赛者/评委共享预算 ✅；客观项目 `round-robin` 的
-   SQLite v8 跨进程预算账本 ✅；评委配置的创意系列赛/循环赛 checkpoint、恢复及深度审计
-   仍待完成，尚未开放创意 `series`。
+   Provider 硬预算与参赛者/评委共享预算 ✅；SQLite v8 跨进程预算账本 ✅；冻结评审团的
+   创意双局赛与循环赛 ✅；checkpoint/resume、runner lease、请求证据绑定及深度审计 ✅。
 4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
    之后新增项目继续保持纯插件接入。

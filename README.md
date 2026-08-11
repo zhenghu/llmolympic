@@ -217,8 +217,8 @@ Ollama 和 mock 未显式配置价格时按零估价。美元数值只是按这�
 
 macOS 可以在 Finder 中双击 `play.command`。菜单可直接启动五子棋、国际象棋、
 数学、知识、逻辑推理、猜谜竞答和创意写作；六个客观判分项目都提供三个 mock 的
-离线循环赛入口，创意写作提供“两名 mock 参赛者 + 三名匿名算法评委”的离线演示，
-并保留已有的人类对战、两个 mock 自动演示和棋类换先手双局赛。
+离线循环赛入口，创意写作提供单场、双局赛和“三名 mock 参赛者 + 三名匿名算法评委”
+循环赛入口，并保留已有的人类对战、两个 mock 自动演示和棋类换先手双局赛。
 
 ```bash
 # 两个 mock 选手演示（离线，无需 key）
@@ -241,6 +241,16 @@ llmolympic play --game creative_writing \
 # 创意写作云端实战：参赛模型与三名评委使用不同的稳定身份
 llmolympic play --game creative_writing \
   --players profile:writer-a,profile:writer-b \
+  --judge profile:judge-a --judge profile:judge-b --judge profile:judge-c --seed 42
+
+# 创意写作双局赛：两局复用同一冻结评审团与整次预算
+llmolympic series --game creative_writing \
+  --players profile:writer-a,profile:writer-b \
+  --judge profile:judge-a --judge profile:judge-b --judge profile:judge-c --seed 42
+
+# 创意写作循环赛：checkpoint 会冻结评审团，恢复时无需也不允许重传 --judge
+llmolympic round-robin --game creative_writing \
+  --players profile:writer-a,profile:writer-b,profile:writer-c \
   --judge profile:judge-a --judge profile:judge-b --judge profile:judge-c --seed 42
 
 # 动态逻辑推理：排序约束与三位密码题都会先由程序穷举确认唯一解
@@ -474,19 +484,23 @@ Profiles 都是云端 LLM，Ollama 是本地 LLM，mock 只是离线算法。
 quorum 时命令失败，不写入对局，也不更新 ELO。
 
 成功裁决的安全评委描述、匿名映射、逐维分数、理由、失败摘要、quorum 与聚合版本都
-保存在 `match_finished.data.judging`。新裁决使用 `PanelVerdict` schema v2，并在
+保存在 `match_finished.data.judging`。新裁决使用 `PanelVerdict` schema v3，在
 `panel` 中冻结完整评审团及每名评委的 `route_id`；即使全部参赛者都已技术放弃、没有
-实际评委调用，也能复核评委路由唯一性。旧 schema v1 裁决仍可读取，但因没有路由快照，
-不能被视为已验证路由独立。SQLite 当前使用 schema v8，最终双人比分继续进入总榜和
-`creative_writing` 项目榜。
+实际评委调用，也能复核评委路由唯一性。v3 还绑定规范化 `JudgingRequest` 摘要，使题面、
+rubric、匿名映射和作品正文不能在不破坏深度审计的情况下被替换。旧 schema v1/v2 裁决仍
+可读取；其中 v1 因没有路由快照，不能被视为已验证路由独立。SQLite 当前使用 schema v8，
+最终双人比分继续进入总榜和 `creative_writing` 项目榜。
 
 评委原始响应、API Key、原始端点和请求头不会进入档案。`route_id` 是稳定、可跨档案
 关联的端点伪名；常见端点可能通过字典枚举被猜出，因此它不是加密或保密边界。路由检查
 只证明本地配置的请求路径不同，无法通过 DNS/CNAME、供应商模型别名或动态后端证明底层
 基础模型必然不同。
-当前首个切片只支持 `play`；参赛模型与评委调用已经共享同一 Provider 硬预算，但评委配置
-尚未接入 `series` 或 `round-robin` 的 checkpoint、恢复和审计，因此这两种模式仍会在建库
-和模型调用前明确拒绝创意项目。
+`play`、`series` 和 `round-robin` 均支持创意项目。双局赛的两局复用同一评审团快照并
+原子保存；循环赛在零进度 checkpoint 中冻结无凭据的评审团描述，恢复时用当前配置重建并
+逐项核对 `entrant_id`、`route_id`、模型、Profile 与超时配置。缺失或漂移会在首次 Provider 调用
+前拒绝。赛事、系列和每局裁决必须引用同一快照；只读深度审计同时验证事件重放、裁决请求
+摘要、关系表、评分账本与 ELO。参赛者和评委共享同一个预算，循环赛的调用估算包含每局
+两份作品乘评委人数，并由 SQLite v8 账本跨进程累计。
 
 技术负也会生成完整档案并正常更新双人 ELO。事件中的 `reason_code`、
 `forfeit_scope`、`termination`、`forfeited_by` 等字段可供程序稳定统计；CLI

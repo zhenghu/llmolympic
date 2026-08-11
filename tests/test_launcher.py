@@ -41,7 +41,7 @@ def test_launcher_exposes_chess_human_demo_series_and_llm_modes() -> None:
     assert "--game chess          --players human:我,mock:random" in launcher
     assert "--game chess          --players mock:random,mock:fixed" in launcher
     assert "llmolympic series --game chess" in launcher
-    assert "26) 国际象棋    你（白）vs LLM" in launcher
+    assert "28) 国际象棋    你（白）vs LLM" in launcher
     assert '--game chess          --players "human:我,openai' in launcher
 
 
@@ -55,6 +55,7 @@ def test_launcher_exposes_all_three_mock_round_robin_modes() -> None:
         17: ("猜谜竞答", "riddle_quiz"),
         18: ("五子棋", "gomoku"),
         19: ("国际象棋", "chess"),
+        22: ("创意写作", "creative_writing"),
     }
     for number, (label, game) in menu_entries.items():
         assert f"{number}) {label}" in launcher
@@ -81,12 +82,15 @@ def test_launcher_exposes_all_three_mock_round_robin_modes() -> None:
 
     for line in command_lines:
         assert "--players mock:random,mock:fixed,mock:illegal" in line
-        if "--game gomoku" in line or "--game chess" in line:
+        if any(
+            f"--game {game}" in line
+            for game in ("gomoku", "chess", "creative_writing")
+        ):
             assert "--rounds" not in line
         else:
             assert "--rounds 5" in line
 
-    assert "21) 五子棋      你（黑）vs LLM" in launcher
+    assert "23) 五子棋      你（黑）vs LLM" in launcher
 
 
 def test_launcher_exposes_offline_creative_writing_with_three_judges() -> None:
@@ -99,3 +103,20 @@ def test_launcher_exposes_offline_creative_writing_with_three_judges() -> None:
     assert "--game creative_writing" in command
     assert "--players mock:random,mock:fixed" in command
     assert command.count("--judge") == 3
+
+    series_command = next(
+        line
+        for line in launcher.splitlines()
+        if line.strip().startswith("21) llmolympic series")
+    )
+    round_robin_command = next(
+        line
+        for line in launcher.splitlines()
+        if line.strip().startswith("22) llmolympic round-robin")
+    )
+    assert "--game creative_writing" in series_command
+    assert "--players mock:random,mock:fixed" in series_command
+    assert series_command.count("--judge") == 3
+    assert "--game creative_writing" in round_robin_command
+    assert "--players mock:random,mock:fixed,mock:illegal" in round_robin_command
+    assert round_robin_command.count("--judge") == 3

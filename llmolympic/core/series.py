@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from llmolympic.core.archive import ArchiveSource, MatchArchive, normalize_player_descriptors
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import Game, validate_players
+from llmolympic.core.judge import JudgePanelSnapshot, LLMJudgePanel, PanelVerdict
 from llmolympic.core.match import play_match
 from llmolympic.core.player import Player
 
@@ -101,6 +102,7 @@ class SeriesArchive(BaseModel):
     points: dict[str, float]
     started_at: datetime
     finished_at: datetime
+    judge_panel: JudgePanelSnapshot | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -200,6 +202,27 @@ class SeriesArchive(BaseModel):
                 opponent = player_b if forfeited_by == player_a else player_a
                 if leg.scores[forfeited_by] != 0.0 or leg.scores[opponent] != 1.0:
                     raise ValueError("技术负必须记为责任方 0 分、对手 1 分")
+
+        requires_panel = self.game == "creative_writing"
+        if requires_panel and self.judge_panel is None:
+            raise ValueError("创意双局赛必须冻结评审团快照")
+        if not requires_panel and self.judge_panel is not None:
+            raise ValueError("客观双局赛不能包含评审团快照")
+        if self.judge_panel is not None:
+            expected_panel = list(self.judge_panel.panel)
+            for leg in self.legs:
+                finished = leg.events[-1]
+                raw_judging = finished.data.get("judging")
+                if raw_judging is None:
+                    if finished.data.get("termination") != "technical_loss":
+                        raise ValueError("创意双局赛的正常终局缺少评审结果")
+                    continue
+                try:
+                    judging = PanelVerdict.model_validate(raw_judging)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("创意双局赛包含无效评审结果") from exc
+                if judging.schema_version < 2 or judging.panel != expected_panel:
+                    raise ValueError("创意双局赛的逐局评审团与冻结快照不一致")
         return self
 
     def to_json(self) -> str:
@@ -235,6 +258,7 @@ def series_from_legs(
     second: MatchArchive,
     *,
     series_id: str | None = None,
+    judge_panel: JudgePanelSnapshot | None = None,
 ) -> SeriesArchive:
     """从顺序相反的两局档案生成系列赛档案。"""
 
@@ -256,6 +280,7 @@ def series_from_legs(
         },
         "started_at": first.started_at,
         "finished_at": second.finished_at,
+        "judge_panel": judge_panel,
     }
     if series_id is not None:
         values["series_id"] = series_id
@@ -268,6 +293,7 @@ async def play_two_leg_series(
     seed: int = 0,
     max_attempts: int = 3,
     on_event: Callable[[int, MatchEvent], None] | None = None,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> SeriesArchive:
     """使用同一 seed 跑两局，第二局交换选手顺序。
 
@@ -288,6 +314,13 @@ async def play_two_leg_series(
     validate_players(game, list(entrant_names))
     if entrants[0].entrant_id == entrants[1].entrant_id:
         raise ValueError("双局赛选手的 entrant_id 必须唯一")
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    if requires_panel and judge_panel is None:
+        raise ValueError(f"项目 {game.name!r} 需要 LLM 评审团")
+    if not requires_panel and judge_panel is not None:
+        raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
+    if judge_panel is not None:
+        judge_panel.validate_contestants(list(entrants))
 
     legs: list[MatchArchive] = []
     orders = ([entrants[0], entrants[1]], [entrants[1], entrants[0]])
@@ -304,6 +337,7 @@ async def play_two_leg_series(
             seed=seed,
             max_attempts=max_attempts,
             on_event=event_callback,
+            judge_panel=judge_panel,
         )
         expected_names = entrant_names if leg_number == 1 else tuple(reversed(entrant_names))
         archived_names = tuple(descriptor.get("name") for descriptor in archive.players)
@@ -319,4 +353,8 @@ async def play_two_leg_series(
             raise ValueError(f"第 {leg_number} 局档案中的 entrant_id 或顺序发生变化")
         legs.append(archive)
 
-    return series_from_legs(legs[0], legs[1])
+    return series_from_legs(
+        legs[0],
+        legs[1],
+        judge_panel=None if judge_panel is None else judge_panel.snapshot(),
+    )

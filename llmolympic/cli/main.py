@@ -48,7 +48,7 @@ from llmolympic.core.game import (
     validate_player_count,
     validate_players,
 )
-from llmolympic.core.judge import JudgePanelError, LLMJudgePanel
+from llmolympic.core.judge import JudgePanelError, JudgePanelSnapshot, LLMJudgePanel
 from llmolympic.core.match import play_match
 from llmolympic.core.player import (
     DEFAULT_LLM_TIMEOUT_SECONDS,
@@ -914,6 +914,60 @@ def _checkpoint_llm_timeout(checkpoint: TournamentCheckpoint) -> float | None:
     return float(first)
 
 
+def _checkpoint_judge_spec(descriptor: object) -> str:
+    if not hasattr(descriptor, "model") or not hasattr(descriptor, "provider"):
+        raise TypeError("循环赛 checkpoint 包含无效评委描述")
+    model = descriptor.model
+    provider = descriptor.provider
+    profile_id = descriptor.profile_id
+    if not isinstance(model, str) or not model or "," in model:
+        raise ValueError("循环赛 checkpoint 包含无法安全恢复的评委模型")
+    if profile_id is not None:
+        if not isinstance(profile_id, str) or not profile_id or "," in profile_id:
+            raise ValueError("循环赛 checkpoint 包含无效评委 Profile ID")
+        return f"profile:{profile_id}:{model}"
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or any(marker in provider for marker in (",", ":"))
+    ):
+        raise ValueError("循环赛 checkpoint 包含无法安全恢复的评委 Provider")
+    return f"{provider}:{model}"
+
+
+def _restore_checkpoint_judge_panel(
+    checkpoint: TournamentCheckpoint,
+    game: Game,
+    contestants: list[Player],
+) -> LLMJudgePanel | None:
+    snapshot = checkpoint.judge_panel
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    if snapshot is None:
+        if requires_panel:
+            raise ValueError("创意循环赛 checkpoint 缺少评审团快照")
+        return None
+    if not requires_panel:
+        raise ValueError("客观循环赛 checkpoint 不能包含评审团快照")
+    if not isinstance(snapshot, JudgePanelSnapshot):
+        raise TypeError("循环赛 checkpoint 评审团快照无效")
+
+    judges: list[LLMPlayer] = []
+    for descriptor in snapshot.panel:
+        parsed = _parse_players(
+            _checkpoint_judge_spec(descriptor),
+            60.0,
+            descriptor.timeout_seconds,
+        )
+        if len(parsed) != 1 or not isinstance(parsed[0], LLMPlayer):
+            raise ValueError("循环赛 checkpoint 只能恢复 LLM/Profile/mock 评委")
+        judges.append(parsed[0])
+    panel = LLMJudgePanel(judges)
+    if panel.snapshot() != snapshot:
+        raise ValueError("当前评委配置与循环赛 checkpoint 冻结快照不一致")
+    panel.validate_contestants(contestants)
+    return panel
+
+
 def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[Player]]:
     """Recreate providers from current config while preserving frozen tournament identity."""
 
@@ -956,9 +1010,16 @@ def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[P
 def _tournament_workload(
     game: Game,
     player_count: int,
+    judge_count: int = 0,
 ) -> tuple[int, int, int | None, int | None]:
     pairing_count = player_count * (player_count - 1) // 2
     match_count = pairing_count * 2
+    if bool(getattr(game, "requires_judge_panel", False)):
+        turns = match_count * 2
+        max_calls = match_count * (
+            2 * TOURNAMENT_MOVE_ATTEMPTS + 2 * judge_count
+        )
+        return pairing_count, match_count, turns, max_calls
     rounds = describe_game_config(game).get("rounds")
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
         return pairing_count, match_count, None, None
@@ -971,8 +1032,11 @@ def _validate_tournament_workload(
     player_count: int,
     *,
     allow_large: bool,
+    judge_count: int = 0,
 ) -> None:
-    _, match_count, turns, max_calls = _tournament_workload(game, player_count)
+    _, match_count, turns, max_calls = _tournament_workload(
+        game, player_count, judge_count
+    )
     too_large = match_count > MAX_UNCONFIRMED_TOURNAMENT_MATCHES or (
         max_calls is not None and max_calls > MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS
     )
@@ -1054,6 +1118,7 @@ async def _run_series(
     players: list[Player],
     seed: int,
     store: SQLiteStore,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> None:
     intro = Text("项目 ")
     intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
@@ -1089,6 +1154,7 @@ async def _run_series(
         players,
         seed=seed,
         on_event=guarded_render_leg,
+        judge_panel=judge_panel,
     )
     result = store.save_series(series_archive, rating_source="engine")
     _best_effort_render(_render_series_summary, series_archive)
@@ -1271,8 +1337,13 @@ async def _run_round_robin(
     checkpoint: TournamentCheckpoint,
     store: SQLiteStore,
     lease: TournamentRunnerLease,
+    judge_panel: LLMJudgePanel | None = None,
 ) -> None:
-    pairing_count, match_count, turns, max_calls = _tournament_workload(game, len(players))
+    pairing_count, match_count, turns, max_calls = _tournament_workload(
+        game,
+        len(players),
+        0 if judge_panel is None else len(judge_panel.judges),
+    )
     intro = Text("项目 ")
     intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
     intro.append(" · seed=")
@@ -1327,6 +1398,7 @@ async def _run_round_robin(
             on_event=_guard_renderer(render_pairing),
             on_checkpoint=save_checkpoint,
             on_pairing_start=renew_before_pairing,
+            judge_panel=judge_panel,
         )
     )
     heartbeat_stop = asyncio.Event()
@@ -1567,6 +1639,13 @@ def series(
         "--no-llm-timeout",
         help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
+    judge: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--judge",
+            help="创意双局赛的独立评委，可重复指定 3–9 次；两局冻结并复用同一评审团",
+        ),
+    ] = None,
     max_provider_calls: int | None = typer.Option(
         None,
         "--max-provider-calls",
@@ -1618,9 +1697,16 @@ def series(
         allow_human=False,
         mode="series",
     )
+    judge_panel = _prepare_judge_panel(
+        selected_game,
+        selected_players,
+        judge,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+    )
     runtime_budget = _prepare_in_memory_budget(
         selected_players,
-        None,
+        judge_panel,
         max_provider_calls=max_provider_calls,
         max_input_tokens=max_input_tokens,
         max_output_tokens_per_call=max_output_tokens_per_call,
@@ -1629,9 +1715,22 @@ def series(
     )
     store = _open_store(database)
     try:
-        asyncio.run(_run_series(selected_game, selected_players, seed, store))
+        asyncio.run(
+            _run_series(
+                selected_game,
+                selected_players,
+                seed,
+                store,
+                judge_panel=judge_panel,
+            )
+        )
     except UsageError as exc:
         _render_usage_error(exc)
+        raise typer.Exit(code=1) from exc
+    except JudgePanelError as exc:
+        line = Text("评审失败，双局赛未存档且未更新 ELO：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         raise typer.Exit(code=1) from exc
     except (OSError, sqlite3.Error, StorageError) as exc:
         line = Text("双局赛已完成，但 SQLite 原子存档失败：", style="red")
@@ -1687,6 +1786,13 @@ def round_robin(
         "--no-llm-timeout",
         help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
     ),
+    judge: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--judge",
+            help="创意循环赛的独立评委，可重复指定 3–9 次；配置会冻结进 checkpoint",
+        ),
+    ] = None,
     allow_large_tournament: bool = typer.Option(
         False,
         "--allow-large-tournament",
@@ -1740,6 +1846,7 @@ def round_robin(
     resumed = resume is not None
     resolved_budget: ResolvedProviderBudget | None = None
     runtime_budget: _RuntimeBudget | None = None
+    judge_panel: LLMJudgePanel | None = None
     if resumed:
         conflicts = [
             option
@@ -1750,6 +1857,7 @@ def round_robin(
                 ("--seed", seed is not None),
                 ("--llm-timeout", llm_timeout is not None),
                 ("--no-llm-timeout", no_llm_timeout),
+                ("--judge", judge is not None),
                 ("--allow-large-tournament", allow_large_tournament),
                 ("--max-provider-calls", max_provider_calls is not None),
                 ("--max-input-tokens", max_input_tokens is not None),
@@ -1793,15 +1901,23 @@ def round_robin(
             llm_timeout=llm_timeout,
             no_llm_timeout=no_llm_timeout,
         )
+        judge_panel = _prepare_judge_panel(
+            selected_game,
+            selected_players,
+            judge,
+            llm_timeout=llm_timeout,
+            no_llm_timeout=no_llm_timeout,
+        )
         effective_seed = DEFAULT_TOURNAMENT_SEED if seed is None else seed
         _validate_tournament_workload(
             selected_game,
             len(selected_players),
             allow_large=allow_large_tournament,
+            judge_count=0 if judge_panel is None else len(judge_panel.judges),
         )
         resolved_budget = _resolve_budget_definition(
             selected_players,
-            None,
+            judge_panel,
             max_provider_calls=max_provider_calls,
             max_input_tokens=max_input_tokens,
             max_output_tokens_per_call=max_output_tokens_per_call,
@@ -1813,6 +1929,7 @@ def round_robin(
             selected_players,
             seed=effective_seed,
             max_attempts=TOURNAMENT_MOVE_ATTEMPTS,
+            judge_panel=judge_panel,
         )
         store = _open_store(database)
         try:
@@ -1884,6 +2001,11 @@ def round_robin(
         if resumed:
             try:
                 selected_game, selected_players = _restore_round_robin(checkpoint)
+                judge_panel = _restore_checkpoint_judge_panel(
+                    checkpoint,
+                    selected_game,
+                    selected_players,
+                )
             except typer.BadParameter:
                 raise
             except (TypeError, ValueError) as exc:
@@ -1894,7 +2016,7 @@ def round_robin(
         if runtime_budget is not None:
             runtime_budget = _bind_runtime_budget(
                 selected_players,
-                None,
+                judge_panel,
                 runtime_budget.resolved,
                 runtime_budget.ledger,
             )
@@ -1905,6 +2027,7 @@ def round_robin(
                 checkpoint,
                 store,
                 lease,
+                judge_panel=judge_panel,
             )
         )
     except KeyboardInterrupt as exc:
@@ -1916,6 +2039,17 @@ def round_robin(
         raise typer.Exit(code=130) from exc
     except UsageError as exc:
         _render_usage_error(exc)
+        try:
+            latest = store.get_tournament_checkpoint(checkpoint.tournament_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_tournament_interrupted, latest, store)
+        raise typer.Exit(code=1) from exc
+    except JudgePanelError as exc:
+        line = Text("评审失败，循环赛保持在最后完整 checkpoint：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
         try:
             latest = store.get_tournament_checkpoint(checkpoint.tournament_id)
         except (OSError, sqlite3.Error, StorageError, ValueError):

@@ -13,7 +13,13 @@ from llmolympic.core.events import EventType
 from llmolympic.core.judge import JudgePanelError, LLMJudgePanel, PanelVerdict
 from llmolympic.core.match import play_match
 from llmolympic.core.player import LLMPlayer, Player
+from llmolympic.core.series import SeriesArchive, play_two_leg_series
 from llmolympic.core.storage import SCHEMA_VERSION, SQLiteStore
+from llmolympic.core.tournament import (
+    TournamentArchive,
+    prepare_round_robin,
+    resume_round_robin,
+)
 from llmolympic.games.creative_writing import CreativeWriting
 from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
@@ -31,6 +37,18 @@ def _contestants() -> list[LLMPlayer]:
             "Contestant B",
             MockProvider("random", seed=0),
             "contestant-random",
+            move_timeout_seconds=None,
+        ),
+    ]
+
+
+def _tournament_contestants() -> list[LLMPlayer]:
+    return [
+        *_contestants(),
+        LLMPlayer(
+            "Contestant C",
+            MockProvider("illegal"),
+            "contestant-illegal",
             move_timeout_seconds=None,
         ),
     ]
@@ -89,7 +107,8 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
     assert finished.data["termination"] == "completed"
     verdict = PanelVerdict.model_validate(finished.data["judging"])
     contestant_names = {contestant.name for contestant in contestants}
-    assert verdict.schema_version == 2
+    assert verdict.schema_version == 3
+    assert verdict.request_digest is not None
     assert verdict.panel_size == 3
     assert verdict.quorum == 2
     assert verdict.successful_judges == 3
@@ -120,6 +139,16 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
     assert "api_key" not in serialized
 
     assert archive.scores["Contestant A"] > archive.scores["Contestant B"]
+
+    tampered = archive.model_dump(mode="python")
+    accepted = next(
+        event
+        for event in tampered["events"]
+        if event["type"] == EventType.MOVE_RECEIVED
+    )
+    accepted["data"]["move"] = "这是一篇长度足够但与原始送审作品完全不同的篡改文本。"
+    with pytest.raises(ValueError, match="实际任务或作品不一致"):
+        MatchArchive.model_validate(tampered)
 
     path = tmp_path / "creative.db"
     store = SQLiteStore(path)
@@ -303,7 +332,7 @@ def test_creative_archive_rejects_self_human_judge_and_rubric_drift() -> None:
         MatchArchive.model_validate(rubric_drift)
 
 
-def test_creative_fixed_scores_v2_still_freezes_the_full_panel() -> None:
+def test_creative_fixed_scores_v3_still_freezes_the_full_panel() -> None:
     archive = asyncio.run(
         play_match(
             CreativeWriting(),
@@ -315,7 +344,8 @@ def test_creative_fixed_scores_v2_still_freezes_the_full_panel() -> None:
 
     judging = PanelVerdict.model_validate(archive.events[-1].data["judging"])
 
-    assert judging.schema_version == 2
+    assert judging.schema_version == 3
+    assert judging.request_digest is not None
     assert judging.aggregation == "fixed-scores-v1"
     assert judging.fixed_scores == {"Forfeiter A": 0.0, "Forfeiter B": 0.0}
     assert judging.verdicts == []
@@ -339,6 +369,7 @@ def test_creative_archive_keeps_v1_judging_readable_without_panel_routes() -> No
     judging = payload["events"][-1]["data"]["judging"]
     judging["schema_version"] = 1
     judging.pop("panel")
+    judging.pop("request_digest")
     for item in [*judging["verdicts"], *judging["failures"]]:
         item["judge"].pop("route_id")
 
@@ -369,6 +400,7 @@ def test_creative_v1_judging_sqlite_round_trip_does_not_rewrite_archive(tmp_path
     judging = payload["events"][-1]["data"]["judging"]
     judging["schema_version"] = 1
     judging.pop("panel")
+    judging.pop("request_digest")
     for item in [*judging["verdicts"], *judging["failures"]]:
         item["judge"].pop("route_id")
     historical = MatchArchive.model_validate(payload)
@@ -422,3 +454,108 @@ def test_creative_archive_rejects_sensitive_or_missing_v2_panel_fields() -> None
     missing_route["events"][-1]["data"]["judging"]["panel"][0].pop("route_id")
     with pytest.raises(ValueError, match="无效的评审团裁决"):
         MatchArchive.model_validate(missing_route)
+
+
+def test_creative_series_freezes_one_panel_across_both_legs() -> None:
+    panel = _healthy_panel()
+
+    series = asyncio.run(
+        play_two_leg_series(
+            CreativeWriting(),
+            _contestants(),
+            seed=81,
+            judge_panel=panel,
+        )
+    )
+
+    assert series.judge_panel == panel.snapshot()
+    assert [leg.players[0]["name"] for leg in series.legs] == [
+        "Contestant A",
+        "Contestant B",
+    ]
+    for leg in series.legs:
+        verdict = PanelVerdict.model_validate(leg.events[-1].data["judging"])
+        assert verdict.schema_version == 3
+        assert verdict.panel == list(series.judge_panel.panel)
+
+    tampered = series.model_dump(mode="python")
+    tampered["judge_panel"]["panel"][0]["route_id"] = "route:v1:" + "f" * 64
+    with pytest.raises(ValueError, match="冻结快照不一致"):
+        SeriesArchive.model_validate(tampered)
+
+
+def test_creative_round_robin_resumes_with_frozen_panel_and_rejects_drift() -> None:
+    game = CreativeWriting()
+    players = _tournament_contestants()
+    panel = _healthy_panel()
+    checkpoint = prepare_round_robin(
+        game,
+        players,
+        seed=82,
+        judge_panel=panel,
+    )
+    captured = checkpoint
+
+    class _StopAfterFirst(Exception):
+        pass
+
+    def stop_after_first(updated) -> None:
+        nonlocal captured
+        captured = updated
+        raise _StopAfterFirst
+
+    with pytest.raises(_StopAfterFirst):
+        asyncio.run(
+            resume_round_robin(
+                game,
+                players,
+                checkpoint,
+                judge_panel=panel,
+                on_checkpoint=stop_after_first,
+            )
+        )
+
+    assert len(captured.completed_series) == 1
+    first_series_id = captured.completed_series[0].series_id
+    restored_players = _tournament_contestants()
+    restored_panel = _healthy_panel()
+    tournament = asyncio.run(
+        resume_round_robin(
+            CreativeWriting(),
+            restored_players,
+            captured,
+            judge_panel=restored_panel,
+        )
+    )
+
+    assert tournament.judge_panel == captured.judge_panel == restored_panel.snapshot()
+    assert tournament.pairings[0].series.series_id == first_series_id
+    assert len(tournament.pairings) == 3
+    assert all(
+        pairing.series.judge_panel == tournament.judge_panel
+        for pairing in tournament.pairings
+    )
+
+    drifted_panel = LLMJudgePanel(
+        [
+            _judge("Judge Strict", "strict", "judge-strict"),
+            _judge("Judge Balanced", "balanced", "judge-balanced"),
+            _judge("Judge Other", "lenient", "judge-other"),
+        ]
+    )
+    with pytest.raises(ValueError, match="冻结快照不一致"):
+        asyncio.run(
+            resume_round_robin(
+                CreativeWriting(),
+                _tournament_contestants(),
+                captured,
+                judge_panel=drifted_panel,
+            )
+        )
+
+    payload = tournament.model_dump(mode="python")
+    payload["pairings"][1]["series"]["judge_panel"]["panel"][0]["route_id"] = (
+        "route:v1:" + "e" * 64
+    )
+    with pytest.raises(ValueError, match="冻结快照不一致"):
+        TournamentArchive.model_validate(payload)
