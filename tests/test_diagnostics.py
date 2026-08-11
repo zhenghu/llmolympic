@@ -54,7 +54,7 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     metadata = importlib.metadata.metadata("llmolympic")
 
-    assert project["build-system"]["requires"] == ["hatchling>=1.27,<2"]
+    assert project["build-system"]["requires"] == ["hatchling>=1.27,<1.32"]
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
