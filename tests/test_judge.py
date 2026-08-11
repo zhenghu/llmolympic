@@ -14,6 +14,7 @@ from llmolympic.core.judge import (
     JudgePanelError,
     JudgingRequest,
     LLMJudgePanel,
+    PanelVerdict,
     _judge_prompt,
     _parse_response,
     score_judge_submission,
@@ -291,7 +292,13 @@ def test_one_incomplete_judge_is_excluded_but_majority_quorum_still_aggregates()
     verdict = asyncio.run(panel.adjudicate(_request(), seed=17))
 
     assert verdict.quorum == 2
+    assert verdict.schema_version == 2
     assert verdict.successful_judges == 2
+    assert verdict.panel is not None
+    assert len(verdict.panel) == verdict.panel_size == 3
+    assert {judge.judge_id for judge in verdict.panel} == {
+        item.judge.judge_id for item in [*verdict.verdicts, *verdict.failures]
+    }
     assert verdict.scores == {"Alpha": 0.7, "Beta": 0.5}
     assert [failure.judge.judge_id for failure in verdict.failures] == ["judge:3"]
     assert verdict.failures[0].reason_code == "provider_error"
@@ -438,6 +445,121 @@ def test_duplicate_judges_and_contestant_judge_identity_overlap_are_rejected() -
                 third,
             ]
         )
+
+
+def test_duplicate_judge_routes_and_contestant_route_overlap_are_rejected() -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 5.0, "clarity": 5.0},
+        "WORK_BETA": {"originality": 5.0, "clarity": 5.0},
+    }
+    first = _judge(
+        "judge:route-first",
+        _ScriptedJudgeProvider("first-provider-name", scores),
+        model="shared-route-model",
+    )
+    same_route = _judge(
+        "judge:route-second",
+        _ScriptedJudgeProvider("second-provider-name", scores),
+        model="shared-route-model",
+    )
+    third = _judge(
+        "judge:route-third",
+        _ScriptedJudgeProvider("third-provider-name", scores),
+        model="independent-route-model",
+    )
+
+    with pytest.raises(ValueError, match="评委路由身份必须唯一"):
+        LLMJudgePanel([first, same_route, third])
+
+    panel = LLMJudgePanel(
+        [
+            first,
+            _judge(
+                "judge:route-independent-two",
+                _ScriptedJudgeProvider("independent-provider-two", scores),
+                model="independent-route-model-two",
+            ),
+            third,
+        ]
+    )
+    contestant = _judge(
+        "contestant:different-stable-id",
+        _ScriptedJudgeProvider("contestant-provider-name", scores),
+        model="shared-route-model",
+    )
+
+    with pytest.raises(ValueError, match="同一模型路由不能同时担任"):
+        panel.validate_contestants([contestant])
+
+    assert all(not provider.calls for provider in [first.provider, same_route.provider])
+
+
+def test_panel_verdict_v2_freezes_and_authenticates_the_complete_panel() -> None:
+    scores = {
+        "WORK_ALPHA": {"originality": 7.0, "clarity": 6.0},
+        "WORK_BETA": {"originality": 6.0, "clarity": 7.0},
+    }
+    panel = LLMJudgePanel(
+        [
+            _judge(
+                f"judge:snapshot-{index}",
+                _ScriptedJudgeProvider(f"snapshot-provider-{index}", scores),
+            )
+            for index in range(3)
+        ]
+    )
+
+    verdict = asyncio.run(panel.adjudicate(_request(), seed=71))
+
+    assert verdict.schema_version == 2
+    assert verdict.panel is not None
+    assert len(verdict.panel) == verdict.panel_size == 3
+    assert len({judge.judge_id for judge in verdict.panel}) == 3
+    assert len({judge.route_id for judge in verdict.panel}) == 3
+    assert {judge.judge_id: judge for judge in verdict.panel} == {
+        item.judge.judge_id: item.judge for item in verdict.verdicts
+    }
+
+    duplicate_route = json.loads(verdict.model_dump_json())
+    duplicate_route["panel"][1]["route_id"] = duplicate_route["panel"][0]["route_id"]
+    with pytest.raises(ValueError, match="panel 快照包含重复评委路由"):
+        PanelVerdict.model_validate(duplicate_route)
+
+    incomplete_panel = json.loads(verdict.model_dump_json())
+    incomplete_panel["panel"].pop()
+    with pytest.raises(ValueError, match="panel 快照必须覆盖整个评审团"):
+        PanelVerdict.model_validate(incomplete_panel)
+
+    mismatched_output = json.loads(verdict.model_dump_json())
+    mismatched_output["verdicts"][0]["judge"]["route_id"] = "route:v1:" + "f" * 64
+    with pytest.raises(ValueError, match="必须精确匹配 panel 快照"):
+        PanelVerdict.model_validate(mismatched_output)
+
+
+def test_fixed_scores_v2_freezes_panel_without_calling_judges() -> None:
+    providers = [
+        _ScriptedJudgeProvider(f"fixed-provider-{index}", {}) for index in range(3)
+    ]
+    panel = LLMJudgePanel(
+        [_judge(f"judge:fixed-{index}", provider) for index, provider in enumerate(providers)]
+    )
+    request = JudgingRequest(
+        task="All contestants forfeited.",
+        criteria={"originality": 1.0},
+        submissions={},
+        fixed_scores={"Alpha": 0.0, "Beta": 0.0},
+        rubric_version="creative-writing-v1",
+    )
+
+    verdict = asyncio.run(panel.adjudicate(request, seed=72))
+
+    assert verdict.schema_version == 2
+    assert verdict.aggregation == "fixed-scores-v1"
+    assert verdict.panel is not None
+    assert len(verdict.panel) == verdict.panel_size == 3
+    assert verdict.verdicts == []
+    assert verdict.failures == []
+    assert all(provider.calls == [] for provider in providers)
 
 
 def test_weighted_median_and_anonymous_order_are_deterministic() -> None:

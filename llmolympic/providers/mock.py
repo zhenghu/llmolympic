@@ -13,7 +13,7 @@ import json
 import random
 import re
 
-from llmolympic.providers.base import Provider
+from llmolympic.providers.base import Provider, _stable_route_id
 
 _CHOICE_RE = re.compile(r"^A[.、)]", re.MULTILINE)
 _GOMOKU_ROW_RE = re.compile(
@@ -156,6 +156,14 @@ class MockProvider(Provider):
             raise ValueError(f"未知 mock 策略: {strategy!r}")
         self.strategy = strategy
         self._rng = random.Random(seed)  # noqa: S311 - mock 策略需可复现，不用于安全令牌
+
+    def route_id_for(self, model: str) -> str:
+        del model  # Mock 的伪模型标签不会改变实际算法路由。
+        return _stable_route_id(
+            family="mock-v1",
+            target=self.strategy,
+            model="",
+        )
 
     def chat(
         self,

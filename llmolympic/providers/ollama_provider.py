@@ -9,6 +9,8 @@ from llmolympic.providers.base import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     Provider,
     ProviderTimeoutError,
+    _endpoint_fingerprint,
+    _stable_route_id,
     validate_base_url,
 )
 
@@ -39,7 +41,15 @@ class OllamaProvider(Provider):
                 else "Ollama base_url"
             ),
         )
+        self._route_endpoint_fingerprint = _endpoint_fingerprint(self.base_url)
         self.profile_id = profile_id
+
+    def route_id_for(self, model: str) -> str:
+        return _stable_route_id(
+            family="ollama-chat-v1",
+            target=self._route_endpoint_fingerprint,
+            model=model,
+        )
 
     @staticmethod
     def _payload(messages: list[dict], model: str, params: dict) -> dict:
