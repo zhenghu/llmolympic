@@ -118,6 +118,22 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-creative-smoke.db"
+          "${smoke_venv}/bin/llmolympic" series \
+            --game creative_writing \
+            --players mock:random,mock:fixed \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-wheel-creative-series-smoke.db"
+          "${smoke_venv}/bin/llmolympic" round-robin \
+            --game creative_writing \
+            --players mock:random,mock:fixed,mock:illegal \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-wheel-creative-round-robin-smoke.db"
 
       - name: Smoke-test source distribution outside the checkout
         run: |
@@ -145,3 +161,19 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-creative-smoke.db"
+          "${smoke_venv}/bin/llmolympic" series \
+            --game creative_writing \
+            --players mock:random,mock:fixed \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-creative-series-smoke.db"
+          "${smoke_venv}/bin/llmolympic" round-robin \
+            --game creative_writing \
+            --players mock:random,mock:fixed,mock:illegal \
+            --judge mock:strict \
+            --judge mock:balanced \
+            --judge mock:lenient \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-creative-round-robin-smoke.db"
