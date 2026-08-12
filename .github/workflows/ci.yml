@@ -54,16 +54,27 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
-      - name: Validate macOS launcher syntax
-        run: bash -n play.command
+      - name: Validate macOS command files
+        run: |
+          for script in play.command start_web.command stop_web.command; do
+            bash -n "$script"
+            test -x "$script"
+          done
 
       - name: Smoke-test CLI registration
         run: python -m llmolympic games
 
   web:
-    name: Read-only Web API
+    name: Read-only Web / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
 
     steps:
       - name: Checkout
@@ -74,7 +85,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -91,6 +102,11 @@ jobs:
 
       - name: Test Web slice
         run: python -m pytest -q tests/test_web_*.py
+
+      - name: Execute observer client state machine
+        run: |
+          node --check llmolympic/web/static/assets/app.js
+          node tests/web_client_state.js
 
       - name: Smoke-test lazy CLI and app factory
         run: |
@@ -180,6 +196,8 @@ jobs:
           "${smoke_venv}/bin/python" -m pip install "${wheel_files[0]}[web]"
           cd "${RUNNER_TEMP}"
           "${smoke_venv}/bin/llmolympic" web --help
+          "${smoke_venv}/bin/python" -c \
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
           WEB_SMOKE_DB="${RUNNER_TEMP}/missing-web-smoke.db" \
             "${smoke_venv}/bin/python" -c \
             "import os; from llmolympic.web.app import create_app; create_app(os.environ['WEB_SMOKE_DB'])"
@@ -227,3 +245,17 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-creative-round-robin-smoke.db"
+
+          # The sdist must build a wheel containing the same self-hosted observer UI.
+          "${smoke_venv}/bin/python" -c \
+            "import importlib.util; assert importlib.util.find_spec('fastapi') is None"
+          sdist_files=("${GITHUB_WORKSPACE}"/dist/*.tar.gz)
+          "${smoke_venv}/bin/python" -m pip install "${sdist_files[0]}[web]"
+          cd "${RUNNER_TEMP}"
+          "${smoke_venv}/bin/llmolympic" web --help
+          "${smoke_venv}/bin/python" -c \
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+          WEB_SMOKE_DB="${RUNNER_TEMP}/missing-sdist-web-smoke.db" \
+            "${smoke_venv}/bin/python" -c \
+            "import os; from llmolympic.web.app import create_app; create_app(os.environ['WEB_SMOKE_DB'])"
+          test ! -e "${RUNNER_TEMP}/missing-sdist-web-smoke.db"

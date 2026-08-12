@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +21,11 @@ STARTED = datetime(2026, 8, 12, 8, 0, tzinfo=UTC)
 ORIGIN = "http://localhost"
 
 
-def _archive(match_id: str = "web-app-match") -> MatchArchive:
+def _archive(
+    match_id: str = "web-app-match",
+    *,
+    source: str = "local_engine",
+) -> MatchArchive:
     players = [
         {
             "name": "甲<script>",
@@ -75,7 +80,7 @@ def _archive(match_id: str = "web-app-match") -> MatchArchive:
     ]
     return MatchArchive(
         schema_version=2,
-        source="local_engine",
+        source=source,
         match_id=match_id,
         game="math_quiz",
         seed=42,
@@ -134,6 +139,83 @@ def test_rest_api_is_read_only_filtered_and_hardened(tmp_path: Path) -> None:
     assert "</script><img src=x onerror=alert(1)>" in detail.text
 
 
+def test_react_observer_ui_is_same_origin_static_and_hardened(tmp_path: Path) -> None:
+    client, _database, archive = _client(tmp_path)
+
+    home = client.get("/")
+    assert home.status_code == 200
+    assert home.headers["content-type"].startswith("text/html")
+    assert '<html lang="zh-CN">' in home.text
+    assert 'src="/assets/react.production.min.js"' in home.text
+    assert 'src="/assets/react-dom.production.min.js"' in home.text
+    assert 'src="/assets/app.js"' in home.text
+    assert 'href="/assets/app.css"' in home.text
+    assert "http://" not in home.text
+    assert "https://" not in home.text
+
+    content_security_policy = home.headers["content-security-policy"]
+    assert "script-src 'self'" in content_security_policy
+    assert "style-src 'self'" in content_security_policy
+    assert "connect-src 'self' ws://localhost" in content_security_policy
+    assert "'unsafe-inline'" not in content_security_policy
+    assert "'unsafe-eval'" not in content_security_policy
+    assert "frame-ancestors 'none'" in content_security_policy
+    assert home.headers["cache-control"] == "no-store"
+
+    deep_link = client.get(f"/matches/{archive.match_id}")
+    assert deep_link.status_code == 200
+    assert deep_link.content == home.content
+    assert client.get("/matches/not%20valid").status_code == 404
+    assert client.get("/unknown-page").status_code == 404
+
+    assets = {
+        "/assets/app.css": "text/css",
+        "/assets/app.js": "javascript",
+        "/assets/react.production.min.js": "javascript",
+        "/assets/react-dom.production.min.js": "javascript",
+    }
+    for path, media_type in assets.items():
+        response = client.get(path)
+        assert response.status_code == 200
+        assert media_type in response.headers["content-type"]
+        assert response.content
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    app_javascript = client.get("/assets/app.js").text
+    assert "dangerouslySetInnerHTML" not in app_javascript
+    assert ".innerHTML" not in app_javascript
+    assert "requestAnimationFrame(commit)" in app_javascript
+    assert "PUBLIC_ERROR_CODES.has(reason)" in app_javascript
+
+    react = client.get("/assets/react.production.min.js")
+    react_dom = client.get("/assets/react-dom.production.min.js")
+    assert hashlib.sha256(react.content).hexdigest() == (
+        "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"
+    )
+    assert hashlib.sha256(react_dom.content).hexdigest() == (
+        "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"
+    )
+
+    api = client.get("/api/v1/games")
+    assert api.headers["content-security-policy"].startswith("default-src 'none'")
+    assert "script-src 'self'" not in api.headers["content-security-policy"]
+
+    openapi_paths = client.get("/openapi.json").json()["paths"]
+    assert "/" not in openapi_paths
+    assert "/matches/{match_id}" not in openapi_paths
+
+
+def test_observer_ui_stays_available_when_database_is_missing(tmp_path: Path) -> None:
+    database = tmp_path / "missing.db"
+    client = TestClient(create_app(database), base_url="http://localhost")
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "LLM Olympics" in response.text
+    assert not database.exists()
+
+
 def test_rest_rejects_cross_origin_bad_host_and_invalid_inputs(tmp_path: Path) -> None:
     client, _database, _archive = _client(tmp_path)
 
@@ -166,6 +248,9 @@ def test_ipv6_loopback_host_and_origin_are_supported(tmp_path: Path) -> None:
 
     response = client.get("/api/v1/games", headers=headers)
     assert response.status_code == 200
+    home = client.get("/", headers=headers)
+    assert home.status_code == 200
+    assert "connect-src 'self' ws://[::1]:8000" in home.headers["content-security-policy"]
 
     with client.websocket_connect(
         f"/ws/v1/matches/{archive.match_id}?from_seq=4",
@@ -249,7 +334,44 @@ def test_websocket_rejects_invalid_resume_and_missing_match_stably(tmp_path: Pat
         with client.websocket_connect(
             "/ws/v1/matches/missing-match",
             headers=headers,
-        ):
-            raise AssertionError("missing replay must not be accepted")
+        ) as websocket:
+            websocket.receive_json()
+            raise AssertionError("missing replay must close with a public business error")
     except WebSocketDisconnect as exc:
         assert exc.code == 4404
+        assert exc.reason == "match_not_found"
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected_reason"),
+    [
+        (False, "archive_not_replayable"),
+        (True, "database_unavailable"),
+    ],
+)
+def test_websocket_exposes_public_business_error_after_accept(
+    tmp_path: Path,
+    *,
+    missing: bool,
+    expected_reason: str,
+) -> None:
+    database = tmp_path / "observer.db"
+    match_id = "missing-match"
+    if not missing:
+        match_id = "external-match"
+        SQLiteStore(database).save_match(
+            _archive(match_id, source="external"),
+            rating_source="imported",
+        )
+    client = TestClient(create_app(database), base_url="http://localhost")
+
+    try:
+        with client.websocket_connect(
+            f"/ws/v1/matches/{match_id}",
+            headers={"Host": "localhost", "Origin": ORIGIN},
+        ) as websocket:
+            websocket.receive_json()
+            raise AssertionError("business read error must close the accepted connection")
+    except WebSocketDisconnect as exc:
+        assert exc.code == 4403
+        assert exc.reason == expected_reason

@@ -9,6 +9,7 @@ import zipfile
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
+from hashlib import sha256
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,22 @@ VERSION = runpy.run_path(PROJECT_ROOT / "llmolympic" / "__init__.py")["__version
 if not isinstance(VERSION, str):
     raise TypeError("llmolympic.__version__ must be a string")
 LEGAL_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+WEB_ASSET_PATHS = (
+    "llmolympic/web/static/index.html",
+    "llmolympic/web/static/REACT_LICENSE.txt",
+    "llmolympic/web/static/assets/app.css",
+    "llmolympic/web/static/assets/app.js",
+    "llmolympic/web/static/assets/react.production.min.js",
+    "llmolympic/web/static/assets/react-dom.production.min.js",
+)
+REACT_ASSET_DIGESTS = {
+    "llmolympic/web/static/assets/react.production.min.js": (
+        "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"
+    ),
+    "llmolympic/web/static/assets/react-dom.production.min.js": (
+        "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"
+    ),
+}
 
 
 def _single(paths: list[Path], description: str) -> Path:
@@ -38,6 +55,10 @@ def _verify_metadata(metadata: Message) -> None:
 
 def verify_distributions(dist_dir: Path) -> None:
     expected_legal_files = {name: (PROJECT_ROOT / name).read_bytes() for name in LEGAL_FILES}
+    expected_web_assets = {name: (PROJECT_ROOT / name).read_bytes() for name in WEB_ASSET_PATHS}
+    for name, expected_digest in REACT_ASSET_DIGESTS.items():
+        if sha256(expected_web_assets[name]).hexdigest() != expected_digest:
+            raise AssertionError(f"bundled React asset digest changed: {name}")
     wheel = _single(list(dist_dir.glob("*.whl")), "wheel")
     sdist = _single(list(dist_dir.glob("*.tar.gz")), "sdist")
     if not wheel.match(f"llmolympic-{VERSION}-*.whl"):
@@ -60,6 +81,9 @@ def verify_distributions(dist_dir: Path) -> None:
             )
             if archive.read(str(legal_name)) != expected:
                 raise AssertionError(f"wheel {filename} does not match the repository file")
+        for filename, expected in expected_web_assets.items():
+            if filename not in names or archive.read(filename) != expected:
+                raise AssertionError(f"wheel Web asset is missing or changed: {filename}")
 
     with tarfile.open(sdist, mode="r:gz") as archive:
         members = archive.getmembers()
@@ -83,8 +107,20 @@ def verify_distributions(dist_dir: Path) -> None:
             legal_file = archive.extractfile(str(legal_member))
             if legal_file is None or legal_file.read() != expected:
                 raise AssertionError(f"sdist {filename} does not match the repository file")
+        for filename, expected in expected_web_assets.items():
+            asset_member = _single(
+                [
+                    Path(member.name)
+                    for member in members
+                    if member.name.endswith(f"/{filename}")
+                ],
+                f"sdist {filename} file",
+            )
+            asset_file = archive.extractfile(str(asset_member))
+            if asset_file is None or asset_file.read() != expected:
+                raise AssertionError(f"sdist Web asset is missing or changed: {filename}")
 
-    print(f"MIT license metadata and payload verified for llmolympic {VERSION}")
+    print(f"MIT license metadata, notices, and Web assets verified for llmolympic {VERSION}")
 
 
 def main() -> None:

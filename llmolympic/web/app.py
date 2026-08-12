@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
@@ -38,15 +39,41 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _SAFE_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SAFE_GAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
-_SECURITY_HEADERS = {
+_BASE_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
-    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+_API_CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; "
+    "form-action 'none'; object-src 'none'"
+)
+
+
+def _security_headers(
+    *,
+    ui: bool = False,
+    host: str | None = None,
+    scheme: str = "http",
+) -> dict[str, str]:
+    headers = dict(_BASE_SECURITY_HEADERS)
+    if not ui:
+        headers["Content-Security-Policy"] = _API_CONTENT_SECURITY_POLICY
+        return headers
+    websocket_scheme = "wss" if scheme in {"https", "wss"} else "ws"
+    headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        "script-src 'self'; script-src-attr 'none'; "
+        "style-src 'self'; style-src-attr 'none'; "
+        "img-src 'self' data:; "
+        f"connect-src 'self' {websocket_scheme}://{host}; "
+        "font-src 'none'; object-src 'none'; frame-ancestors 'none'; "
+        "base-uri 'none'; form-action 'none'; manifest-src 'none'; worker-src 'none'"
+    )
+    return headers
 
 _READ_ERROR_RESPONSES = {
     400: {"model": ErrorResponse, "description": "Invalid request"},
@@ -66,7 +93,7 @@ def _error(code: str, status_code: int) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content=payload.model_dump(mode="json"),
-        headers=_SECURITY_HEADERS,
+        headers=_security_headers(),
     )
 
 
@@ -149,6 +176,9 @@ def create_app(database: str | Path) -> FastAPI:
     reader = WebSQLiteReader(database)
     read_slots = asyncio.Semaphore(MAX_CONCURRENT_READS)
     replay_slots = asyncio.Semaphore(MAX_CONCURRENT_REPLAYS)
+    static_root = Path(__file__).with_name("static")
+    index_path = static_root / "index.html"
+    assets_path = static_root / "assets"
     app = FastAPI(
         title="LLM Olympics local observer API",
         version=__version__,
@@ -190,7 +220,14 @@ def create_app(database: str | Path) -> FastAPI:
         if request.headers.get("sec-fetch-site", "").casefold() == "cross-site":
             return _error("cross_origin_forbidden", 403)
         response = await call_next(request)
-        response.headers.update(_SECURITY_HEADERS)
+        is_ui_document = response.headers.get("content-type", "").startswith("text/html")
+        response.headers.update(
+            _security_headers(
+                ui=is_ui_document,
+                host=request.headers.get("host"),
+                scheme=request.url.scheme,
+            )
+        )
         return response
 
     @app.exception_handler(RequestValidationError)
@@ -210,6 +247,18 @@ def create_app(database: str | Path) -> FastAPI:
     async def read(callable_: Callable[[], object]) -> object:
         async with read_slots:
             return await run_in_threadpool(callable_)
+
+    app.mount("/assets", StaticFiles(directory=assets_path), name="observer-assets")
+
+    @app.get("/", include_in_schema=False, response_class=FileResponse)
+    async def observer_home() -> FileResponse:
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get("/matches/{match_id}", include_in_schema=False, response_class=FileResponse)
+    async def observer_match(match_id: str) -> Response:
+        if _SAFE_PATH_ID_RE.fullmatch(match_id) is None:
+            return Response(status_code=404)
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
 
     @app.get("/api/v1/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -311,6 +360,12 @@ def create_app(database: str | Path) -> FastAPI:
         if from_seq > MAX_ARCHIVE_EVENTS:
             await websocket.close(code=4400, reason="invalid_request")
             return
+
+        # Host, Origin, path, and query validation remain pre-accept so an
+        # untrusted handshake is never upgraded.  Same-origin business errors
+        # are sent after accept; browsers can then observe the stable public
+        # close code/reason instead of an opaque HTTP 403 / close code 1006.
+        await websocket.accept()
         if replay_slots.locked():
             await websocket.close(code=4429, reason="overloaded")
             return
@@ -327,7 +382,6 @@ def create_app(database: str | Path) -> FastAPI:
                 await websocket.close(code=4400, reason="invalid_request")
                 return
 
-            await websocket.accept()
             try:
                 archive_envelope = WSArchiveEnvelope.from_archive(
                     loaded.archive,

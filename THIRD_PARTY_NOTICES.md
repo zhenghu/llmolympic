@@ -31,3 +31,17 @@ their upstream licenses:
 - FastAPI: <https://github.com/fastapi/fastapi>
 - Uvicorn: <https://github.com/Kludex/uvicorn>
 - websockets: <https://github.com/python-websockets/websockets>
+
+## Bundled React observer assets
+
+The local observer page includes minified React and ReactDOM 18.3.1 browser
+builds copied into the LLM Olympics wheel and source distribution. React is
+copyright Meta Platforms, Inc. and affiliates and is licensed under the MIT
+License. The complete upstream license text is distributed at
+`llmolympic/web/static/REACT_LICENSE.txt`.
+
+- Source: <https://github.com/facebook/react/tree/v18.3.1>
+- Bundled files: `react.production.min.js`, `react-dom.production.min.js`
+
+The observer's `app.js`, `app.css`, and `index.html` are original LLM Olympics
+files covered by the project's MIT License.

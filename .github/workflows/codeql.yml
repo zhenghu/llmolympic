@@ -20,9 +20,15 @@ concurrency:
 
 jobs:
   analyze:
-    name: Analyze Python
+    name: Analyze ${{ matrix.language }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - python
+          - javascript-typescript
 
     steps:
       - name: Checkout
@@ -33,7 +39,11 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
-          languages: python
+          languages: ${{ matrix.language }}
+          config: |
+            paths-ignore:
+              - llmolympic/web/static/assets/react.production.min.js
+              - llmolympic/web/static/assets/react-dom.production.min.js
 
       - name: Analyze
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
