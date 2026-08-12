@@ -19,3 +19,15 @@ distribution. When using or redistributing an installed environment or bundle th
 combines LLM Olympics with python-chess, comply with the applicable licenses,
 including the GPL terms for python-chess. This notice is informational and is not
 legal advice.
+
+## Optional Web dependencies
+
+The optional `web` installation extra installs FastAPI (MIT), Uvicorn
+(BSD-3-Clause), and websockets (BSD-3-Clause), together with their separately
+distributed dependencies. These
+packages are not copied into the LLM Olympics wheel or source distribution and retain
+their upstream licenses:
+
+- FastAPI: <https://github.com/fastapi/fastapi>
+- Uvicorn: <https://github.com/Kludex/uvicorn>
+- websockets: <https://github.com/python-websockets/websockets>

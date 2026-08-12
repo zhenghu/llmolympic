@@ -300,5 +300,7 @@ CLI（今天）          WebSocket（将来）
    3–9 名评委多数 quorum、严格 JSON 与加权中位数聚合 ✅；双人档案与 ELO ✅；
    Provider 硬预算与参赛者/评委共享预算 ✅；SQLite v8 跨进程预算账本 ✅；冻结评审团的
    创意双局赛与循环赛 ✅；checkpoint/resume、runner lease、请求证据绑定及深度审计 ✅。
-4. **Web 化 + 锦标赛**：FastAPI 暴露 core，前端对局/观战/排行榜与锦标赛模式。
-   之后新增项目继续保持纯插件接入。
+4. **Web 化 + 锦标赛（进行中）**：4.1 先以 FastAPI 提供仅限回环地址的只读 REST、
+   排行榜与已完成档案的 WebSocket 事件回放；读取层使用 SQLite `mode=ro`，公开协议与
+   内部档案模型隔离。后续切片再加入 React 观战页、运行中事件 broker、远程人类输入和
+   锦标赛模式。之后新增项目继续保持纯插件接入。

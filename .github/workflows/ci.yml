@@ -60,6 +60,43 @@ jobs:
       - name: Smoke-test CLI registration
         run: python -m llmolympic games
 
+  web:
+    name: Read-only Web API
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install Web extra
+        run: |
+          python -m pip install "pip==26.1.2" "setuptools==83.0.0"
+          python -m pip install -e ".[dev,security,web]"
+
+      - name: Audit dependencies
+        run: python -m pip_audit
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Test Web slice
+        run: python -m pytest -q tests/test_web_*.py
+
+      - name: Smoke-test lazy CLI and app factory
+        run: |
+          python -m llmolympic web --help
+          python -c "from llmolympic.web.app import create_app; create_app('missing.db')"
+
   package:
     name: Build and install package
     runs-on: ubuntu-latest
@@ -134,6 +171,19 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-creative-round-robin-smoke.db"
+
+          # The base wheel stays usable without Web dependencies; installing its
+          # optional extra must then expose the app factory and lazy CLI command.
+          "${smoke_venv}/bin/python" -c \
+            "import importlib.util; assert importlib.util.find_spec('fastapi') is None"
+          wheel_files=("${GITHUB_WORKSPACE}"/dist/*.whl)
+          "${smoke_venv}/bin/python" -m pip install "${wheel_files[0]}[web]"
+          cd "${RUNNER_TEMP}"
+          "${smoke_venv}/bin/llmolympic" web --help
+          WEB_SMOKE_DB="${RUNNER_TEMP}/missing-web-smoke.db" \
+            "${smoke_venv}/bin/python" -c \
+            "import os; from llmolympic.web.app import create_app; create_app(os.environ['WEB_SMOKE_DB'])"
+          test ! -e "${RUNNER_TEMP}/missing-web-smoke.db"
 
       - name: Smoke-test source distribution outside the checkout
         run: |
