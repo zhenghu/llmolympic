@@ -18,6 +18,9 @@ build/
 .bin/
 .pythons/
 .uv-cache/
+node_modules/
+playwright-report/
+test-results/
 
 # 系统
 .DS_Store

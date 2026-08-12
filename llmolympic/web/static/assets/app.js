@@ -377,7 +377,7 @@
     } else {
       body = h(
         "div",
-        { className: "table-scroll" },
+        { "aria-label": "ELO 排行榜横向滚动区域", className: "table-scroll", tabIndex: 0 },
         h(
           "table",
           null,

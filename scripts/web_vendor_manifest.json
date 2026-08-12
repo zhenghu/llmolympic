@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "package": "react",
+      "version": "18.3.1",
+      "registry_tarball": "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+      "npm_integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
+      "package_asset": "umd/react.production.min.js",
+      "bundled_asset": "llmolympic/web/static/assets/react.production.min.js",
+      "sha256": "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"
+    },
+    {
+      "package": "react-dom",
+      "version": "18.3.1",
+      "registry_tarball": "https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz",
+      "npm_integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
+      "package_asset": "umd/react-dom.production.min.js",
+      "bundled_asset": "llmolympic/web/static/assets/react-dom.production.min.js",
+      "sha256": "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"
+    }
+  ]
+}
