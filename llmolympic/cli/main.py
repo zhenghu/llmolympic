@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import math
 import shlex
@@ -72,6 +73,7 @@ from llmolympic.core.storage import (
     TournamentRunnerLeaseLostError,
     TournamentSaveResult,
     audit_tournament,
+    database_path,
 )
 from llmolympic.core.tournament import (
     MAX_TOURNAMENT_PLAYERS,
@@ -107,6 +109,7 @@ DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
 DEFAULT_TOURNAMENT_SEED = 0
 TOURNAMENT_RUNNER_HEARTBEAT_SECONDS = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS / 4
 TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS = 1.0
+LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +670,29 @@ def _open_store(path: Path | None, *, create: bool = True) -> SQLiteStore:
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
+
+
+def _load_web_runtime():
+    """Import the optional Web stack without burdening the base CLI install."""
+
+    try:
+        import uvicorn
+
+        from llmolympic.web.app import create_app
+
+        importlib.import_module("websockets")
+    except ModuleNotFoundError as exc:
+        missing = (exc.name or "").split(".", maxsplit=1)[0]
+        if missing not in {"fastapi", "starlette", "uvicorn", "websockets"}:
+            raise
+        console.print(
+            Text(
+                'Web 功能未安装。请运行 python -m pip install "llmolympic[web]"。',
+                style="red",
+            )
+        )
+        raise typer.Exit(code=1) from exc
+    return uvicorn, create_app
 
 
 def _render_saved(archive: MatchArchive, store: SQLiteStore, result: SaveResult) -> None:
@@ -2076,6 +2102,53 @@ def round_robin(
             line.append(literal_text(exc))
             console.print(line)
         _best_effort_render(_render_usage_summary, runtime_budget)
+
+
+@app.command(name="web")
+def serve_web(
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="只读打开的 SQLite 文件；默认读取现有数据库配置"),
+    ] = None,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="监听地址；首版只允许本机回环地址"),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=65_535, help="监听端口"),
+    ] = 8000,
+) -> None:
+    """启动本机只读观战 API 与已完成对局的事件回放。"""
+
+    normalized_host = host.strip().casefold()
+    if normalized_host not in LOCAL_WEB_HOSTS:
+        allowed = ", ".join(sorted(LOCAL_WEB_HOSTS))
+        raise typer.BadParameter(
+            f"首版 Web 服务只允许回环地址（{allowed}）；尚未提供远程认证和 TLS",
+            param_hint="--host",
+        )
+
+    uvicorn, create_app = _load_web_runtime()
+    resolved_database = database_path(database)
+    web_app = create_app(resolved_database)
+    display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    console.print(f"只读观战 API：http://{display_host}:{port}/api/v1/health")
+    console.print("仅回放已完成并存档的本地引擎对局；按 Ctrl-C 停止。")
+    uvicorn.run(
+        web_app,
+        host=normalized_host,
+        port=port,
+        access_log=False,
+        proxy_headers=False,
+        forwarded_allow_ips="",
+        server_header=False,
+        date_header=False,
+        ws_max_size=65_536,
+        ws_max_queue=16,
+        limit_concurrency=64,
+        timeout_keep_alive=5,
+    )
 
 
 @app.command(name="games")

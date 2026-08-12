@@ -22,8 +22,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "httpx2>=2,<3",
     "pytest>=8.0,<10",
     "ruff>=0.4,<1",
+]
+web = [
+    "fastapi>=0.139,<1",
+    "uvicorn>=0.51,<1",
+    "websockets>=17,<18",
 ]
 security = [
     "pip-audit==2.10.1",

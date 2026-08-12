@@ -41,6 +41,12 @@ python -m venv .venv && source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
+开发阶段四的本地 Web API 时，另外安装受上界约束的可选依赖：
+
+```bash
+python -m pip install -e ".[dev,web]"
+```
+
 用 OpenAI 模型对战需设置 `OPENAI_API_KEY`（见 `.env.example`）；
 本地模型可用 [Ollama](https://ollama.com)；没有任何 key 时用内置 mock 选手即可体验。
 
@@ -299,6 +305,27 @@ llmolympic leaderboard --game math_quiz
 llmolympic history
 llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 ```
+
+### 本地只读观战 API（阶段四 4.1）
+
+安装 `web` extra 后，可以只读打开现有 SQLite 存档：
+
+```bash
+llmolympic web --db ~/.llmolympic/llmolympic.db
+```
+
+服务默认仅监听 `127.0.0.1:8000`，首版明确拒绝 `0.0.0.0`、局域网地址和公网地址；
+当前没有远程认证或 TLS，不能将它直接暴露到网络。REST 前缀是 `/api/v1`，提供健康状态、
+项目能力、最近对局、单场公开详情和 ELO 排行榜。已完成对局可通过
+`/ws/v1/matches/<MATCH_ID>?from_seq=0` 按版本化信封回放公开事件。
+WebSocket 握手必须带与监听 Host 和端口完全同源的浏览器 `Origin`；例如默认地址使用
+`Origin: http://127.0.0.1:8000`。缺失、`null` 或跨源 Origin 会在连接接受前拒绝。
+
+这是“已完成并存档对局的观战回放”，不是正在运行比赛的实时广播。Web 层使用独立的
+SQLite `mode=ro` 仓储，不创建数据库、不迁移 schema、不更新权限或 ELO；公开 DTO 只保留
+展示所需字段，不返回 Provider 路由、Profile、模型配置、凭据、请求头或原始失败详情。
+旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样公开。React 页面、实时
+事件 broker、远程人类落子和锦标赛模式将在后续阶段四切片中实现。
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
