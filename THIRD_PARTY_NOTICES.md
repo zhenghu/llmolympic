@@ -42,6 +42,8 @@ License. The complete upstream license text is distributed at
 
 - Source: <https://github.com/facebook/react/tree/v18.3.1>
 - Bundled files: `react.production.min.js`, `react-dom.production.min.js`
+- Reproducible source manifest: `scripts/web_vendor_manifest.json`
+- Verification procedure: `docs/web-vendor-supply-chain.md`
 
 The observer's `app.js`, `app.css`, and `index.html` are original LLM Olympics
 files covered by the project's MIT License.

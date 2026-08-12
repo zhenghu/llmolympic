@@ -20,3 +20,15 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # These packages are development-only. React and ReactDOM are also the
+  # canonical source for the byte-for-byte verified, self-hosted UMD assets.
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      web-development:
+        patterns:
+          - "*"

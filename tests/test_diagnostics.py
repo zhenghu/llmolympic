@@ -58,7 +58,7 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
-    assert metadata["Version"] == __version__ == "0.4.0"
+    assert metadata["Version"] == __version__ == "0.5.0"
     assert project["project"]["license"] == "MIT"
     assert project["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
     assert metadata["License-Expression"] == "MIT"
@@ -84,16 +84,22 @@ def test_release_documents_match_package_version() -> None:
         f"releases/download/v{__version__}/"
         f"llmolympic-{__version__}-py3-none-any.whl" in readme
     )
+    assert (
+        f'"llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/'
+        f'download/v{__version__}/llmolympic-{__version__}-py3-none-any.whl"' in readme
+    )
+    assert f"阶段 4.2 自 v{__version__} 起随正式 wheel/sdist 发布" in readme
     assert f"`llmolympic-{__version__}-py3-none-any.whl`" in readme
     assert f"`llmolympic-{__version__}.tar.gz`" in readme
 
     changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-    assert f"## [{__version__}] - 2026-08-11" in changelog
+    assert f"## [{__version__}] - 2026-08-12" in changelog
     assert changelog.index("## [Unreleased]") < changelog.index(f"## [{__version__}]")
 
     supported_series = ".".join(__version__.split(".")[:2])
     security = Path("SECURITY.md").read_text(encoding="utf-8")
     assert f"| `{supported_series}.x` | 支持 |" in security
+    assert f"| `<{__version__}`、历史提交和其他功能分支 | 不支持 |" in security
 
 
 def test_version_option_does_not_load_bad_config_or_create_database(

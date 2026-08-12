@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+from llmolympic import __version__
 from llmolympic.core.archive import MatchArchive, archive_from_events
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.storage import (
@@ -429,12 +430,13 @@ def test_health_and_game_metadata_are_explicitly_versioned() -> None:
 
     health = HealthResponse(
         status="ok",
-        service_version="0.4.0",
+        service_version=__version__,
         database_available=True,
         database_schema_version=8,
     )
     game = GameInfo.from_game("creative_writing", _Game)
 
     assert health.api_version == "v1"
+    assert health.service_version == __version__
     assert game.supported_modes == ("play", "round_robin")
     assert game.requires_judge_panel is True

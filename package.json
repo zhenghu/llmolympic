@@ -1,0 +1,20 @@
+{
+  "name": "llmolympic-web-development",
+  "private": true,
+  "description": "Development-only browser tests and vendored Web asset verification for LLM Olympics",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test:web-client": "node tests/web_client_state.js",
+    "test:web-e2e": "playwright test --config tests/web_e2e/playwright.config.mjs",
+    "verify:web-vendor": "node scripts/verify_web_vendor.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "@playwright/test": "1.61.1",
+    "playwright-core": "1.61.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
