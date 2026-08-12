@@ -2119,7 +2119,7 @@ def serve_web(
         typer.Option("--port", min=1, max=65_535, help="监听端口"),
     ] = 8000,
 ) -> None:
-    """启动本机只读观战 API 与已完成对局的事件回放。"""
+    """启动本机只读观战 API、观战页与已完成对局的事件回放。"""
 
     normalized_host = host.strip().casefold()
     if normalized_host not in LOCAL_WEB_HOSTS:
@@ -2133,7 +2133,8 @@ def serve_web(
     resolved_database = database_path(database)
     web_app = create_app(resolved_database)
     display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
-    console.print(f"只读观战 API：http://{display_host}:{port}/api/v1/health")
+    console.print(f"只读观战页：http://{display_host}:{port}/")
+    console.print(f"只读观战 API（健康检查）：http://{display_host}:{port}/api/v1/health")
     console.print("仅回放已完成并存档的本地引擎对局；按 Ctrl-C 停止。")
     uvicorn.run(
         web_app,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from rich.text import Text
 from typer.testing import CliRunner
 
@@ -27,7 +28,16 @@ def test_web_rejects_non_loopback_before_loading_optional_runtime(monkeypatch) -
     assert "只允许回环地址" in _plain(result.output)
 
 
-def test_web_starts_hardened_local_server(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("host", "display_host"),
+    [("127.0.0.1", "127.0.0.1"), ("::1", "[::1]")],
+)
+def test_web_starts_hardened_local_server(
+    monkeypatch,
+    tmp_path: Path,
+    host: str,
+    display_host: str,
+) -> None:
     calls: list[tuple[object, dict[str, object]]] = []
     created_for: list[Path] = []
     sentinel_app = object()
@@ -48,7 +58,7 @@ def test_web_starts_hardened_local_server(monkeypatch, tmp_path: Path) -> None:
 
     result = runner.invoke(
         main.app,
-        ["web", "--db", str(database), "--host", "127.0.0.1", "--port", "8765"],
+        ["web", "--db", str(database), "--host", host, "--port", "8765"],
     )
 
     assert result.exit_code == 0, result.output
@@ -57,7 +67,7 @@ def test_web_starts_hardened_local_server(monkeypatch, tmp_path: Path) -> None:
         (
             sentinel_app,
             {
-                "host": "127.0.0.1",
+                "host": host,
                 "port": 8765,
                 "access_log": False,
                 "proxy_headers": False,
@@ -71,7 +81,9 @@ def test_web_starts_hardened_local_server(monkeypatch, tmp_path: Path) -> None:
             },
         )
     ]
-    assert "只读观战 API" in _plain(result.output)
+    output = _plain(result.output)
+    assert f"只读观战页：http://{display_host}:8765/" in output
+    assert f"只读观战 API（健康检查）：http://{display_host}:8765/api/v1/health" in output
 
 
 def test_web_help_does_not_load_optional_runtime(monkeypatch) -> None:

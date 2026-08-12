@@ -27,6 +27,7 @@ from llmolympic.core.storage import (
     UnsupportedSchemaError,
     database_path,
 )
+from llmolympic.web.reader import WebReadError, WebSQLiteReader
 
 STARTED = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 _MATCH_METADATA_UPDATE_SQL = {
@@ -804,6 +805,16 @@ def test_v1_database_is_migrated_without_changing_existing_data(tmp_path) -> Non
         legacy_entrant_id("乙"),
     ]
     assert all(entry.games_played == 1 for entry in migrated.leaderboard())
+    web_summary = WebSQLiteReader(path).list_matches()
+    assert len(web_summary) == 1
+    assert web_summary[0].match_id == payload["match_id"]
+    assert web_summary[0].players == ("甲", "乙")
+    assert web_summary[0].entrant_ids == (
+        legacy_entrant_id("甲"),
+        legacy_entrant_id("乙"),
+    )
+    with pytest.raises(WebReadError, match="match_detail_unsupported"):
+        WebSQLiteReader(path).load_match(payload["match_id"])
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
@@ -863,6 +874,18 @@ def test_v2_series_migration_preserves_raw_json_and_backfills_legacy_identity(
         legacy_entrant_id("甲"),
         legacy_entrant_id("乙"),
     }
+    web_summaries = WebSQLiteReader(path).list_matches()
+    assert {summary.match_id for summary in web_summaries} == set(raw_archives)
+    assert {summary.series_id for summary in web_summaries} == {payload["series_id"]}
+    assert {summary.leg_number for summary in web_summaries} == {1, 2}
+    assert all(
+        summary.entrant_ids == (legacy_entrant_id("甲"), legacy_entrant_id("乙"))
+        or summary.entrant_ids == (legacy_entrant_id("乙"), legacy_entrant_id("甲"))
+        for summary in web_summaries
+    )
+    for summary in web_summaries:
+        with pytest.raises(WebReadError, match="match_detail_unsupported"):
+            WebSQLiteReader(path).load_match(summary.match_id)
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
@@ -1590,6 +1613,11 @@ def test_engine_identity_rename_keeps_one_rating_and_history_snapshots(tmp_path)
     board = {entry.entrant_id: entry for entry in store.leaderboard()}
     assert board["profile:a"].display_name == "Renamed"
     assert board["profile:a"].games_played == 2
+    web_matches = {
+        summary.match_id: summary for summary in WebSQLiteReader(path).list_matches()
+    }
+    assert web_matches["before-rename"].players == ("Alpha", "Beta")
+    assert web_matches["after-rename"].players == ("Renamed", "Beta")
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             """

@@ -102,7 +102,7 @@ jobs:
       - name: Install project and release tools
         run: |
           python -m pip install "pip==26.1.2" "setuptools==83.0.0"
-          python -m pip install -e ".[dev,security]"
+          python -m pip install -e ".[dev,security,web]"
           python -m pip install "build==1.5.0" "twine==6.2.0"
 
       - name: Audit dependencies
@@ -166,6 +166,13 @@ jobs:
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-creative-round-robin-smoke.db"
 
+          wheel_files=("${GITHUB_WORKSPACE}"/dist/*.whl)
+          "${smoke_venv}/bin/python" -m pip install "${wheel_files[0]}[web]"
+          cd "${RUNNER_TEMP}"
+          "${smoke_venv}/bin/llmolympic" web --help
+          "${smoke_venv}/bin/python" -c \
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+
       - name: Smoke-test source distribution outside the checkout
         run: |
           smoke_venv="${RUNNER_TEMP}/llmolympic-sdist-venv"
@@ -208,6 +215,13 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-creative-round-robin-smoke.db"
+
+          sdist_files=("${GITHUB_WORKSPACE}"/dist/*.tar.gz)
+          "${smoke_venv}/bin/python" -m pip install "${sdist_files[0]}[web]"
+          cd "${RUNNER_TEMP}"
+          "${smoke_venv}/bin/llmolympic" web --help
+          "${smoke_venv}/bin/python" -c \
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
 
       - name: Generate checksums
         working-directory: dist

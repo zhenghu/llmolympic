@@ -6,13 +6,20 @@ import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 
 import pytest
 
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.core.series import SeriesArchive, series_from_legs
 from llmolympic.core.storage import SCHEMA_VERSION, SQLiteStore
+from llmolympic.core.tournament import (
+    TournamentArchive,
+    round_robin_pair_seed,
+    tournament_from_series,
+)
 from llmolympic.web.reader import (
     MAX_ARCHIVE_BYTES,
     MAX_ARCHIVE_EVENTS,
@@ -104,6 +111,118 @@ def _database(tmp_path: Path) -> tuple[Path, SQLiteStore, MatchArchive]:
     return path, store, archive
 
 
+def _descriptor(name: str) -> dict:
+    return {
+        "name": name,
+        "display_name": name,
+        "entrant_id": f"web:{name.lower()}",
+        "kind": "mock",
+        "model": name,
+    }
+
+
+def _context_archive(
+    *,
+    match_id: str,
+    seed: int,
+    players: tuple[dict, dict],
+    winner: str,
+    seconds: int,
+) -> MatchArchive:
+    started = STARTED + timedelta(seconds=seconds)
+    scores = {
+        descriptor["name"]: 1.0 if descriptor["name"] == winner else 0.0
+        for descriptor in players
+    }
+    return MatchArchive(
+        schema_version=2,
+        source="local_engine",
+        match_id=match_id,
+        game="math_quiz",
+        seed=seed,
+        players=list(players),
+        events=[
+            MatchEvent(
+                seq=0,
+                type=EventType.MATCH_STARTED,
+                timestamp=started,
+                data={
+                    "game": "math_quiz",
+                    "seed": seed,
+                    "game_config": {},
+                    "players": list(players),
+                },
+            ),
+            MatchEvent(
+                seq=1,
+                type=EventType.MATCH_FINISHED,
+                timestamp=started + timedelta(seconds=1),
+                data={"scores": scores, "termination": "completed"},
+            ),
+        ],
+        moves=[],
+        scores=scores,
+        started_at=started,
+        finished_at=started + timedelta(seconds=1),
+    )
+
+
+def _series(
+    *,
+    series_id: str,
+    players: tuple[dict, dict] | None = None,
+    seed: int = 17,
+    seconds: int = 10,
+) -> SeriesArchive:
+    first, second = players or (_descriptor("A"), _descriptor("B"))
+    winner = first["name"]
+    return series_from_legs(
+        _context_archive(
+            match_id=f"{series_id}-leg-1",
+            seed=seed,
+            players=(first, second),
+            winner=winner,
+            seconds=seconds,
+        ),
+        _context_archive(
+            match_id=f"{series_id}-leg-2",
+            seed=seed,
+            players=(second, first),
+            winner=winner,
+            seconds=seconds + 2,
+        ),
+        series_id=series_id,
+    )
+
+
+def _tournament(*, tournament_id: str = "web-tournament") -> TournamentArchive:
+    players = tuple(_descriptor(name) for name in ("A", "B", "C"))
+    series = []
+    for pairing_number, (first_index, second_index) in enumerate(
+        combinations(range(len(players)), 2), start=1
+    ):
+        pairing = (players[first_index], players[second_index])
+        seed = round_robin_pair_seed(
+            42,
+            pairing[0]["entrant_id"],
+            pairing[1]["entrant_id"],
+        )
+        series.append(
+            _series(
+                series_id=f"{tournament_id}-series-{pairing_number}",
+                players=pairing,
+                seed=seed,
+                seconds=20 + pairing_number * 4,
+            )
+        )
+    return tournament_from_series(
+        players,
+        series,
+        seed=42,
+        tournament_id=tournament_id,
+    )
+
+
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -157,6 +276,102 @@ def test_reader_returns_core_dtos_and_verified_archive(tmp_path: Path) -> None:
     assert loaded.summary == summaries[0]
     assert loaded.archive.model_dump(mode="json") == archive.model_dump(mode="json")
     assert reader.get_match(archive.match_id) == loaded
+
+
+def test_reader_accepts_context_bound_series_and_tournament_rating_policies(
+    tmp_path: Path,
+) -> None:
+    series_path = tmp_path / "series.db"
+    series = _series(series_id="web-series")
+    SQLiteStore(series_path).save_series(series, rating_source="engine")
+    series_reader = WebSQLiteReader(series_path)
+
+    series_summaries = series_reader.list_matches(limit=10)
+    assert {summary.match_id for summary in series_summaries} == {
+        leg.match_id for leg in series.legs
+    }
+    assert {summary.series_id for summary in series_summaries} == {series.series_id}
+    assert {summary.leg_number for summary in series_summaries} == {1, 2}
+    assert all(summary.tournament_id is None and summary.rated for summary in series_summaries)
+    assert all(series_reader.load_match(leg.match_id).archive == leg for leg in series.legs)
+
+    tournament_path = tmp_path / "tournament.db"
+    tournament = _tournament()
+    SQLiteStore(tournament_path).save_tournament(tournament, rating_source="engine")
+    tournament_reader = WebSQLiteReader(tournament_path)
+
+    tournament_summaries = tournament_reader.list_matches(limit=10)
+    assert len(tournament_summaries) == 6
+    assert {summary.tournament_id for summary in tournament_summaries} == {
+        tournament.tournament_id
+    }
+    assert {summary.pairing_number for summary in tournament_summaries} == {1, 2, 3}
+    assert {summary.pairing_count for summary in tournament_summaries} == {3}
+    assert all(summary.series_id and summary.leg_number in (1, 2) for summary in tournament_summaries)
+    assert all(summary.rated for summary in tournament_summaries)
+    assert all(
+        tournament_reader.load_match(summary.match_id).summary == summary
+        for summary in tournament_summaries
+    )
+
+
+@pytest.mark.parametrize(
+    ("context", "wrong_policy"),
+    [
+        ("standalone", "elo_batch_v1"),
+        ("series", "elo_v1"),
+        ("tournament", "elo_batch_v1"),
+    ],
+)
+def test_reader_rejects_rating_policy_that_does_not_match_archive_context(
+    tmp_path: Path,
+    context: str,
+    wrong_policy: str,
+) -> None:
+    path = tmp_path / f"{context}.db"
+    store = SQLiteStore(path)
+    if context == "standalone":
+        archive = _archive(match_id="standalone-match")
+        store.save_match(archive, rating_source="engine")
+        match_id = archive.match_id
+    elif context == "series":
+        series = _series(series_id="policy-series")
+        store.save_series(series, rating_source="engine")
+        match_id = series.legs[0].match_id
+    else:
+        tournament = _tournament(tournament_id="policy-tournament")
+        store.save_tournament(tournament, rating_source="engine")
+        match_id = tournament.pairings[0].series.legs[0].match_id
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE matches SET rating_policy = ? WHERE match_id = ?",
+            (wrong_policy, match_id),
+        )
+
+    reader = WebSQLiteReader(path)
+    assert _error_code(lambda: reader.list_matches(limit=100)) == "match_index_invalid"
+    assert _error_code(lambda: reader.load_match(match_id)) == "match_index_invalid"
+
+
+def test_reader_normalizes_legacy_surrogate_name_failure(tmp_path: Path) -> None:
+    path, _, _ = _database(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE matches
+            SET schema_version = 1,
+                archive_source = 'legacy',
+                players_json = '[{"name":"\\ud800"}]',
+                scores_json = '{"\\ud800":1.0}',
+                rating_source = 'imported',
+                rated = 0,
+                rating_policy = 'unrated'
+            WHERE match_id = 'web-match-1'
+            """
+        )
+
+    assert _error_code(WebSQLiteReader(path).list_matches) == "match_index_invalid"
 
 
 def test_all_reader_operations_leave_database_bytes_metadata_and_sidecars_unchanged(

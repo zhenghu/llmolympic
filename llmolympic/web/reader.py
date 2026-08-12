@@ -22,7 +22,8 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from llmolympic.core.archive import MatchArchive, validate_entrant_id
+from llmolympic.core.archive import MatchArchive, legacy_entrant_id, validate_entrant_id
+from llmolympic.core.elo import K_FACTOR
 from llmolympic.core.events import EventType
 from llmolympic.core.storage import SCHEMA_VERSION, MatchSummary, RatingEntry
 
@@ -81,13 +82,32 @@ _REQUIRED_COLUMNS = {
         "losses",
         "updated_at",
     },
+    "series_archives": {
+        "series_id",
+        "schema_version",
+        "game",
+        "archive_source",
+        "rating_source",
+        "rated",
+        "rating_policy",
+    },
     "series_matches": {"series_id", "leg_number", "match_id"},
     "tournament_pairings": {
         "tournament_id",
         "pairing_number",
         "series_id",
     },
-    "tournament_archives": {"tournament_id", "pairing_count"},
+    "tournament_archives": {
+        "tournament_id",
+        "schema_version",
+        "game",
+        "pairing_count",
+        "archive_source",
+        "rating_source",
+        "rated",
+        "rating_policy",
+        "k_factor",
+    },
 }
 
 
@@ -105,6 +125,26 @@ class LoadedMatch:
 
     archive: MatchArchive
     summary: MatchSummary
+
+
+@dataclass(frozen=True)
+class _IndexedPlayer:
+    """One private descriptor plus its verified public identity fields."""
+
+    descriptor: dict[str, Any]
+    display_name: str
+    entrant_id: str
+
+
+@dataclass(frozen=True)
+class _MatchContext:
+    """Verified series/tournament placement for one denormalized match row."""
+
+    series_id: str | None
+    leg_number: int | None
+    tournament_id: str | None
+    pairing_number: int | None
+    pairing_count: int | None
 
 
 def _sqlite_error_code(exc: sqlite3.Error, default: str) -> str:
@@ -158,7 +198,10 @@ def _safe_display_name(raw: object, *, code: str) -> str:
     if not isinstance(raw, str) or not raw or len(raw) > 512:
         raise WebReadError(code)
     if any(
-        ord(character) < 32 or 127 <= ord(character) <= 159 or character in _BIDI_CONTROL_CHARACTERS
+        ord(character) < 32
+        or 127 <= ord(character) <= 159
+        or 0xD800 <= ord(character) <= 0xDFFF
+        or character in _BIDI_CONTROL_CHARACTERS
         for character in raw
     ):
         raise WebReadError(code)
@@ -179,26 +222,42 @@ def _players_and_scores(
     scores_raw: object,
     *,
     code: str,
-) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    legacy: bool = False,
+) -> tuple[list[_IndexedPlayer], dict[str, float]]:
     if not isinstance(players_raw, list) or not players_raw:
         raise WebReadError(code)
     if not isinstance(scores_raw, dict):
         raise WebReadError(code)
 
-    players: list[dict[str, Any]] = []
+    players: list[_IndexedPlayer] = []
     names: list[str] = []
     entrant_ids: list[str] = []
     for descriptor in players_raw:
         if not isinstance(descriptor, dict):
             raise WebReadError(code)
         name = _safe_display_name(descriptor.get("name"), code=code)
-        display_name = _safe_display_name(descriptor.get("display_name"), code=code)
-        entrant_id = _safe_identity(descriptor.get("entrant_id"), code=code)
-        if display_name != name:
-            raise WebReadError(code)
+        if legacy:
+            display_name = name
+            entrant_id = _safe_identity(legacy_entrant_id(name), code=code)
+            if (
+                ("display_name" in descriptor and descriptor["display_name"] != display_name)
+                or ("entrant_id" in descriptor and descriptor["entrant_id"] != entrant_id)
+            ):
+                raise WebReadError(code)
+        else:
+            display_name = _safe_display_name(descriptor.get("display_name"), code=code)
+            entrant_id = _safe_identity(descriptor.get("entrant_id"), code=code)
+            if display_name != name or entrant_id.startswith("legacy:"):
+                raise WebReadError(code)
         names.append(name)
         entrant_ids.append(entrant_id)
-        players.append(descriptor)
+        players.append(
+            _IndexedPlayer(
+                descriptor=dict(descriptor),
+                display_name=display_name,
+                entrant_id=entrant_id,
+            )
+        )
     if len(set(names)) != len(names) or len(set(entrant_ids)) != len(entrant_ids):
         raise WebReadError(code)
 
@@ -206,6 +265,110 @@ def _players_and_scores(
         raise WebReadError(code)
     scores = {name: _finite_score(scores_raw[name], code=code) for name in names}
     return players, scores
+
+
+def _validated_match_context(row: sqlite3.Row, *, code: str) -> _MatchContext:
+    """Validate rating policy against the row's exact archive ownership chain."""
+
+    series_id = _validated_optional_related_id(row["series_id"], code=code)
+    series_archive_id = _validated_optional_related_id(row["series_archive_id"], code=code)
+    leg_number = row["leg_number"]
+    series_parent_values = (
+        series_archive_id,
+        row["series_schema_version"],
+        row["series_game"],
+        row["series_archive_source"],
+        row["series_rating_source"],
+        row["series_rated"],
+        row["series_rating_policy"],
+    )
+    if series_id is None:
+        if leg_number is not None or any(value is not None for value in series_parent_values):
+            raise WebReadError(code)
+    elif (
+        series_archive_id != series_id
+        or isinstance(leg_number, bool)
+        or not isinstance(leg_number, int)
+        or leg_number not in (1, 2)
+        or row["series_schema_version"] != row["schema_version"]
+        or row["series_game"] != row["game"]
+        or row["series_archive_source"] != row["archive_source"]
+        or row["series_rating_source"] != row["rating_source"]
+        or row["series_rated"] != row["rated"]
+        or row["series_rating_policy"] != row["rating_policy"]
+    ):
+        raise WebReadError(code)
+
+    tournament_id = _validated_optional_related_id(row["tournament_id"], code=code)
+    tournament_archive_id = _validated_optional_related_id(
+        row["tournament_archive_id"], code=code
+    )
+    pairing_number = row["pairing_number"]
+    pairing_count = row["pairing_count"]
+    tournament_parent_values = (
+        tournament_archive_id,
+        row["tournament_schema_version"],
+        row["tournament_game"],
+        row["tournament_archive_source"],
+        row["tournament_rating_source"],
+        row["tournament_rated"],
+        row["tournament_rating_policy"],
+        row["tournament_k_factor"],
+    )
+    if tournament_id is None:
+        if (
+            pairing_number is not None
+            or pairing_count is not None
+            or any(value is not None for value in tournament_parent_values)
+        ):
+            raise WebReadError(code)
+    else:
+        if (
+            series_id is None
+            or tournament_archive_id != tournament_id
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                for value in (pairing_number, pairing_count)
+            )
+            or pairing_number > pairing_count
+            or row["tournament_schema_version"] != 1
+            or row["tournament_game"] != row["game"]
+            or row["tournament_archive_source"] != row["archive_source"]
+            or row["tournament_rating_source"] != row["rating_source"]
+            or row["tournament_rated"] != row["rated"]
+            or row["tournament_rating_policy"] != row["rating_policy"]
+        ):
+            raise WebReadError(code)
+        k_factor = row["tournament_k_factor"]
+        if row["rated"]:
+            if (
+                isinstance(k_factor, bool)
+                or not isinstance(k_factor, (int, float))
+                or not math.isfinite(float(k_factor))
+                or float(k_factor) != K_FACTOR
+            ):
+                raise WebReadError(code)
+        elif k_factor is not None:
+            raise WebReadError(code)
+
+    expected_policy = "unrated"
+    if row["rated"]:
+        if tournament_id is not None:
+            expected_policy = "elo_tournament_batch_v1"
+        elif series_id is not None:
+            expected_policy = "elo_batch_v1"
+        else:
+            expected_policy = "elo_v1"
+    if row["rating_policy"] != expected_policy:
+        raise WebReadError(code)
+
+    return _MatchContext(
+        series_id=series_id,
+        leg_number=leg_number,
+        tournament_id=tournament_id,
+        pairing_number=pairing_number,
+        pairing_count=pairing_count,
+    )
 
 
 def _validate_limit(limit: object) -> int:
@@ -361,10 +524,26 @@ class WebSQLiteReader:
                    m.archive_source, m.rating_source, m.rated, m.rating_policy,
                    length(CAST(m.players_json AS BLOB)) AS players_bytes,
                    length(CAST(m.scores_json AS BLOB)) AS scores_bytes,
-                   sm.series_id, sm.leg_number, tp.tournament_id,
-                   tp.pairing_number, ta.pairing_count
+                   sm.series_id, sm.leg_number,
+                   sa.series_id AS series_archive_id,
+                   sa.schema_version AS series_schema_version,
+                   sa.game AS series_game,
+                   sa.archive_source AS series_archive_source,
+                   sa.rating_source AS series_rating_source,
+                   sa.rated AS series_rated,
+                   sa.rating_policy AS series_rating_policy,
+                   tp.tournament_id, tp.pairing_number, ta.pairing_count,
+                   ta.tournament_id AS tournament_archive_id,
+                   ta.schema_version AS tournament_schema_version,
+                   ta.game AS tournament_game,
+                   ta.archive_source AS tournament_archive_source,
+                   ta.rating_source AS tournament_rating_source,
+                   ta.rated AS tournament_rated,
+                   ta.rating_policy AS tournament_rating_policy,
+                   ta.k_factor AS tournament_k_factor
             FROM matches AS m
             LEFT JOIN series_matches AS sm ON sm.match_id = m.match_id
+            LEFT JOIN series_archives AS sa ON sa.series_id = sm.series_id
             LEFT JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
             LEFT JOIN tournament_archives AS ta
                    ON ta.tournament_id = tp.tournament_id
@@ -410,7 +589,6 @@ class WebSQLiteReader:
             or row["rating_source"] not in ("engine", "imported")
             or row["rated"] not in (0, 1)
             or not isinstance(row["rating_policy"], str)
-            or row["rating_policy"] != ("elo_v1" if row["rated"] else "unrated")
             or not isinstance(row["players_bytes"], int)
             or not 0 <= row["players_bytes"] <= _MAX_METADATA_BYTES
             or not isinstance(row["scores_bytes"], int)
@@ -421,66 +599,53 @@ class WebSQLiteReader:
             (row["schema_version"] == 1 and row["archive_source"] != "legacy")
             or (row["schema_version"] == 2 and row["archive_source"] == "legacy")
             or (row["rated"] and row["rating_source"] != "engine")
+            or (
+                row["rated"]
+                and row["archive_source"]
+                != ("legacy" if row["schema_version"] == 1 else "local_engine")
+            )
         ):
             raise WebReadError(code)
 
         players_raw = _json_value(row["players_json"], code=code)
         scores_raw = _json_value(row["scores_json"], code=code)
-        players, scores = _players_and_scores(players_raw, scores_raw, code=code)
+        players, scores = _players_and_scores(
+            players_raw,
+            scores_raw,
+            code=code,
+            legacy=row["schema_version"] == 1,
+        )
         started = _aware_datetime(row["started_at"], code=code)
         finished = _aware_datetime(row["finished_at"], code=code)
         if finished.astimezone(UTC) < started.astimezone(UTC):
             raise WebReadError(code)
         self._verify_match_players(connection, match_id, players, scores, code=code)
 
-        series_id = _validated_optional_related_id(row["series_id"], code=code)
-        tournament_id = _validated_optional_related_id(row["tournament_id"], code=code)
-        leg_number = row["leg_number"]
-        pairing_number = row["pairing_number"]
-        pairing_count = row["pairing_count"]
-        if (series_id is None) != (leg_number is None):
-            raise WebReadError(code)
-        if leg_number is not None and (
-            isinstance(leg_number, bool) or not isinstance(leg_number, int) or leg_number < 1
-        ):
-            raise WebReadError(code)
-        tournament_values = (tournament_id, pairing_number, pairing_count)
-        if any(value is None for value in tournament_values) != all(
-            value is None for value in tournament_values
-        ):
-            raise WebReadError(code)
-        if tournament_id is not None:
-            if series_id is None or any(
-                isinstance(value, bool) or not isinstance(value, int) or value < 1
-                for value in (pairing_number, pairing_count)
-            ):
-                raise WebReadError(code)
-            if pairing_number > pairing_count:
-                raise WebReadError(code)
+        context = _validated_match_context(row, code=code)
 
         return MatchSummary(
             match_id=match_id,
             game=game,
             seed=row["seed"],
-            players=tuple(descriptor["display_name"] for descriptor in players),
-            entrant_ids=tuple(descriptor["entrant_id"] for descriptor in players),
+            players=tuple(player.display_name for player in players),
+            entrant_ids=tuple(player.entrant_id for player in players),
             scores=scores,
             started_at=started,
             finished_at=finished,
-            series_id=series_id,
-            leg_number=leg_number,
+            series_id=context.series_id,
+            leg_number=context.leg_number,
             rating_source=row["rating_source"],
             rated=bool(row["rated"]),
-            tournament_id=tournament_id,
-            pairing_number=pairing_number,
-            pairing_count=pairing_count,
+            tournament_id=context.tournament_id,
+            pairing_number=context.pairing_number,
+            pairing_count=context.pairing_count,
         )
 
     @staticmethod
     def _verify_match_players(
         connection: sqlite3.Connection,
         match_id: str,
-        players: list[dict[str, Any]],
+        players: list[_IndexedPlayer],
         scores: dict[str, float],
         *,
         code: str,
@@ -488,11 +653,14 @@ class WebSQLiteReader:
         try:
             rows = connection.execute(
                 """
-                SELECT position, player, entrant_id, display_name,
-                       descriptor_json, score
-                FROM match_players
-                WHERE match_id = ?
-                ORDER BY position
+                SELECT mp.position, mp.player, mp.entrant_id, mp.display_name,
+                       mp.descriptor_json, mp.score,
+                       e.entrant_id AS registered_entrant_id,
+                       e.display_name AS registered_display_name
+                FROM match_players AS mp
+                LEFT JOIN entrants AS e ON e.entrant_id = mp.entrant_id
+                WHERE mp.match_id = ?
+                ORDER BY mp.position
                 """,
                 (match_id,),
             ).fetchall()
@@ -500,15 +668,20 @@ class WebSQLiteReader:
             raise WebReadError(_sqlite_error_code(exc, "database_read_failed")) from None
         if len(rows) != len(players):
             raise WebReadError(code)
-        for position, (row, descriptor) in enumerate(zip(rows, players)):
+        for position, (row, player) in enumerate(zip(rows, players)):
             stored_descriptor = _json_value(row["descriptor_json"], code=code)
-            name = descriptor["display_name"]
+            name = player.display_name
             if (
                 row["position"] != position
                 or row["player"] != name
                 or row["display_name"] != name
-                or row["entrant_id"] != descriptor["entrant_id"]
-                or stored_descriptor != descriptor
+                or row["entrant_id"] != player.entrant_id
+                or row["registered_entrant_id"] != player.entrant_id
+                or (
+                    player.entrant_id.startswith("legacy:")
+                    and row["registered_display_name"] != name
+                )
+                or stored_descriptor != player.descriptor
                 or _finite_score(row["score"], code=code) != scores[name]
             ):
                 raise WebReadError(code)
@@ -593,10 +766,26 @@ class WebSQLiteReader:
                            length(CAST(m.scores_json AS BLOB)) AS scores_bytes,
                            typeof(m.archive_json) AS archive_type,
                            length(CAST(m.archive_json AS BLOB)) AS archive_bytes,
-                           sm.series_id, sm.leg_number, tp.tournament_id,
-                           tp.pairing_number, ta.pairing_count
+                           sm.series_id, sm.leg_number,
+                           sa.series_id AS series_archive_id,
+                           sa.schema_version AS series_schema_version,
+                           sa.game AS series_game,
+                           sa.archive_source AS series_archive_source,
+                           sa.rating_source AS series_rating_source,
+                           sa.rated AS series_rated,
+                           sa.rating_policy AS series_rating_policy,
+                           tp.tournament_id, tp.pairing_number, ta.pairing_count,
+                           ta.tournament_id AS tournament_archive_id,
+                           ta.schema_version AS tournament_schema_version,
+                           ta.game AS tournament_game,
+                           ta.archive_source AS tournament_archive_source,
+                           ta.rating_source AS tournament_rating_source,
+                           ta.rated AS tournament_rated,
+                           ta.rating_policy AS tournament_rating_policy,
+                           ta.k_factor AS tournament_k_factor
                     FROM matches AS m
                     LEFT JOIN series_matches AS sm ON sm.match_id = m.match_id
+                    LEFT JOIN series_archives AS sa ON sa.series_id = sm.series_id
                     LEFT JOIN tournament_pairings AS tp ON tp.series_id = sm.series_id
                     LEFT JOIN tournament_archives AS ta
                            ON ta.tournament_id = tp.tournament_id
@@ -677,7 +866,7 @@ class WebSQLiteReader:
             raise WebReadError(code)
 
         players, scores = _players_and_scores(archive.players, archive.scores, code=code)
-        names = {descriptor["display_name"] for descriptor in players}
+        names = {player.display_name for player in players}
         if [event.seq for event in archive.events] != list(range(len(archive.events))):
             raise WebReadError(code)
         started_events = [
@@ -752,6 +941,7 @@ class WebSQLiteReader:
     @staticmethod
     def _verify_archive_row(row: sqlite3.Row, archive: MatchArchive) -> None:
         code = "match_index_invalid"
+        _validated_match_context(row, code=code)
         payload = archive.model_dump(mode="json")
         players_raw = _json_value(row["players_json"], code=code)
         scores_raw = _json_value(row["scores_json"], code=code)
@@ -768,9 +958,6 @@ class WebSQLiteReader:
             or not _utc_equal(started, archive.started_at)
             or not _utc_equal(finished, archive.finished_at)
             or row["archive_source"] != archive.source
-            or row["rating_source"] not in ("engine", "imported")
-            or row["rated"] not in (0, 1)
-            or row["rating_policy"] != ("elo_v1" if row["rated"] else "unrated")
         ):
             raise WebReadError(code)
 
