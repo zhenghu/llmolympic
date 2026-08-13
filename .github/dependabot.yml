@@ -22,7 +22,7 @@ updates:
           - "*"
 
   # These packages are development-only. React and ReactDOM are also the
-  # canonical source for the byte-for-byte verified, self-hosted UMD assets.
+  # canonical inputs for the reproducibly built, self-hosted browser bundle.
   - package-ecosystem: npm
     directory: "/"
     schedule:

@@ -32,18 +32,27 @@ their upstream licenses:
 - Uvicorn: <https://github.com/Kludex/uvicorn>
 - websockets: <https://github.com/python-websockets/websockets>
 
-## Bundled React observer assets
+## Bundled React observer code
 
-The local observer page includes minified React and ReactDOM 18.3.1 browser
-builds copied into the LLM Olympics wheel and source distribution. React is
-copyright Meta Platforms, Inc. and affiliates and is licensed under the MIT
-License. The complete upstream license text is distributed at
+The local observer's production `app.js` bundle includes React 19.2.8,
+ReactDOM 19.2.8, and Scheduler 0.27.0. These projects are copyright Meta
+Platforms, Inc. and affiliates and are licensed under the MIT License. The
+complete upstream license text is distributed at
 `llmolympic/web/static/REACT_LICENSE.txt`.
+The production bundle also carries React and Modernizr MIT notices; retained
+upstream React comments and a fixed banner keep those notices with the served copy.
 
-- Source: <https://github.com/facebook/react/tree/v18.3.1>
-- Bundled files: `react.production.min.js`, `react-dom.production.min.js`
+- Source: <https://github.com/facebook/react/tree/v19.2.8>
+- Bundled file: `llmolympic/web/static/assets/app.js`
 - Reproducible source manifest: `scripts/web_vendor_manifest.json`
 - Verification procedure: `docs/web-vendor-supply-chain.md`
 
-The observer's `app.js`, `app.css`, and `index.html` are original LLM Olympics
-files covered by the project's MIT License.
+The bundle is produced with esbuild 0.28.2, an MIT-licensed build tool. esbuild
+itself is not copied into the LLM Olympics wheel or source distribution.
+
+- Source: <https://github.com/evanw/esbuild/tree/v0.28.2>
+
+The observer source in `web_src/app.js`, its CSS, and its HTML are original LLM
+Olympics files covered by the project's MIT License; the generated `app.js`
+contains both that original application code and the bundled third-party code
+listed above.

@@ -141,6 +141,8 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm audit --audit-level=high
+          npm run build:web
+          git diff --exit-code -- llmolympic/web/static/assets/app.js
           npm run verify:web-vendor
           npx --no-install playwright install --with-deps chromium
 
@@ -210,7 +212,7 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${smoke_venv}/bin/llmolympic" web --help
           "${smoke_venv}/bin/python" -c \
-            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assets = root.joinpath('assets'); assert root.joinpath('index.html').is_file(); assert assets.joinpath('app.js').is_file(); assert not assets.joinpath('react.production.min.js').is_file(); assert not assets.joinpath('react-dom.production.min.js').is_file()"
           WEB_SMOKE_DB="${RUNNER_TEMP}/missing-web-smoke.db" \
             "${smoke_venv}/bin/python" -c \
             "import os; from llmolympic.web.app import create_app; create_app(os.environ['WEB_SMOKE_DB'])"
@@ -267,7 +269,7 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${smoke_venv}/bin/llmolympic" web --help
           "${smoke_venv}/bin/python" -c \
-            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assets = root.joinpath('assets'); assert root.joinpath('index.html').is_file(); assert assets.joinpath('app.js').is_file(); assert not assets.joinpath('react.production.min.js').is_file(); assert not assets.joinpath('react-dom.production.min.js').is_file()"
           WEB_SMOKE_DB="${RUNNER_TEMP}/missing-sdist-web-smoke.db" \
             "${smoke_venv}/bin/python" -c \
             "import os; from llmolympic.web.app import create_app; create_app(os.environ['WEB_SMOKE_DB'])"

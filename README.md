@@ -334,8 +334,9 @@ macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项
 时间线播放、暂停、前后单步、拖动进度、切换速度或重新播放。页面明确展示的是已完成存档，
 不是直播；五子棋和国际象棋暂时也使用通用事件时间线，不提供专用棋盘。
 
-React 与 ReactDOM 18.3.1 的固定生产构建随 wheel/sdist 离线分发；打开页面不访问 CDN，
-运行时也不需要 Node、外部字体、遥测或 Service Worker。REST 前缀是 `/api/v1`，提供健康
+React 19.2.8、ReactDOM 19.2.8 与 Scheduler 0.27.0 通过锁定依赖和可复现构建合并为同源
+生产 bundle，随 wheel/sdist 离线分发；打开页面不访问 CDN，运行时也不需要 Node、外部
+字体、遥测或 Service Worker。REST 前缀是 `/api/v1`，提供健康
 状态、项目能力、最近对局、单场公开详情和 ELO 排行榜。已完成对局可通过
 `/ws/v1/matches/<MATCH_ID>?from_seq=0` 按版本化信封回放公开事件。
 WebSocket 握手必须带与监听 Host 和端口完全同源的浏览器 `Origin`；例如默认地址使用

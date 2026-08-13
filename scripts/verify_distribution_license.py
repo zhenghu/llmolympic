@@ -9,7 +9,6 @@ import zipfile
 from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
-from hashlib import sha256
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,17 +21,19 @@ WEB_ASSET_PATHS = (
     "llmolympic/web/static/REACT_LICENSE.txt",
     "llmolympic/web/static/assets/app.css",
     "llmolympic/web/static/assets/app.js",
+)
+LEGACY_REACT_ASSET_PATHS = (
     "llmolympic/web/static/assets/react.production.min.js",
     "llmolympic/web/static/assets/react-dom.production.min.js",
 )
-REACT_ASSET_DIGESTS = {
-    "llmolympic/web/static/assets/react.production.min.js": (
-        "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"
-    ),
-    "llmolympic/web/static/assets/react-dom.production.min.js": (
-        "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"
-    ),
-}
+WEB_BUILD_INPUT_PATHS = (
+    "package.json",
+    "package-lock.json",
+    "scripts/build_web.mjs",
+    "scripts/verify_web_vendor.mjs",
+    "scripts/web_vendor_manifest.json",
+    "web_src/app.js",
+)
 
 
 def _single(paths: list[Path], description: str) -> Path:
@@ -56,9 +57,9 @@ def _verify_metadata(metadata: Message) -> None:
 def verify_distributions(dist_dir: Path) -> None:
     expected_legal_files = {name: (PROJECT_ROOT / name).read_bytes() for name in LEGAL_FILES}
     expected_web_assets = {name: (PROJECT_ROOT / name).read_bytes() for name in WEB_ASSET_PATHS}
-    for name, expected_digest in REACT_ASSET_DIGESTS.items():
-        if sha256(expected_web_assets[name]).hexdigest() != expected_digest:
-            raise AssertionError(f"bundled React asset digest changed: {name}")
+    expected_build_inputs = {
+        name: (PROJECT_ROOT / name).read_bytes() for name in WEB_BUILD_INPUT_PATHS
+    }
     wheel = _single(list(dist_dir.glob("*.whl")), "wheel")
     sdist = _single(list(dist_dir.glob("*.tar.gz")), "sdist")
     if not wheel.match(f"llmolympic-{VERSION}-*.whl"):
@@ -84,6 +85,9 @@ def verify_distributions(dist_dir: Path) -> None:
         for filename, expected in expected_web_assets.items():
             if filename not in names or archive.read(filename) != expected:
                 raise AssertionError(f"wheel Web asset is missing or changed: {filename}")
+        for filename in LEGACY_REACT_ASSET_PATHS:
+            if filename in names:
+                raise AssertionError(f"wheel contains obsolete standalone React asset: {filename}")
 
     with tarfile.open(sdist, mode="r:gz") as archive:
         members = archive.getmembers()
@@ -119,6 +123,22 @@ def verify_distributions(dist_dir: Path) -> None:
             asset_file = archive.extractfile(str(asset_member))
             if asset_file is None or asset_file.read() != expected:
                 raise AssertionError(f"sdist Web asset is missing or changed: {filename}")
+        member_names = {member.name for member in members}
+        for filename in LEGACY_REACT_ASSET_PATHS:
+            if any(name.endswith(f"/{filename}") for name in member_names):
+                raise AssertionError(f"sdist contains obsolete standalone React asset: {filename}")
+        for filename, expected in expected_build_inputs.items():
+            build_input_member = _single(
+                [
+                    Path(member.name)
+                    for member in members
+                    if member.name.endswith(f"/{filename}")
+                ],
+                f"sdist Web build input {filename}",
+            )
+            build_input_file = archive.extractfile(str(build_input_member))
+            if build_input_file is None or build_input_file.read() != expected:
+                raise AssertionError(f"sdist Web build input is missing or changed: {filename}")
 
     print(f"MIT license metadata, notices, and Web assets verified for llmolympic {VERSION}")
 

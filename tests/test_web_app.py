@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -146,9 +145,10 @@ def test_react_observer_ui_is_same_origin_static_and_hardened(tmp_path: Path) ->
     assert home.status_code == 200
     assert home.headers["content-type"].startswith("text/html")
     assert '<html lang="zh-CN">' in home.text
-    assert 'src="/assets/react.production.min.js"' in home.text
-    assert 'src="/assets/react-dom.production.min.js"' in home.text
     assert 'src="/assets/app.js"' in home.text
+    assert home.text.count("<script ") == 1
+    assert "react.production.min.js" not in home.text
+    assert "react-dom.production.min.js" not in home.text
     assert 'href="/assets/app.css"' in home.text
     assert "http://" not in home.text
     assert "https://" not in home.text
@@ -171,8 +171,6 @@ def test_react_observer_ui_is_same_origin_static_and_hardened(tmp_path: Path) ->
     assets = {
         "/assets/app.css": "text/css",
         "/assets/app.js": "javascript",
-        "/assets/react.production.min.js": "javascript",
-        "/assets/react-dom.production.min.js": "javascript",
     }
     for path, media_type in assets.items():
         response = client.get(path)
@@ -181,20 +179,16 @@ def test_react_observer_ui_is_same_origin_static_and_hardened(tmp_path: Path) ->
         assert response.content
         assert response.headers["x-content-type-options"] == "nosniff"
 
-    app_javascript = client.get("/assets/app.js").text
-    assert "dangerouslySetInnerHTML" not in app_javascript
-    assert ".innerHTML" not in app_javascript
-    assert "requestAnimationFrame(commit)" in app_javascript
-    assert "PUBLIC_ERROR_CODES.has(reason)" in app_javascript
+    assert client.get("/assets/react.production.min.js").status_code == 404
+    assert client.get("/assets/react-dom.production.min.js").status_code == 404
 
-    react = client.get("/assets/react.production.min.js")
-    react_dom = client.get("/assets/react-dom.production.min.js")
-    assert hashlib.sha256(react.content).hexdigest() == (
-        "d949f1c3687aedadcedac85261865f29b17cd273997e7f6b2bfc53b2f9d4c4dd"
-    )
-    assert hashlib.sha256(react_dom.content).hexdigest() == (
-        "35f4f974f4b2bcd44da73963347f8952e341f83909e4498227d4e26b98f66f0d"
-    )
+    # React internals legitimately use low-level DOM APIs after bundling. Keep
+    # the application-authored source free of HTML injection primitives instead.
+    app_source = Path("web_src/app.js").read_text(encoding="utf-8")
+    assert "dangerouslySetInnerHTML" not in app_source
+    assert ".innerHTML" not in app_source
+    assert "requestAnimationFrame(commit)" in app_source
+    assert "PUBLIC_ERROR_CODES.has(reason)" in app_source
 
     api = client.get("/api/v1/games")
     assert api.headers["content-security-policy"].startswith("default-src 'none'")
