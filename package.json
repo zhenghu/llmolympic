@@ -6,6 +6,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "build:web": "node scripts/build_web.mjs",
     "test:web-client": "node tests/web_client_state.js",
     "test:web-e2e": "playwright test --config tests/web_e2e/playwright.config.mjs",
     "verify:web-vendor": "node scripts/verify_web_vendor.mjs"
@@ -13,8 +14,9 @@
   "devDependencies": {
     "@axe-core/playwright": "4.12.1",
     "@playwright/test": "1.62.1",
+    "esbuild": "0.28.2",
     "playwright-core": "1.62.1",
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   }
 }

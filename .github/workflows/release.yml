@@ -115,6 +115,8 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm audit --audit-level=high
+          npm run build:web
+          git diff --exit-code -- llmolympic/web/static/assets/app.js
           npm run verify:web-vendor
           npx --no-install playwright install --with-deps chromium
 
@@ -184,7 +186,7 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${smoke_venv}/bin/llmolympic" web --help
           "${smoke_venv}/bin/python" -c \
-            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assets = root.joinpath('assets'); assert root.joinpath('index.html').is_file(); assert assets.joinpath('app.js').is_file(); assert not assets.joinpath('react.production.min.js').is_file(); assert not assets.joinpath('react-dom.production.min.js').is_file()"
 
       - name: Smoke-test source distribution outside the checkout
         run: |
@@ -234,7 +236,7 @@ jobs:
           cd "${RUNNER_TEMP}"
           "${smoke_venv}/bin/llmolympic" web --help
           "${smoke_venv}/bin/python" -c \
-            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assert root.joinpath('index.html').is_file(); assert root.joinpath('assets', 'app.js').is_file(); assert root.joinpath('assets', 'react-dom.production.min.js').is_file()"
+            "from importlib.resources import files; root = files('llmolympic.web').joinpath('static'); assets = root.joinpath('assets'); assert root.joinpath('index.html').is_file(); assert assets.joinpath('app.js').is_file(); assert not assets.joinpath('react.production.min.js').is_file(); assert not assets.joinpath('react-dom.production.min.js').is_file()"
 
       - name: Browser and axe smoke-test the installed wheel
         shell: bash

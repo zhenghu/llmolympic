@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
 import sqlite3
 import tomllib
@@ -100,6 +101,28 @@ def test_release_documents_match_package_version() -> None:
     security = Path("SECURITY.md").read_text(encoding="utf-8")
     assert f"| `{supported_series}.x` | 支持 |" in security
     assert f"| `<{__version__}`、历史提交和其他功能分支 | 不支持 |" in security
+
+
+def test_react_bundle_build_and_ci_contract() -> None:
+    package = json.loads(Path("package.json").read_text(encoding="utf-8"))
+    assert package["scripts"]["build:web"] == "node scripts/build_web.mjs"
+    assert package["scripts"]["verify:web-vendor"] == "node scripts/verify_web_vendor.mjs"
+    assert package["devDependencies"]["react"] == "19.2.8"
+    assert package["devDependencies"]["react-dom"] == "19.2.8"
+    assert "esbuild" in package["devDependencies"]
+
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = Path(".github/workflows", workflow_name).read_text(encoding="utf-8")
+        build = workflow.index("npm run build:web")
+        verify = workflow.index("npm run verify:web-vendor")
+        distribution = workflow.index("python -m build")
+        assert build < verify < distribution
+
+    codeql = Path(".github/workflows/codeql.yml").read_text(encoding="utf-8")
+    assert "- llmolympic/web/static/assets/app.js" in codeql
+    assert "- web_src/app.js" not in codeql
+    assert "react.production.min.js" not in codeql
+    assert "react-dom.production.min.js" not in codeql
 
 
 def test_version_option_does_not_load_bad_config_or_create_database(

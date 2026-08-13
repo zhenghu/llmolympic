@@ -42,8 +42,9 @@ jobs:
           languages: ${{ matrix.language }}
           config: |
             paths-ignore:
-              - llmolympic/web/static/assets/react.production.min.js
-              - llmolympic/web/static/assets/react-dom.production.min.js
+              # Generated deterministically from web_src/app.js and locked npm
+              # dependencies; analyze the authored source instead of vendor code.
+              - llmolympic/web/static/assets/app.js
 
       - name: Analyze
         uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6

@@ -1,55 +1,86 @@
 # Web vendor supply chain
 
-The observer is self-hosted and has no runtime Node.js or CDN dependency. Node.js and npm are
-used only for browser tests and for verifying that the committed React browser files are exact
-copies of official npm package contents.
+The observer is self-hosted and has no runtime Node.js or CDN dependency. Its single
+same-origin JavaScript file is a production IIFE built from the reviewed source in
+`web_src/app.js` and exact npm package versions. This keeps the browser CSP free of
+third-party origins and runtime module loaders while supporting React 19, which no longer
+publishes the UMD files used by the former copy-based process.
 
-## Recorded source
+## Recorded source and build
 
-The canonical metadata is `scripts/web_vendor_manifest.json`; dependency tarball integrity is
-also locked by `package-lock.json`.
+The canonical provenance record is `scripts/web_vendor_manifest.json`; npm tarball
+integrity is independently locked by `package-lock.json`.
 
-| Bundled asset | Package source | Version | License |
+| Build input | Version | Role | License |
 | --- | --- | --- | --- |
-| `react.production.min.js` | `react` from the npm registry | 18.3.1 | MIT |
-| `react-dom.production.min.js` | `react-dom` from the npm registry | 18.3.1 | MIT |
+| `react` | 19.2.8 | Bundled runtime | MIT |
+| `react-dom` | 19.2.8 | Bundled runtime | MIT |
+| `scheduler` | 0.27.0 | Bundled transitive runtime | MIT |
+| `esbuild` | 0.28.2 | Build-only compiler | MIT |
 
-The upstream MIT text is committed as `llmolympic/web/static/REACT_LICENSE.txt`. The manifest
-records the registry tarball URL, npm SHA-512 integrity value, package-relative source path, and
-SHA-256 digest for every distributed file.
+The manifest records each package's exact version, official registry tarball URL, and npm
+SHA-512 integrity value. It also fixes the complete production build contract: entry and
+output paths, IIFE format, browser platform, ES2020 target, production environment,
+minification, tree shaking, UTF-8 output, disabled source maps, and preservation of upstream
+legal comments at the end of the bundle. The SHA-256 digests of every project-local build input
+and the final bundle are
+recorded as a second, review-friendly integrity layer.
+
+React's complete MIT text is committed as
+`llmolympic/web/static/REACT_LICENSE.txt` and is distributed next to the application assets.
+The corresponding third-party attribution is in `THIRD_PARTY_NOTICES.md`.
 
 ## Reproduce and verify
 
 Use a supported Node.js release, then run:
 
 ```bash
-npm ci
+npm ci --ignore-scripts
 npm run verify:web-vendor
 npm audit --audit-level=high
 ```
 
-The verifier requires all of the following to match before it succeeds:
+`verify:web-vendor` does not trust the committed bundle. It requires all of the following:
 
-1. the exact package version, registry tarball, and integrity value in `package-lock.json`;
-2. the installed npm package version;
-3. the SHA-256 digest of both the npm package file and the distributed file;
-4. byte-for-byte equality between those two files.
+1. every declared package matches the exact version, registry tarball, and integrity value in
+   `package-lock.json`;
+2. direct dependencies are exact pins in both `package.json` and the lockfile root, and every
+   installed package has the declared version;
+3. esbuild's dependency graph contains exactly the declared runtime packages and project-local
+   source files, with no undeclared input;
+4. the local source hashes and the fixed build configuration match the manifest;
+5. a fresh in-memory production build has the declared output SHA-256 and is byte-for-byte
+   identical to `llmolympic/web/static/assets/app.js`.
 
-CI executes these checks. The npm Dependabot entry supplies weekly update and advisory signals
-for both the development tools and the React packages that anchor the bundled bytes.
+To deliberately regenerate the committed bundle after reviewing an input change, run:
+
+```bash
+npm run build:web
+npm run verify:web-vendor
+```
+
+The verifier will fail after a legitimate source or dependency change until the reviewer also
+updates the manifest hashes. CI runs the same reconstruction and comparison, so a hand-edited
+or stale bundle cannot pass merely by changing its recorded digest.
 
 ## Upgrade procedure
 
-1. Review the upstream release and security advisories. React 19 does not publish the same UMD
-   layout, so a major upgrade requires an explicit build and CSP design review.
-2. Install exact versions, for example
-   `npm install --save-dev --save-exact react@VERSION react-dom@VERSION`.
-3. Copy only the intended production browser files from each package into
-   `llmolympic/web/static/assets/`.
-4. Update every field in `scripts/web_vendor_manifest.json`, including SHA-256 values, and verify
-   that `REACT_LICENSE.txt` and `THIRD_PARTY_NOTICES.md` remain accurate.
-5. Run `npm run verify:web-vendor`, the browser E2E suite, Python tests, distribution verification,
-   and the dependency audits before review.
+1. Review the upstream releases, licenses, and security advisories for React, ReactDOM,
+   Scheduler, and esbuild. Treat major React changes as application and CSP design changes.
+2. Install exact direct versions, for example:
 
-Do not replace the files from an unversioned CDN URL or weaken the verifier to accept a digest
-without also matching the locked npm package bytes.
+   ```bash
+   npm install --save-dev --save-exact react@VERSION react-dom@VERSION esbuild@VERSION
+   ```
+
+3. Review `web_src/app.js` and update it for the new public APIs. Do not import code from an
+   unversioned URL or add a runtime CDN dependency.
+4. Update every affected package field and source hash in
+   `scripts/web_vendor_manifest.json`, run `npm run build:web`, and record the resulting bundle
+   SHA-256. Keep `scripts/build_web.mjs` and the manifest build contract identical.
+5. Confirm `REACT_LICENSE.txt` and `THIRD_PARTY_NOTICES.md` remain accurate.
+6. Run `npm run verify:web-vendor`, the browser unit and E2E suites, Python tests,
+   distribution verification, and dependency audits before review.
+
+Do not weaken verification to accept only a committed digest: provenance requires the locked
+npm tarballs, a closed input graph, a fixed production build, and an exact reconstruction.

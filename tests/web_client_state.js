@@ -2,15 +2,7 @@
 
 (() => {
   globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__ = true;
-  globalThis.React = {
-    createElement: () => null,
-  };
-  globalThis.ReactDOM = {
-    createRoot: () => ({ render: () => undefined }),
-  };
-  globalThis.document = {
-    getElementById: () => ({}),
-  };
+  globalThis.__LLMOLYMPIC_SKIP_BOOTSTRAP__ = true;
 
   if (typeof require === "function") {
     require("../llmolympic/web/static/assets/app.js");
