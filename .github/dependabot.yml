@@ -32,3 +32,10 @@ updates:
       web-development:
         patterns:
           - "*"
+        exclude-patterns:
+          - "react"
+          - "react-dom"
+      react-vendor:
+        patterns:
+          - "react"
+          - "react-dom"
