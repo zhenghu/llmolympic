@@ -36,6 +36,7 @@ from llmolympic.core.tournament import (
 from llmolympic.games import create_game
 from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
+from llmolympic.web.live_reader import LiveSQLiteReader
 
 runner = CliRunner()
 
@@ -110,6 +111,12 @@ def test_play_persists_once_and_query_commands_read_same_database(tmp_path) -> N
     matches = store.list_matches()
     assert len(matches) == 1
     assert len(store.leaderboard()) == 2
+    live = LiveSQLiteReader(path).list_live()
+    assert len(live) == 1
+    assert live[0].status == "completed"
+    assert live[0].final_kind == "match"
+    assert live[0].final_id == matches[0].match_id
+    assert live[0].final_match_ids == (matches[0].match_id,)
 
     history = runner.invoke(app, ["history", "--db", str(path)])
     assert history.exit_code == 0
@@ -125,6 +132,57 @@ def test_play_persists_once_and_query_commands_read_same_database(tmp_path) -> N
     assert archive.exit_code == 0
     assert matches[0].match_id in archive.output
     assert "match_finished" in archive.output
+
+
+def test_live_publisher_failure_warns_once_without_affecting_match_or_archive(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "live-failure.db"
+
+    class FailingLivePublisher:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.failed = False
+
+        def start_session(self, *_args, **_kwargs) -> str:
+            return "live-test"
+
+        def publish(self, *_args, **_kwargs) -> bool:
+            self.failed = True
+            raise RuntimeError("injected live failure")
+
+        def complete(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def interrupt(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def close(self) -> None:
+            raise RuntimeError("injected live close failure")
+
+    monkeypatch.setattr("llmolympic.cli.main.LivePublisher", FailingLivePublisher)
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "mock:random,mock:fixed",
+            "--rounds",
+            "1",
+            "--seed",
+            "3",
+            "--db",
+            str(path),
+        ],
+    )
+
+    output = Text.from_ansi(result.output).plain
+    assert result.exit_code == 0, output
+    assert output.count("实时观战不可用") == 1
+    assert "对局已存档" in output
+    assert len(SQLiteStore(path).list_matches()) == 1
 
 
 def test_play_provider_call_budget_aborts_without_archive_or_elo(tmp_path) -> None:
@@ -154,6 +212,10 @@ def test_play_provider_call_budget_aborts_without_archive_or_elo(tmp_path) -> No
     store = SQLiteStore(path)
     assert store.list_matches() == []
     assert store.leaderboard() == []
+    live = LiveSQLiteReader(path).list_live()
+    assert len(live) == 1
+    assert live[0].status == "interrupted"
+    assert live[0].final_id is None
 
 
 def test_play_budget_success_reports_aggregate_usage(tmp_path) -> None:
@@ -330,6 +392,18 @@ def test_gomoku_series_swaps_colors_and_persists_one_fair_elo_batch(tmp_path) ->
     series_archive = store.get_series(series_id)
     assert series_archive is not None
     assert series_archive.points == {"mock:fixed": 2.0, "mock:illegal": 0.0}
+    live_summary = LiveSQLiteReader(path).list_live()[0]
+    live_detail = LiveSQLiteReader(path).load_live(live_summary.live_id)
+    assert live_summary.status == "completed"
+    assert live_summary.final_kind == "series"
+    assert live_summary.final_id == series_id
+    assert live_summary.final_match_ids == tuple(
+        leg.match_id for leg in series_archive.legs
+    )
+    assert {item.context.leg_number for item in live_detail.events} == {1, 2}
+    assert [item.seq for item in live_detail.events] == list(
+        range(len(live_detail.events))
+    )
 
     history = runner.invoke(app, ["history", "--game", "gomoku", "--db", str(path)])
     assert history.exit_code == 0
@@ -461,6 +535,18 @@ def test_round_robin_persists_complete_tournament_and_query_context(tmp_path) ->
     assert len(tournament.pairings) == 3
     assert sum(len(pairing.series.legs) for pairing in tournament.pairings) == 6
     assert all(entry.games_played == 4 for entry in store.leaderboard())
+    live_summary = LiveSQLiteReader(path).list_live()[0]
+    live_detail = LiveSQLiteReader(path).load_live(live_summary.live_id)
+    assert live_summary.status == "completed"
+    assert live_summary.pairing_count == 3
+    assert live_summary.final_kind == "tournament"
+    assert live_summary.final_id == tournament_id
+    assert set(live_summary.final_match_ids) == {row.match_id for row in matches}
+    assert {item.context.pairing_number for item in live_detail.events} == {1, 2, 3}
+    assert {item.context.leg_number for item in live_detail.events} == {1, 2}
+    assert [item.seq for item in live_detail.events] == list(
+        range(len(live_detail.events))
+    )
 
     history = runner.invoke(app, ["history", "--db", str(path)])
     assert history.exit_code == 0

@@ -1,4 +1,4 @@
-"""FastAPI application for local, read-only archived-match observation."""
+"""FastAPI application for local, read-only live and archived observation."""
 
 from __future__ import annotations
 
@@ -17,23 +17,33 @@ from starlette.websockets import WebSocketDisconnect
 
 from llmolympic import __version__
 from llmolympic.games import GAME_REGISTRY
+from llmolympic.web.live_reader import LiveReadError, LiveSQLiteReader
 from llmolympic.web.models import (
     ErrorResponse,
     GameInfo,
     GameListResponse,
     HealthResponse,
     LeaderboardResponse,
+    LiveMatchDetail,
+    LiveMatchListResponse,
     MatchDetail,
     MatchListResponse,
     WSArchiveEnvelope,
     WSCompleteEnvelope,
     WSEventEnvelope,
+    WSLiveCompleteEnvelope,
+    WSLiveEventEnvelope,
+    WSLiveInterruptedEnvelope,
+    WSLiveSnapshotEnvelope,
 )
 from llmolympic.web.reader import MAX_ARCHIVE_EVENTS, WebReadError, WebSQLiteReader
 
 MAX_CONCURRENT_READS = 16
 MAX_CONCURRENT_REPLAYS = 8
+MAX_CONCURRENT_LIVE_STREAMS = 16
 WEBSOCKET_SEND_TIMEOUT_SECONDS = 5.0
+LIVE_POLL_SECONDS = 0.2
+LIVE_PAGE_LIMIT = 256
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _SAFE_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -87,6 +97,12 @@ _DETAIL_ERROR_RESPONSES = {
     413: {"model": ErrorResponse, "description": "Archive exceeds Web limits"},
 }
 
+_LIVE_ERROR_RESPONSES = {
+    400: {"model": ErrorResponse, "description": "Invalid request"},
+    404: {"model": ErrorResponse, "description": "Live session not found"},
+    503: {"model": ErrorResponse, "description": "Live event stream unavailable"},
+}
+
 
 def _error(code: str, status_code: int) -> JSONResponse:
     payload = ErrorResponse(error={"code": code})
@@ -112,6 +128,16 @@ def _public_read_error(exc: WebReadError) -> tuple[str, int]:
     if code == "match_detail_unsupported":
         return "archive_not_replayable", 409
     return "archive_invalid", 503
+
+
+def _public_live_error(exc: LiveReadError) -> tuple[str, int]:
+    if exc.code in {"invalid_game_id", "invalid_limit", "invalid_from_seq"}:
+        return "invalid_request", 400
+    if exc.code == "live_not_found":
+        return exc.code, 404
+    if exc.code == "database_busy":
+        return "database_busy", 503
+    return "live_unavailable", 503
 
 
 def _same_loopback_origin(origin: str | None, host: str | None, scheme: str) -> bool:
@@ -174,8 +200,10 @@ def create_app(database: str | Path) -> FastAPI:
     """Build the optional local observer app without opening the database."""
 
     reader = WebSQLiteReader(database)
+    live_reader = LiveSQLiteReader(database)
     read_slots = asyncio.Semaphore(MAX_CONCURRENT_READS)
     replay_slots = asyncio.Semaphore(MAX_CONCURRENT_REPLAYS)
+    live_slots = asyncio.Semaphore(MAX_CONCURRENT_LIVE_STREAMS)
     static_root = Path(__file__).with_name("static")
     index_path = static_root / "index.html"
     assets_path = static_root / "assets"
@@ -244,6 +272,12 @@ def create_app(database: str | Path) -> FastAPI:
         code, status = _public_read_error(exc)
         return _error(code, status)
 
+    @app.exception_handler(LiveReadError)
+    async def live_read_error_handler(request: Request, exc: LiveReadError) -> JSONResponse:
+        del request
+        code, status = _public_live_error(exc)
+        return _error(code, status)
+
     async def read(callable_: Callable[[], object]) -> object:
         async with read_slots:
             return await run_in_threadpool(callable_)
@@ -257,6 +291,12 @@ def create_app(database: str | Path) -> FastAPI:
     @app.get("/matches/{match_id}", include_in_schema=False, response_class=FileResponse)
     async def observer_match(match_id: str) -> Response:
         if _SAFE_PATH_ID_RE.fullmatch(match_id) is None:
+            return Response(status_code=404)
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get("/live/{live_id}", include_in_schema=False, response_class=FileResponse)
+    async def observer_live(live_id: str) -> Response:
+        if _SAFE_PATH_ID_RE.fullmatch(live_id) is None:
             return Response(status_code=404)
         return FileResponse(index_path, media_type="text/html; charset=utf-8")
 
@@ -302,6 +342,36 @@ def create_app(database: str | Path) -> FastAPI:
             return MatchListResponse.from_storage(rows)
         except (TypeError, ValueError) as exc:
             raise WebReadError("match_index_invalid") from exc
+
+    @app.get(
+        "/api/v1/live",
+        response_model=LiveMatchListResponse,
+        responses=_LIVE_ERROR_RESPONSES,
+    )
+    async def live_matches(
+        game: str | None = Query(default=None, min_length=1, max_length=64),
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> LiveMatchListResponse:
+        if game is not None and _SAFE_GAME_RE.fullmatch(game) is None:
+            return _error("invalid_request", 400)
+        rows = await read(lambda: live_reader.list_live(game=game, limit=limit))
+        return LiveMatchListResponse(matches=tuple(rows))
+
+    @app.get(
+        "/api/v1/live/{live_id}",
+        response_model=LiveMatchDetail,
+        responses=_LIVE_ERROR_RESPONSES,
+    )
+    async def live_match_detail(
+        live_id: str,
+        from_seq: int = Query(default=0, ge=0, le=MAX_ARCHIVE_EVENTS),
+        limit: int = Query(default=LIVE_PAGE_LIMIT, ge=1, le=LIVE_PAGE_LIMIT),
+    ) -> LiveMatchDetail:
+        if _SAFE_PATH_ID_RE.fullmatch(live_id) is None:
+            return _error("invalid_request", 400)
+        return await read(
+            lambda: live_reader.load_live(live_id, from_seq=from_seq, limit=limit)
+        )
 
     @app.get(
         "/api/v1/leaderboard",
@@ -397,6 +467,107 @@ def create_app(database: str | Path) -> FastAPI:
                 )
                 await _send_json(websocket, complete.model_dump(mode="json"))
                 await websocket.close(code=1000)
+            except (TimeoutError, TypeError, ValueError, WebSocketDisconnect):
+                return
+
+    @app.websocket("/ws/v1/live/{live_id}")
+    async def stream_live_match(websocket: WebSocket, live_id: str) -> None:
+        if not _loopback_host_header(websocket.headers.get("host")):
+            await websocket.close(code=4403, reason="invalid_host")
+            return
+        if not _same_loopback_origin(
+            websocket.headers.get("origin"),
+            websocket.headers.get("host"),
+            websocket.url.scheme,
+        ):
+            await websocket.close(code=4403, reason="cross_origin_forbidden")
+            return
+        if _SAFE_PATH_ID_RE.fullmatch(live_id) is None:
+            await websocket.close(code=4400, reason="invalid_request")
+            return
+        raw_from_seq = websocket.query_params.get("from_seq", "0")
+        if not raw_from_seq.isascii() or not raw_from_seq.isdigit() or len(raw_from_seq) > 6:
+            await websocket.close(code=4400, reason="invalid_request")
+            return
+        from_seq = int(raw_from_seq)
+        if from_seq > MAX_ARCHIVE_EVENTS:
+            await websocket.close(code=4400, reason="invalid_request")
+            return
+
+        await websocket.accept()
+        if live_slots.locked():
+            await websocket.close(code=4429, reason="overloaded")
+            return
+
+        async with live_slots:
+            try:
+                first = await read(
+                    lambda: live_reader.load_live(
+                        live_id,
+                        from_seq=from_seq,
+                        limit=LIVE_PAGE_LIMIT,
+                    )
+                )
+            except LiveReadError as exc:
+                code, _status = _public_live_error(exc)
+                close_code = (
+                    4404
+                    if code == "live_not_found"
+                    else 4400
+                    if code == "invalid_request"
+                    else 4403
+                )
+                await websocket.close(code=close_code, reason=code)
+                return
+
+            next_seq = from_seq
+            try:
+                snapshot = WSLiveSnapshotEnvelope(match=first.match, next_seq=from_seq)
+                await _send_json(websocket, snapshot.model_dump(mode="json"))
+                detail = first
+                while True:
+                    for item in detail.events:
+                        if item.seq != next_seq:
+                            raise ValueError("non-contiguous live event page")
+                        envelope = WSLiveEventEnvelope(live_id=live_id, item=item)
+                        await _send_json(websocket, envelope.model_dump(mode="json"))
+                        next_seq += 1
+
+                    summary = detail.match
+                    if next_seq == summary.event_count and summary.status == "completed":
+                        complete = WSLiveCompleteEnvelope(
+                            live_id=live_id,
+                            event_count=summary.event_count,
+                            final_kind=summary.final_kind,
+                            final_id=summary.final_id,
+                            final_match_ids=summary.final_match_ids,
+                        )
+                        await _send_json(websocket, complete.model_dump(mode="json"))
+                        await websocket.close(code=1000)
+                        return
+                    if next_seq == summary.event_count and summary.status == "interrupted":
+                        interrupted = WSLiveInterruptedEnvelope(
+                            live_id=live_id,
+                            event_count=summary.event_count,
+                        )
+                        await _send_json(websocket, interrupted.model_dump(mode="json"))
+                        await websocket.close(code=1000)
+                        return
+                    if not detail.has_more:
+                        await asyncio.sleep(LIVE_POLL_SECONDS)
+                    detail = await read(
+                        lambda _from_seq=next_seq: live_reader.load_live(
+                            live_id,
+                            from_seq=_from_seq,
+                            limit=LIVE_PAGE_LIMIT,
+                        )
+                    )
+            except LiveReadError as exc:
+                code, _status = _public_live_error(exc)
+                await websocket.close(
+                    code=4400 if code == "invalid_request" else 4403,
+                    reason=code,
+                )
             except (TimeoutError, TypeError, ValueError, WebSocketDisconnect):
                 return
 
