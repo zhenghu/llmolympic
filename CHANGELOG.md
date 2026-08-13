@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-13
+
 - Web 观战页升级到 React 19.2.8，并从 React 19 已移除的 UMD 分发切换为同源单文件
   production bundle；构建使用精确锁定的 esbuild，CI 会从已声明源码和 npm 完整性记录
   重新构建并与发行资产逐字节比对，继续保持无 CDN、严格 CSP 和运行时不依赖 Node。
