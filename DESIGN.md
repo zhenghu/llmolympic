@@ -302,6 +302,8 @@ CLI                  Web / WebSocket
    创意双局赛与循环赛 ✅；checkpoint/resume、runner lease、请求证据绑定及深度审计 ✅。
 4. **Web 化 + 锦标赛（进行中）**：4.1 以 FastAPI 提供仅限回环地址的只读 REST、
    排行榜与已完成档案的 WebSocket 事件回放 ✅；4.2 提供随 Python 发行包离线分发的
-   React 观战大厅、ELO 榜、对局详情和可控制事件时间线 ✅。读取层使用 SQLite `mode=ro`，
-   公开协议与内部档案模型隔离。后续切片再加入运行中事件 broker、远程人类输入和锦标赛
+   React 观战大厅、ELO 榜、对局详情和可控制事件时间线 ✅；4.3 以独立 SQLite sidecar
+   提供跨进程运行中事件 broker、连续序号续播、租约中断判定与实时只读页面 ✅。Web 对
+   主档案和直播 sidecar 都只使用 SQLite `mode=ro`，公开协议与内部档案模型隔离；比赛进程
+   的后台发布失败不会拥有比赛、预算或存档控制流。后续切片再加入远程人类输入和锦标赛
    模式；之后新增项目继续保持纯插件接入。

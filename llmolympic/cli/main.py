@@ -11,12 +11,12 @@ import shlex
 import sqlite3
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from itertools import combinations
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Self
 
 import typer
 from rich.console import Console
@@ -92,6 +92,7 @@ from llmolympic.core.usage import (
 )
 from llmolympic.diagnostics import run_diagnostics
 from llmolympic.games import create_game, list_games
+from llmolympic.live import GameMode, LiveFinalKind, LivePublisher
 from llmolympic.providers import create_profile_provider, create_provider
 from llmolympic.providers.base import validate_route_id
 
@@ -402,6 +403,117 @@ def _render_warning() -> None:
         console.print(Text("⚠ 终端显示失败；比赛将继续并优先保存档案。", style="yellow"))
     except Exception:  # noqa: BLE001 - UI failures must never abort persistence
         return
+
+
+def _render_live_warning() -> None:
+    """尽力且不泄密地报告直播 sidecar 故障。"""
+
+    try:
+        console.print(Text("⚠ 实时观战不可用；比赛将继续并优先保存档案。", style="yellow"))
+    except Exception:  # noqa: BLE001 - reporting cannot own match control flow
+        return
+
+
+class _LiveRun:
+    """One failure-isolated live publisher for one top-level CLI run."""
+
+    def __init__(self, database: str | Path, mode: GameMode) -> None:
+        self._publisher: LivePublisher | None = None
+        self._live_id: str | None = None
+        self._terminal = False
+        self._warned = False
+        try:
+            self._publisher = LivePublisher(database, mode)
+            if self._publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - live observation is strictly non-critical
+            self._warn_once()
+
+    def _warn_once(self) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        _render_live_warning()
+
+    def observe(
+        self,
+        event: MatchEvent,
+        *,
+        context: Mapping[str, object] | None = None,
+    ) -> None:
+        publisher = self._publisher
+        if publisher is None or self._terminal:
+            return
+        try:
+            if publisher.failed:
+                self._warn_once()
+                return
+            if self._live_id is None:
+                if event.type != EventType.MATCH_STARTED:
+                    return
+                self._live_id = publisher.start_session(event, context=context)
+                success = self._live_id is not None
+            else:
+                success = publisher.publish(self._live_id, event, context=context)
+            if not success or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - publisher failures must not escape callbacks
+            self._warn_once()
+
+    def complete(
+        self,
+        *,
+        final_kind: LiveFinalKind,
+        final_id: str,
+        final_match_ids: Sequence[str],
+    ) -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            self._terminal = publisher.complete(
+                self._live_id,
+                final_kind=final_kind,
+                final_id=final_id,
+                final_match_ids=final_match_ids,
+            )
+            if not self._terminal or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - archival success cannot depend on live completion
+            self._warn_once()
+
+    def interrupt(self, reason_code: str = "producer_failed") -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            self._terminal = publisher.interrupt(
+                self._live_id,
+                reason_code=reason_code,
+            )
+            if not self._terminal or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - interruption is a best-effort status signal
+            self._warn_once()
+
+    def close(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            publisher.close()
+            if publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - cleanup cannot change match semantics
+            self._warn_once()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None:
+            self.interrupt()
+        self.close()
 
 
 def _best_effort_render(render: Callable[..., None], *args: object) -> None:
@@ -1085,15 +1197,34 @@ async def _run(
     store: SQLiteStore,
     judge_panel: LLMJudgePanel | None = None,
 ) -> None:
-    archive = await play_match(
-        game,
-        players,
-        seed=seed,
-        on_event=_guard_renderer(_render),
-        judge_panel=judge_panel,
-    )
-    result = store.save_match(archive, rating_source="engine")
-    _best_effort_render(_render_saved, archive, store, result)
+    live = _LiveRun(store.path, "play")
+    guarded_render = _guard_renderer(_render)
+    saved = False
+
+    def on_event(event: MatchEvent) -> None:
+        guarded_render(event)
+        live.observe(event)
+
+    try:
+        archive = await play_match(
+            game,
+            players,
+            seed=seed,
+            on_event=on_event,
+            judge_panel=judge_panel,
+        )
+        result = store.save_match(archive, rating_source="engine")
+        saved = True
+        live.complete(
+            final_kind="match",
+            final_id=archive.match_id,
+            final_match_ids=(archive.match_id,),
+        )
+        _best_effort_render(_render_saved, archive, store, result)
+    finally:
+        if not saved:
+            live.interrupt()
+        live.close()
 
 
 def _render_series_summary(series_archive: SeriesArchive) -> None:
@@ -1146,6 +1277,8 @@ async def _run_series(
     store: SQLiteStore,
     judge_panel: LLMJudgePanel | None = None,
 ) -> None:
+    live = _LiveRun(store.path, "series")
+    saved = False
     intro = Text("项目 ")
     intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
     intro.append(" · seed=")
@@ -1175,16 +1308,32 @@ async def _run_series(
         _render(event)
 
     guarded_render_leg = _guard_renderer(render_leg)
-    series_archive = await play_two_leg_series(
-        game,
-        players,
-        seed=seed,
-        on_event=guarded_render_leg,
-        judge_panel=judge_panel,
-    )
-    result = store.save_series(series_archive, rating_source="engine")
-    _best_effort_render(_render_series_summary, series_archive)
-    _best_effort_render(_render_series_saved, series_archive, store, result)
+
+    def on_event(leg_number: int, event: MatchEvent) -> None:
+        guarded_render_leg(leg_number, event)
+        live.observe(event, context={"leg_number": leg_number})
+
+    try:
+        series_archive = await play_two_leg_series(
+            game,
+            players,
+            seed=seed,
+            on_event=on_event,
+            judge_panel=judge_panel,
+        )
+        result = store.save_series(series_archive, rating_source="engine")
+        saved = True
+        live.complete(
+            final_kind="series",
+            final_id=series_archive.series_id,
+            final_match_ids=tuple(leg.match_id for leg in series_archive.legs),
+        )
+        _best_effort_render(_render_series_summary, series_archive)
+        _best_effort_render(_render_series_saved, series_archive, store, result)
+    finally:
+        if not saved:
+            live.interrupt()
+        live.close()
 
 
 def _render_tournament_summary(tournament: TournamentArchive) -> None:
@@ -1416,43 +1565,75 @@ async def _run_round_robin(
     def renew_before_pairing(_spec: object) -> None:
         store.renew_tournament_runner(lease)
 
-    tournament_task = asyncio.create_task(
-        resume_round_robin(
-            game,
-            players,
-            checkpoint,
-            on_event=_guard_renderer(render_pairing),
-            on_checkpoint=save_checkpoint,
-            on_pairing_start=renew_before_pairing,
-            judge_panel=judge_panel,
-        )
-    )
-    heartbeat_stop = asyncio.Event()
-    heartbeat_task = asyncio.create_task(_runner_lease_heartbeat(store, lease, heartbeat_stop))
-    try:
-        done, _ = await asyncio.wait(
-            {tournament_task, heartbeat_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if heartbeat_task in done:
-            heartbeat_error = heartbeat_task.exception()
-            if heartbeat_error is None:
-                raise StorageError("循环赛 runner lease 心跳意外停止")
-            raise heartbeat_error
-        tournament = tournament_task.result()
-    finally:
-        heartbeat_stop.set()
-        if not tournament_task.done():
-            tournament_task.cancel()
-        await asyncio.gather(tournament_task, heartbeat_task, return_exceptions=True)
+    live = _LiveRun(store.path, "round_robin")
+    guarded_render_pairing = _guard_renderer(render_pairing)
+    finalized = False
 
-    renewed_lease = store.renew_tournament_runner(lease)
-    result = store.finalize_tournament_checkpoint(
-        checkpoint.tournament_id,
-        lease=renewed_lease,
-    )
-    _best_effort_render(_render_tournament_summary, tournament)
-    _best_effort_render(_render_tournament_saved, tournament, store, result)
+    def on_event(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
+        guarded_render_pairing(pairing_number, leg_number, event)
+        live.observe(
+            event,
+            context={
+                "pairing_number": pairing_number,
+                "pairing_count": pairing_count,
+                "leg_number": leg_number,
+            },
+        )
+
+    try:
+        tournament_task = asyncio.create_task(
+            resume_round_robin(
+                game,
+                players,
+                checkpoint,
+                on_event=on_event,
+                on_checkpoint=save_checkpoint,
+                on_pairing_start=renew_before_pairing,
+                judge_panel=judge_panel,
+            )
+        )
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            _runner_lease_heartbeat(store, lease, heartbeat_stop)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {tournament_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                heartbeat_error = heartbeat_task.exception()
+                if heartbeat_error is None:
+                    raise StorageError("循环赛 runner lease 心跳意外停止")
+                raise heartbeat_error
+            tournament = tournament_task.result()
+        finally:
+            heartbeat_stop.set()
+            if not tournament_task.done():
+                tournament_task.cancel()
+            await asyncio.gather(tournament_task, heartbeat_task, return_exceptions=True)
+
+        renewed_lease = store.renew_tournament_runner(lease)
+        result = store.finalize_tournament_checkpoint(
+            checkpoint.tournament_id,
+            lease=renewed_lease,
+        )
+        finalized = True
+        live.complete(
+            final_kind="tournament",
+            final_id=tournament.tournament_id,
+            final_match_ids=tuple(
+                leg.match_id
+                for pairing in tournament.pairings
+                for leg in pairing.series.legs
+            ),
+        )
+        _best_effort_render(_render_tournament_summary, tournament)
+        _best_effort_render(_render_tournament_saved, tournament, store, result)
+    finally:
+        if not finalized:
+            live.interrupt()
+        live.close()
 
 
 @app.command()
@@ -2119,7 +2300,7 @@ def serve_web(
         typer.Option("--port", min=1, max=65_535, help="监听端口"),
     ] = 8000,
 ) -> None:
-    """启动本机只读观战 API、观战页与已完成对局的事件回放。"""
+    """启动本机只读观战 API、运行中事件流与已完成对局回放。"""
 
     normalized_host = host.strip().casefold()
     if normalized_host not in LOCAL_WEB_HOSTS:
@@ -2135,7 +2316,7 @@ def serve_web(
     display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
     console.print(f"只读观战页：http://{display_host}:{port}/")
     console.print(f"只读观战 API（健康检查）：http://{display_host}:{port}/api/v1/health")
-    console.print("仅回放已完成并存档的本地引擎对局；按 Ctrl-C 停止。")
+    console.print("可只读观看本机运行中公开事件与已完成存档；按 Ctrl-C 停止。")
     uvicorn.run(
         web_app,
         host=normalized_host,

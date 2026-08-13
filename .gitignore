@@ -22,5 +22,11 @@ node_modules/
 playwright-report/
 test-results/
 
+# 本地运行期实时观战 sidecar（与档案数据库同路径派生）
+*.live.db
+*.live.db-journal
+*.live.db-wal
+*.live.db-shm
+
 # 系统
 .DS_Store

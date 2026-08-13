@@ -79,6 +79,155 @@
   );
   equal(playback, { cursor: 2, playing: false }, "an error stops playback");
 
+  const runningLiveSummary = {
+    live_id: "live-match-43",
+    mode: "play",
+    status: "running",
+    game: "math_quiz",
+    players: ["Alice", "Bob"],
+    started_at: "2026-08-13T12:00:00.000000Z",
+    updated_at: "2026-08-13T12:00:01.000000Z",
+    event_count: 2,
+    pairing_number: null,
+    pairing_count: null,
+    leg_number: null,
+    final_kind: null,
+    final_id: null,
+    final_match_ids: [],
+  };
+  assert(
+    observer.validateLiveSummary(runningLiveSummary, "live-match-43"),
+    "a running single-match summary is accepted",
+  );
+
+  const completedLiveSummary = {
+    ...runningLiveSummary,
+    status: "completed",
+    event_count: 3,
+    final_kind: "match",
+    final_id: "archive-match-43",
+    final_match_ids: ["archive-match-43"],
+  };
+  assert(
+    observer.validateLiveSummary(completedLiveSummary, "live-match-43"),
+    "a completed match with its archive reference is accepted",
+  );
+  assert(
+    observer.validateLiveSummary({
+      ...completedLiveSummary,
+      live_id: "live-series",
+      mode: "series",
+      leg_number: 2,
+      final_kind: "series",
+      final_id: "series-43",
+      final_match_ids: ["series-leg-1", "series-leg-2"],
+    }, "live-series"),
+    "a completed two-leg series is accepted",
+  );
+  assert(
+    observer.validateLiveSummary({
+      ...completedLiveSummary,
+      live_id: "live-tournament",
+      mode: "round_robin",
+      pairing_number: 2,
+      pairing_count: 3,
+      leg_number: 1,
+      final_kind: "tournament",
+      final_id: "tournament-43",
+      final_match_ids: ["m1", "m2", "m3", "m4", "m5", "m6"],
+    }, "live-tournament"),
+    "a completed tournament with all leg archives is accepted",
+  );
+
+  const invalidLiveSummaries = [
+    [{ ...runningLiveSummary, live_id: "other" }, "live-match-43", "wrong live id"],
+    [{ ...runningLiveSummary, mode: "unknown" }, "live-match-43", "unknown mode"],
+    [{ ...runningLiveSummary, status: "finished" }, "live-match-43", "unknown status"],
+    [{ ...runningLiveSummary, game: "bad-game" }, "live-match-43", "invalid game id"],
+    [{ ...runningLiveSummary, players: ["Alice"] }, "live-match-43", "too few players"],
+    [{ ...runningLiveSummary, event_count: 10001 }, "live-match-43", "unbounded event count"],
+    [{ ...runningLiveSummary, leg_number: 1 }, "live-match-43", "play placement"],
+    [{ ...runningLiveSummary, final_id: "partial-archive" }, "live-match-43", "unfinished final metadata"],
+    [{ ...completedLiveSummary, final_kind: "series" }, "live-match-43", "wrong final kind"],
+    [{ ...completedLiveSummary, final_match_ids: ["other"] }, "live-match-43", "mismatched match archive"],
+    [{
+      ...completedLiveSummary,
+      live_id: "bad-series",
+      mode: "series",
+      final_kind: "series",
+      final_id: "series-43",
+      final_match_ids: ["only-one-leg"],
+    }, "bad-series", "incomplete series archives"],
+    [{
+      ...completedLiveSummary,
+      live_id: "bad-tournament",
+      mode: "round_robin",
+      pairing_number: 4,
+      pairing_count: 3,
+      leg_number: 1,
+      final_kind: "tournament",
+      final_id: "tournament-43",
+      final_match_ids: ["m1", "m2", "m3", "m4", "m5", "m6"],
+    }, "bad-tournament", "pairing outside tournament"],
+  ];
+  invalidLiveSummaries.forEach(([summary, liveId, reason]) => {
+    assert(!observer.validateLiveSummary(summary, liveId), `live summary rejects ${reason}`);
+  });
+
+  const liveItem = {
+    seq: 7,
+    context: {
+      pairing_number: 2,
+      leg_number: 1,
+      match_event_seq: 0,
+    },
+    event: {
+      seq: 0,
+      type: "match_started",
+      timestamp: "2026-08-13T12:00:00.000000Z",
+      player: null,
+      data: {
+        game: "math_quiz",
+        seed: 43,
+        game_config: { rounds: 1 },
+        players: ["Alice", "Bob"],
+      },
+    },
+  };
+  assert(observer.validateLiveItem(liveItem, 7), "a valid live broker item is accepted");
+  assert(
+    !observer.validateLiveItem({ ...liveItem, seq: 8 }, 7),
+    "a broker sequence mismatch is rejected",
+  );
+  assert(
+    !observer.validateLiveItem({
+      ...liveItem,
+      context: { ...liveItem.context, match_event_seq: 1 },
+    }, 7),
+    "a match event sequence mismatch is rejected",
+  );
+  assert(
+    !observer.validateLiveItem({
+      ...liveItem,
+      context: { pairing_number: 2, leg_number: null, match_event_seq: 0 },
+    }, 7),
+    "a tournament pairing without a leg is rejected",
+  );
+  assert(
+    !observer.validateLiveItem({
+      ...liveItem,
+      event: { ...liveItem.event, type: "provider_secret" },
+    }, 7),
+    "an unknown public event type is rejected",
+  );
+  assert(
+    !observer.validateLiveItem({
+      ...liveItem,
+      event: { ...liveItem.event, timestamp: null },
+    }, 7),
+    "a malformed public event is rejected",
+  );
+
   if (typeof console !== "undefined" && console.log) {
     console.log("observer client state tests passed");
   } else if (typeof print === "function") {

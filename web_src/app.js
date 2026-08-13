@@ -37,6 +37,8 @@ const ERROR_COPY = {
   database_unavailable: "无法读取本地数据库。请确认数据库存在且版本兼容。",
   invalid_host: "当前地址不受支持，请使用命令行显示的本机地址。",
   invalid_request: "请求无效，请返回观战大厅后重试。",
+  live_not_found: "这场运行中的比赛不存在，或直播保留期已经结束。",
+  live_unavailable: "本机实时事件流暂时不可用，比赛本身不受影响。",
   match_not_found: "对局不存在，或已经不再可用。",
   network_error: "与本机观战服务的连接中断。",
   overloaded: "回放服务正忙，请稍后重试。",
@@ -246,7 +248,7 @@ function Header({ health }) {
       h(
         "div",
         { className: "status-cluster" },
-        h("span", { className: "status-pill local" }, "本机 · 只读"),
+        h("span", { className: "status-pill local" }, "本机 · 只读观战"),
         h(StatusPill, { health }),
       ),
     ),
@@ -413,6 +415,76 @@ function Leaderboard({ data, loading, error, onRetry }) {
   );
 }
 
+function modeLabel(mode) {
+  if (mode === "series") return "双局赛";
+  if (mode === "round_robin") return "循环赛";
+  return "单场对局";
+}
+
+function liveStatusLabel(status) {
+  if (status === "completed") return "已完成并存档";
+  if (status === "interrupted") return "直播已中断";
+  return "正在进行";
+}
+
+function LiveMatchCard({ match }) {
+  const context = match.mode === "round_robin" && match.pairing_number
+    ? `第 ${match.pairing_number}/${match.pairing_count || "?"} 组 · 第 ${match.leg_number || "?"} 局`
+    : match.mode === "series" && match.leg_number
+      ? `第 ${match.leg_number}/2 局`
+      : `${match.event_count} 条事件`;
+  return h(
+    AppLink,
+    {
+      className: `live-card ${match.status}`,
+      href: `/live/${encodeURIComponent(match.live_id)}`,
+      "aria-label": `${gameLabel(match.game)}，${match.players.join(" 对 ")}，${liveStatusLabel(match.status)}`,
+    },
+    h("span", { className: "live-pulse", "aria-hidden": "true" }),
+    h("span", { className: "game-badge" }, gameLabel(match.game)),
+    h("span", { className: "live-card-copy" },
+      h("strong", null, match.players.join(" 对 ")),
+      h("span", { className: "meta" }, `${modeLabel(match.mode)} · ${context}`),
+    ),
+    h("span", { className: "live-card-status" }, liveStatusLabel(match.status)),
+    h("span", { className: "match-arrow", "aria-hidden": "true" }, "→"),
+  );
+}
+
+function LiveMatches({ data, loading, error, onRetry }) {
+  const matches = data && Array.isArray(data.matches) ? data.matches : [];
+  let body;
+  if (loading && !data) {
+    body = h(LoadingRows, { count: 1 });
+  } else if (error && !data) {
+    body = h(StateCard, {
+      title: "实时事件流暂不可用",
+      copy: errorCopy(error),
+      error: true,
+      action: h("button", { className: "button small", onClick: onRetry }, "重试"),
+    });
+  } else if (!matches.length) {
+    body = h(StateCard, {
+      title: "当前没有运行中的比赛",
+      copy: "启动 play、series 或 round-robin 后，公开事件会自动出现在这里；比赛进程不依赖观战页。",
+    });
+  } else {
+    body = h("div", { className: "live-list" }, ...matches.map((match) => h(LiveMatchCard, {
+      key: match.live_id,
+      match,
+    })));
+  }
+  return h(
+    "section",
+    { className: "panel live-panel", "aria-labelledby": "live-heading" },
+    h("div", { className: "panel-head" },
+      h("h2", { id: "live-heading" }, "实时观战"),
+      h("span", { className: "panel-kicker" }, "每 2 秒发现本机运行"),
+    ),
+    h("div", { className: "panel-body" }, body),
+  );
+}
+
 function Lobby({ health, games, initialGame, refreshAll }) {
   const [game, setGame] = useState(initialGame);
   const [limit, setLimit] = useState(20);
@@ -423,6 +495,9 @@ function Lobby({ health, games, initialGame, refreshAll }) {
   const [leaderboardError, setLeaderboardError] = useState(null);
   const [matchesLoading, setMatchesLoading] = useState(true);
   const [leaderboardLoading, setLeaderboardLoading] = useState(true);
+  const [liveData, setLiveData] = useState(null);
+  const [liveError, setLiveError] = useState(null);
+  const [liveLoading, setLiveLoading] = useState(true);
 
   const retry = useCallback(() => setRefreshKey((value) => value + 1), []);
 
@@ -449,6 +524,39 @@ function Lobby({ health, games, initialGame, refreshAll }) {
     return () => controller.abort();
   }, [game, limit, refreshKey]);
 
+  useEffect(() => {
+    let cancelled = false;
+    let controller = null;
+    const load = () => {
+      if (cancelled || document.visibilityState === "hidden") return;
+      if (controller) controller.abort();
+      controller = new AbortController();
+      const query = game ? `&game=${encodeURIComponent(game)}` : "";
+      setLiveLoading(true);
+      fetchJSON(`/api/v1/live?limit=20${query}`, controller.signal)
+        .then((payload) => {
+          if (!cancelled) {
+            setLiveData(payload);
+            setLiveError(null);
+          }
+        })
+        .catch((error) => {
+          if (!cancelled && error.name !== "AbortError") setLiveError(error);
+        })
+        .finally(() => { if (!cancelled) setLiveLoading(false); });
+    };
+    load();
+    const timer = window.setInterval(load, 2000);
+    const onVisibility = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (controller) controller.abort();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [game, refreshKey]);
+
   const chooseGame = (value) => {
     setGame(value);
     setLimit(20);
@@ -473,9 +581,9 @@ function Lobby({ health, games, initialGame, refreshAll }) {
       h(
         "div",
         null,
-        h("p", { className: "eyebrow" }, "COMPLETED MATCH ARCHIVE"),
+        h("p", { className: "eyebrow" }, "LIVE + ARCHIVE OBSERVER"),
         h("h1", { id: "lobby-title" }, "每一场模型较量，都有迹可循。"),
-        h("p", { className: "hero-copy" }, "浏览本机已经完成并存档的比赛、ELO 排名与事件回放。这里不是运行中比赛的直播，也不会连接任何模型服务。"),
+        h("p", { className: "hero-copy" }, "只读观看本机正在运行的比赛，或浏览已经完成并存档的比赛、ELO 排名与事件回放。页面不会连接模型服务或提交落子。"),
       ),
       h("div", { className: "hero-stat", "aria-label": `当前显示 ${matchCount} 场对局` },
         h("strong", null, matchesLoading ? "—" : String(matchCount).padStart(2, "0")),
@@ -498,6 +606,12 @@ function Lobby({ health, games, initialGame, refreshAll }) {
       ),
       h("button", { className: "button", type: "button", onClick: refresh }, "↻", " 刷新数据"),
     ),
+    h(LiveMatches, {
+      data: liveData,
+      error: liveError,
+      loading: liveLoading,
+      onRetry: retry,
+    }),
     health && health.status === "degraded"
       ? h(StateCard, { title: "数据库暂不可用", copy: ERROR_COPY.database_unavailable, error: true, action: h("button", { className: "button small", onClick: refresh }, "重新检查") })
       : h(
@@ -751,6 +865,333 @@ function useArchiveReplay(matchId, reloadKey) {
   return state;
 }
 
+function validateLiveSummary(summary, liveId) {
+  if (
+    !isObject(summary)
+    || summary.live_id !== liveId
+    || !["play", "series", "round_robin"].includes(summary.mode)
+    || !["running", "completed", "interrupted"].includes(summary.status)
+    || typeof summary.game !== "string"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(summary.game)
+    || !Array.isArray(summary.players)
+    || summary.players.length < 2
+    || summary.players.some((player) => typeof player !== "string" || !player)
+    || !Number.isInteger(summary.event_count)
+    || summary.event_count < 0
+    || summary.event_count > 10000
+  ) return false;
+  const placement = ["pairing_number", "pairing_count", "leg_number"];
+  if (placement.some((key) => summary[key] !== null
+    && summary[key] !== undefined
+    && (!Number.isInteger(summary[key]) || summary[key] < 1))) return false;
+  if (summary.mode === "play" && placement.some((key) => summary[key] != null)) return false;
+  if (summary.mode === "series" && (summary.pairing_number != null || summary.pairing_count != null)) return false;
+  if (summary.mode === "round_robin" && !Number.isInteger(summary.pairing_count)) return false;
+  if (summary.pairing_number != null
+    && (summary.pairing_count == null || summary.pairing_number > summary.pairing_count)) return false;
+
+  const expectedFinalKind = {
+    play: "match",
+    round_robin: "tournament",
+    series: "series",
+  }[summary.mode];
+  const ids = summary.final_match_ids;
+  if (summary.status !== "completed") {
+    return summary.final_kind == null
+      && summary.final_id == null
+      && Array.isArray(ids)
+      && ids.length === 0;
+  }
+  if (
+    summary.final_kind !== expectedFinalKind
+    || typeof summary.final_id !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(summary.final_id)
+    || !Array.isArray(ids)
+    || !ids.length
+    || ids.some((id) => typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id))
+    || new Set(ids).size !== ids.length
+  ) return false;
+  if (summary.mode === "play") return ids.length === 1 && ids[0] === summary.final_id;
+  if (summary.mode === "series") return ids.length === 2;
+  return ids.length === summary.pairing_count * 2;
+}
+
+function validateLiveItem(item, expectedSeq) {
+  if (!(isObject(item)
+    && item.seq === expectedSeq
+    && isObject(item.context)
+    && Number.isInteger(item.context.match_event_seq)
+    && item.context.match_event_seq >= 0
+    && (item.context.leg_number == null
+      || (Number.isInteger(item.context.leg_number) && item.context.leg_number >= 1))
+    && (item.context.pairing_number == null
+      || (Number.isInteger(item.context.pairing_number) && item.context.pairing_number >= 1))
+    && (item.context.pairing_number == null || item.context.leg_number != null)
+    && validatePublicEvent(item.event, item.context.match_event_seq))) return false;
+  const allowedContext = new Set(["leg_number", "match_event_seq", "pairing_number"]);
+  return Object.keys(item.context).every((key) => allowedContext.has(key));
+}
+
+function publicEventFromLiveItem(item) {
+  return {
+    ...item.event,
+    context: item.context,
+    match_event_seq: item.context.match_event_seq,
+    seq: item.seq,
+  };
+}
+
+function liveWebsocketURL(liveId, fromSeq) {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}/ws/v1/live/${encodeURIComponent(liveId)}?from_seq=${fromSeq}`;
+}
+
+function useLiveStream(liveId, reloadKey) {
+  const [state, setState] = useState({
+    error: null,
+    events: [],
+    finalId: null,
+    finalKind: null,
+    finalMatchIds: [],
+    phase: "connecting",
+    retries: 0,
+    source: "websocket",
+    summary: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    let socket = null;
+    let retryTimer = null;
+    let pollTimer = null;
+    let retryCount = 0;
+    let terminal = false;
+    let summary = null;
+    let nextSeq = 0;
+    let events = [];
+    let finalKind = null;
+    let finalId = null;
+    let finalMatchIds = [];
+    let publishFrame = null;
+    let pendingPatch = {};
+
+    const commit = () => {
+      publishFrame = null;
+      if (cancelled) return;
+      const patch = pendingPatch;
+      pendingPatch = {};
+      setState((previous) => ({
+        ...previous,
+        ...patch,
+        events: events.slice(),
+        finalId,
+        finalKind,
+        finalMatchIds: finalMatchIds.slice(),
+        retries: retryCount,
+        summary,
+      }));
+    };
+
+    const publish = (patch = {}, immediate = false) => {
+      if (cancelled) return;
+      pendingPatch = { ...pendingPatch, ...patch };
+      if (immediate) {
+        if (publishFrame !== null) window.cancelAnimationFrame(publishFrame);
+        commit();
+      } else if (publishFrame === null) {
+        publishFrame = window.requestAnimationFrame(commit);
+      }
+    };
+
+    const fail = (code) => {
+      terminal = true;
+      publish({ error: new PublicError(code), phase: "error" }, true);
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    };
+
+    const acceptSummary = (candidate) => {
+      if (!validateLiveSummary(candidate, liveId) || candidate.event_count < nextSeq) {
+        throw new PublicError("protocol_error");
+      }
+      summary = candidate;
+      if (candidate.status === "completed") {
+        finalKind = candidate.final_kind;
+        finalId = candidate.final_id;
+        finalMatchIds = Array.isArray(candidate.final_match_ids)
+          ? candidate.final_match_ids.slice()
+          : [];
+      }
+    };
+
+    const appendItems = (items) => {
+      if (!Array.isArray(items)) throw new PublicError("protocol_error");
+      items.forEach((item) => {
+        if (Number.isInteger(item && item.seq) && item.seq < nextSeq) {
+          const prior = events[item.seq];
+          if (JSON.stringify(prior) !== JSON.stringify(publicEventFromLiveItem(item))) {
+            throw new PublicError("protocol_error");
+          }
+          return;
+        }
+        if (!validateLiveItem(item, nextSeq)) throw new PublicError("protocol_error");
+        events.push(publicEventFromLiveItem(item));
+        nextSeq += 1;
+      });
+    };
+
+    const schedulePoll = (delay = 1000) => {
+      if (!cancelled && !terminal) pollTimer = window.setTimeout(poll, delay);
+    };
+
+    const poll = async () => {
+      if (cancelled || terminal) return;
+      publish({ error: null, phase: "polling", source: "rest" }, true);
+      try {
+        const detail = await fetchJSON(
+          `/api/v1/live/${encodeURIComponent(liveId)}?from_seq=${nextSeq}&limit=256`,
+        );
+        acceptSummary(detail.match);
+        appendItems(detail.events);
+        if (!Number.isInteger(detail.next_seq) || detail.next_seq !== nextSeq) {
+          throw new PublicError("protocol_error");
+        }
+        if (typeof detail.has_more !== "boolean"
+          || detail.has_more !== (nextSeq < summary.event_count)) {
+          throw new PublicError("protocol_error");
+        }
+        if (summary.status === "completed" && nextSeq === summary.event_count) {
+          terminal = true;
+          publish({ phase: "completed", source: "rest" }, true);
+          return;
+        }
+        if (summary.status === "interrupted" && nextSeq === summary.event_count) {
+          terminal = true;
+          publish({ phase: "interrupted", source: "rest" }, true);
+          return;
+        }
+        publish({ phase: "polling", source: "rest" });
+        schedulePoll(detail.has_more ? 0 : 1000);
+      } catch (error) {
+        if (cancelled || (error && error.name === "AbortError")) return;
+        const publicError = error instanceof PublicError ? error : new PublicError("network_error");
+        if (["live_not_found", "invalid_request", "protocol_error"].includes(publicError.code)) {
+          fail(publicError.code);
+          return;
+        }
+        publish({ error: publicError, phase: "polling", source: "rest" }, true);
+        schedulePoll(2000);
+      }
+    };
+
+    const connect = () => {
+      if (cancelled || terminal) return;
+      if (!("WebSocket" in window)) {
+        poll();
+        return;
+      }
+      publish({ error: null, phase: retryCount ? "retrying" : "connecting", source: "websocket" }, true);
+      socket = new WebSocket(liveWebsocketURL(liveId, nextSeq));
+      socket.onopen = () => publish({ phase: "live" }, true);
+      socket.onmessage = (message) => {
+        if (cancelled || terminal) return;
+        let envelope;
+        try {
+          envelope = JSON.parse(message.data);
+          if (!isObject(envelope) || envelope.api_version !== API_VERSION) {
+            throw new PublicError("protocol_error");
+          }
+          if (envelope.type === "live_snapshot") {
+            acceptSummary(envelope.match);
+            if (!Number.isInteger(envelope.next_seq) || envelope.next_seq !== nextSeq) {
+              throw new PublicError("protocol_error");
+            }
+            publish({ phase: "live" }, true);
+            return;
+          }
+          if (envelope.type === "live_event") {
+            if (envelope.live_id !== liveId) throw new PublicError("protocol_error");
+            appendItems([envelope.item]);
+            publish({ phase: "live" });
+            return;
+          }
+          if (envelope.type === "live_complete") {
+            if (!summary
+              || envelope.live_id !== liveId
+              || envelope.event_count !== nextSeq) {
+              throw new PublicError("protocol_error");
+            }
+            const completedSummary = {
+              ...summary,
+              final_id: envelope.final_id,
+              final_kind: envelope.final_kind,
+              final_match_ids: envelope.final_match_ids,
+              status: "completed",
+            };
+            if (!validateLiveSummary(completedSummary, liveId)) {
+              throw new PublicError("protocol_error");
+            }
+            finalKind = completedSummary.final_kind;
+            finalId = completedSummary.final_id;
+            finalMatchIds = completedSummary.final_match_ids.slice();
+            terminal = true;
+            summary = completedSummary;
+            publish({ phase: "completed" }, true);
+            return;
+          }
+          if (envelope.type === "live_interrupted") {
+            if (envelope.live_id !== liveId || envelope.event_count !== nextSeq) {
+              throw new PublicError("protocol_error");
+            }
+            terminal = true;
+            if (summary) summary = { ...summary, status: "interrupted" };
+            publish({ phase: "interrupted" }, true);
+            return;
+          }
+          throw new PublicError("protocol_error");
+        } catch (error) {
+          fail(error instanceof PublicError ? error.code : "protocol_error");
+        }
+      };
+      socket.onclose = (event) => {
+        if (cancelled || terminal) return;
+        const decision = classifyReplayClose(event.code, event.reason, retryCount, false);
+        if (decision.action === "retry") {
+          retryCount += 1;
+          publish({ phase: "retrying" }, true);
+          retryTimer = window.setTimeout(connect, decision.delay);
+        } else if (decision.action === "error") {
+          fail(decision.code === "match_not_found" ? "live_not_found" : decision.code);
+        } else {
+          poll();
+        }
+      };
+    };
+
+    setState({
+      error: null,
+      events: [],
+      finalId: null,
+      finalKind: null,
+      finalMatchIds: [],
+      phase: "connecting",
+      retries: 0,
+      source: "websocket",
+      summary: null,
+    });
+    connect();
+    return () => {
+      cancelled = true;
+      terminal = true;
+      if (publishFrame !== null) window.cancelAnimationFrame(publishFrame);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "page_changed");
+    };
+  }, [liveId, reloadKey]);
+
+  return state;
+}
+
 function scoreRows(summary) {
   if (!summary) return null;
   const known = new Set(summary.players);
@@ -828,7 +1269,15 @@ function Timeline({ events, cursor }) {
         "div",
         { className: "event-content" },
         h("div", { className: "event-head" },
-          h("strong", null, EVENT_LABELS[event.type]),
+          h("strong", null,
+            EVENT_LABELS[event.type],
+            event.context && (event.context.pairing_number || event.context.leg_number)
+              ? h("span", { className: "event-context" },
+                event.context.pairing_number ? ` · 第 ${event.context.pairing_number} 组` : "",
+                event.context.leg_number ? ` · 第 ${event.context.leg_number} 局` : "",
+              )
+              : null,
+          ),
           h("time", { dateTime: event.timestamp }, dateTime(event.timestamp)),
         ),
         event.player ? h("p", { className: "event-player" }, event.player) : null,
@@ -966,6 +1415,86 @@ function ReplayViewer({ replay }) {
   );
 }
 
+function LiveViewer({ stream }) {
+  const [cursor, setCursor] = useState(0);
+  const [following, setFollowing] = useState(true);
+
+  useEffect(() => {
+    if (following) setCursor(stream.events.length);
+  }, [following, stream.events.length]);
+
+  const terminal = stream.phase === "completed" || stream.phase === "interrupted";
+  const status = stream.phase === "completed"
+    ? "比赛已完成并存档"
+    : stream.phase === "interrupted"
+      ? "比赛进程或直播发布已中断"
+      : stream.phase === "retrying"
+        ? `连接中断，正在续播（${stream.retries}/3）`
+        : stream.phase === "polling"
+          ? "WebSocket 不可用，正在只读轮询"
+          : stream.phase === "connecting"
+            ? "正在连接实时事件流"
+            : following
+              ? "正在跟随直播"
+              : `已暂停显示，仍在接收（积压 ${stream.events.length - cursor} 条）`;
+
+  const pauseOrFollow = () => {
+    if (following) {
+      setFollowing(false);
+    } else {
+      setCursor(stream.events.length);
+      setFollowing(true);
+    }
+  };
+
+  return h(
+    "section",
+    { className: "panel replay-panel", "aria-labelledby": "live-timeline-heading", tabIndex: 0 },
+    h("div", { className: "panel-head" },
+      h("h2", { id: "live-timeline-heading" }, "实时事件"),
+      h("span", {
+        "aria-atomic": "true",
+        "aria-live": "polite",
+        className: `replay-status${stream.phase === "interrupted" ? " error" : terminal ? " done" : " live"}`,
+      }, status),
+    ),
+    h("div", { className: "controls", "aria-label": "直播显示控制" },
+      h("div", { className: "control-row" },
+        h("button", {
+          className: "button primary small",
+          disabled: !stream.events.length || terminal,
+          onClick: pauseOrFollow,
+          type: "button",
+        }, following ? "暂停显示" : "跟随直播"),
+        h("button", {
+          className: "button small",
+          disabled: cursor <= 0,
+          onClick: () => { setFollowing(false); setCursor((value) => Math.max(0, value - 1)); },
+          type: "button",
+        }, "上一条"),
+        h("button", {
+          className: "button small",
+          disabled: cursor >= stream.events.length,
+          onClick: () => {
+            const next = Math.min(stream.events.length, cursor + 1);
+            setCursor(next);
+            setFollowing(next === stream.events.length);
+          },
+          type: "button",
+        }, "下一条"),
+        h("button", {
+          className: "button small",
+          disabled: cursor >= stream.events.length,
+          onClick: () => { setCursor(stream.events.length); setFollowing(true); },
+          type: "button",
+        }, "回到最新"),
+        h("span", { className: "progress-count" }, `${cursor} / ${stream.events.length}`),
+      ),
+    ),
+    h(Timeline, { cursor, events: stream.events }),
+  );
+}
+
 function MatchFacts({ summary, replay }) {
   const facts = [
     ["项目", gameLabel(summary.game)],
@@ -1040,6 +1569,106 @@ function MatchDetailPage({ matchId }) {
   );
 }
 
+function LiveFacts({ stream, summary }) {
+  const facts = [
+    ["项目", gameLabel(summary.game)],
+    ["运行模式", modeLabel(summary.mode)],
+    ["开始时间", dateTime(summary.started_at, true)],
+    ["最新事件", `${summary.event_count} 条`],
+    ["传输", stream.source === "rest" ? "REST 只读轮询" : "WebSocket 同源直播"],
+    ["状态", liveStatusLabel(summary.status)],
+  ];
+  if (summary.pairing_number) facts.push(["当前对阵", `${summary.pairing_number}/${summary.pairing_count || "?"}`]);
+  if (summary.leg_number) facts.push(["当前局", String(summary.leg_number)]);
+  return h(
+    "aside",
+    { "aria-label": "运行中比赛信息" },
+    h("dl", { className: "facts" }, ...facts.map(([label, value]) => h(
+      "div",
+      { className: "fact", key: label },
+      h("dt", null, label),
+      h("dd", null, value),
+    ))),
+    h("p", { className: "notice" }, "只读事件来自本机比赛进程的公开 sidecar。观战页不会调用模型、提交动作、更新 ELO 或读取 Provider 路由与凭据。"),
+  );
+}
+
+function LiveDetailPage({ liveId }) {
+  const [reloadKey, setReloadKey] = useState(0);
+  const stream = useLiveStream(liveId, reloadKey);
+  const summary = stream.summary;
+
+  if (stream.phase === "error" && !summary) {
+    return h(
+      "main",
+      { className: "page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回观战大厅"),
+      h(StateCard, {
+        title: "无法打开实时观战",
+        copy: errorCopy(stream.error),
+        error: true,
+        action: h("button", { className: "button", onClick: () => setReloadKey((value) => value + 1) }, "重新连接"),
+      }),
+    );
+  }
+
+  if (!summary) {
+    return h(
+      "main",
+      { className: "page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回观战大厅"),
+      h("section", { className: "panel" }, h("div", { className: "panel-body" }, h(LoadingRows, { count: 4 }))),
+    );
+  }
+
+  const archiveLinks = stream.phase === "completed" && stream.finalMatchIds.length
+    ? h(
+      "div",
+      { className: "archive-actions" },
+      h("strong", null, "完整档案已安全提交"),
+      ...stream.finalMatchIds.map((matchId, index) => h(
+        AppLink,
+        { className: "button primary small", href: `/matches/${encodeURIComponent(matchId)}`, key: matchId },
+        stream.finalMatchIds.length === 1 ? "打开存档回放" : `打开第 ${index + 1} 场存档`,
+      )),
+    )
+    : null;
+
+  return h(
+    "main",
+    { className: "page", id: "main-content", tabIndex: -1 },
+    h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回观战大厅"),
+    h("section", { className: "detail-hero live-detail-hero", "aria-labelledby": "live-detail-title" },
+      h("div", null,
+        h("p", { className: "eyebrow" }, `${gameLabel(summary.game)} · LIVE EVENTS`),
+        h("h1", { className: "detail-title", id: "live-detail-title" }, summary.players.join(" 对 ")),
+        h("p", { className: "id-line" }, summary.live_id),
+      ),
+      h("div", { className: `live-stage ${summary.status}` },
+        h("span", { className: "live-pulse", "aria-hidden": "true" }),
+        h("strong", null, liveStatusLabel(summary.status)),
+        h("span", null, `${summary.event_count} 条公开事件`),
+      ),
+    ),
+    stream.error ? h(StateCard, {
+      title: "实时连接异常",
+      copy: errorCopy(stream.error),
+      error: true,
+      action: h("button", { className: "button", onClick: () => setReloadKey((value) => value + 1) }, "重新连接"),
+    }) : null,
+    stream.phase === "interrupted" ? h(StateCard, {
+      title: "这次直播已中断",
+      copy: "比赛进程可能退出，或实时发布因本机资源限制而安全降级；已收到的公开事件仍可查看。",
+      error: true,
+    }) : null,
+    archiveLinks,
+    h("div", { className: "replay-layout" },
+      h(LiveViewer, { stream }),
+      h(LiveFacts, { stream, summary }),
+    ),
+  );
+}
+
 function parseRoute() {
   if (window.location.pathname === "/") {
     const candidate = new URLSearchParams(window.location.search).get("game");
@@ -1047,11 +1676,14 @@ function parseRoute() {
     return { name: "lobby", game };
   }
   const match = window.location.pathname.match(/^\/matches\/([^/]+)$/);
-  if (!match) return { name: "not-found" };
+  const live = window.location.pathname.match(/^\/live\/([^/]+)$/);
+  if (!match && !live) return { name: "not-found" };
   try {
-    const id = decodeURIComponent(match[1]);
+    const id = decodeURIComponent((match || live)[1]);
     return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)
-      ? { name: "match", matchId: id }
+      ? match
+        ? { name: "match", matchId: id }
+        : { name: "live", liveId: id }
       : { name: "not-found" };
   } catch (_error) {
     return { name: "not-found" };
@@ -1076,7 +1708,9 @@ function App() {
       ? "LLM Olympics · 观战台"
       : route.name === "match"
         ? "对局回放 · LLM Olympics"
-        : "页面不存在 · LLM Olympics";
+        : route.name === "live"
+          ? "实时观战 · LLM Olympics"
+          : "页面不存在 · LLM Olympics";
     if (firstRoute.current) {
       firstRoute.current = false;
       return undefined;
@@ -1086,7 +1720,7 @@ function App() {
       if (main) main.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [route.game, route.name, route.matchId]);
+  }, [route.game, route.liveId, route.name, route.matchId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1109,6 +1743,8 @@ function App() {
     });
   } else if (route.name === "match") {
     content = h(MatchDetailPage, { matchId: route.matchId });
+  } else if (route.name === "live") {
+    content = h(LiveDetailPage, { liveId: route.liveId });
   } else {
     content = h("main", { className: "page", id: "main-content", tabIndex: -1 },
       h(StateCard, {
@@ -1123,7 +1759,9 @@ function App() {
     ? `已打开观战大厅${route.game ? `，筛选${gameLabel(route.game)}` : ""}`
     : route.name === "match"
       ? "已打开对局回放"
-      : "页面不存在";
+      : route.name === "live"
+        ? "已打开实时观战"
+        : "页面不存在";
   const healthAnnouncement = health
     ? (health.status === "ok" ? "数据库可用" : "数据库不可用")
     : "正在检查数据库";
@@ -1134,7 +1772,7 @@ function App() {
     h(Header, { health }),
     content,
     h("div", { className: "live-region", "aria-atomic": "true", "aria-live": "polite" }, `${routeAnnouncement}。${healthAnnouncement}`),
-    h("footer", { className: "footer" }, "LLM Olympics · 本机只读观战 · 已完成存档回放"),
+    h("footer", { className: "footer" }, "LLM Olympics · 本机只读观战 · 实时事件与已完成存档"),
   );
 }
 
@@ -1142,6 +1780,8 @@ if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
   globalThis.__LLMOLYMPIC_OBSERVER_TEST__ = Object.freeze({
     classifyReplayClose,
     playbackReducer,
+    validateLiveItem,
+    validateLiveSummary,
   });
 }
 

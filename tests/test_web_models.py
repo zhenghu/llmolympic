@@ -18,6 +18,10 @@ from llmolympic.web.models import (
     GameInfo,
     HealthResponse,
     LeaderboardResponse,
+    LiveEventContext,
+    LiveEventItem,
+    LiveMatchDetail,
+    LiveMatchSummary,
     MatchDetail,
     MatchListResponse,
     MatchSummary,
@@ -25,6 +29,8 @@ from llmolympic.web.models import (
     WSArchiveEnvelope,
     WSCompleteEnvelope,
     WSEventEnvelope,
+    WSLiveCompleteEnvelope,
+    WSLiveSnapshotEnvelope,
 )
 
 STAMP = datetime(2026, 1, 2, 3, 4, 5, 6789, tzinfo=timezone(timedelta(hours=2)))
@@ -440,3 +446,91 @@ def test_health_and_game_metadata_are_explicitly_versioned() -> None:
     assert health.service_version == __version__
     assert game.supported_modes == ("play", "round_robin")
     assert game.requires_judge_panel is True
+
+
+def test_live_dtos_keep_broker_and_match_sequences_distinct() -> None:
+    public = PublicEvent.from_event(
+        _event(EventType.TURN_PROMPT, {"prompt": "next"}, seq=0, player="Alice")
+    )
+    item = LiveEventItem(
+        seq=7,
+        context=LiveEventContext(leg_number=2, match_event_seq=0),
+        event=public,
+    )
+    summary = LiveMatchSummary(
+        live_id="live-series",
+        mode="series",
+        status="running",
+        game="gomoku",
+        players=("Alice", "Bob"),
+        started_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=1),
+        event_count=8,
+        leg_number=2,
+    )
+    detail = LiveMatchDetail(
+        match=summary,
+        events=(item,),
+        next_seq=8,
+        has_more=False,
+    )
+
+    assert detail.events[0].seq == 7
+    assert detail.events[0].event.seq == 0
+    assert detail.events[0].context.match_event_seq == 0
+
+    with pytest.raises(ValidationError):
+        LiveEventItem(
+            seq=7,
+            context=LiveEventContext(leg_number=2, match_event_seq=1),
+            event=public,
+        )
+
+
+def test_live_completion_and_page_contracts_fail_closed() -> None:
+    completed = LiveMatchSummary(
+        live_id="live-match",
+        mode="play",
+        status="completed",
+        game="math_quiz",
+        players=("Alice", "Bob"),
+        started_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=1),
+        event_count=3,
+        final_kind="match",
+        final_id="match-1",
+        final_match_ids=("match-1",),
+    )
+    snapshot = WSLiveSnapshotEnvelope(match=completed, next_seq=2)
+    terminal = WSLiveCompleteEnvelope(
+        live_id=completed.live_id,
+        event_count=completed.event_count,
+        final_kind="match",
+        final_id="match-1",
+        final_match_ids=("match-1",),
+    )
+
+    assert snapshot.type == "live_snapshot"
+    assert terminal.type == "live_complete"
+
+    with pytest.raises(ValidationError):
+        LiveMatchSummary.model_validate(
+            completed.model_dump(mode="python") | {"status": "running"}
+        )
+    with pytest.raises(ValidationError):
+        WSLiveSnapshotEnvelope(match=completed, next_seq=4)
+    with pytest.raises(ValidationError):
+        WSLiveCompleteEnvelope(
+            live_id=completed.live_id,
+            event_count=completed.event_count,
+            final_kind="match",
+            final_id="match-1",
+            final_match_ids=("different-match",),
+        )
+    with pytest.raises(ValidationError):
+        LiveMatchDetail(
+            match=completed,
+            events=(),
+            next_seq=2,
+            has_more=False,
+        )

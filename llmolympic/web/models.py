@@ -32,6 +32,10 @@ from llmolympic.core.storage import RatingEntry
 API_VERSION = "v1"
 _MAX_PUBLIC_NESTING = 16
 _DROP = object()
+_SAFE_PUBLIC_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_BIDI_CONTROL_CHARACTERS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
 _PUBLIC_GAME_CONFIG_KEYS = frozenset(
     {
         "bank_version",
@@ -158,14 +162,14 @@ def _sanitize_public_value(value: object, *, depth: int = 0) -> object:
             copied = _sanitize_public_value(item, depth=depth + 1)
             if copied is not _DROP:
                 result[key] = copied
-        return result
+        return result if result or not value else _DROP
     if isinstance(value, (list, tuple)):
         result_list: list[object] = []
         for item in value:
             copied = _sanitize_public_value(item, depth=depth + 1)
             if copied is not _DROP:
                 result_list.append(copied)
-        return result_list
+        return result_list if result_list or not value else _DROP
     return _DROP
 
 
@@ -243,6 +247,13 @@ class ErrorResponse(_PublicModel):
 
 
 GameMode: TypeAlias = Literal["play", "series", "round_robin"]
+LiveMatchStatus: TypeAlias = Literal["running", "completed", "interrupted"]
+LiveFinalKind: TypeAlias = Literal["match", "series", "tournament"]
+_MODE_FINAL_KIND: dict[GameMode, LiveFinalKind] = {
+    "play": "match",
+    "series": "series",
+    "round_robin": "tournament",
+}
 
 
 class GameInfo(_PublicModel):
@@ -522,6 +533,248 @@ def public_event(event: MatchEvent) -> PublicEvent:
     return PublicEvent.from_event(event)
 
 
+class LiveEventContext(_PublicModel):
+    """Placement of one match event within a top-level live run."""
+
+    pairing_number: int | None = Field(default=None, ge=1)
+    leg_number: int | None = Field(default=None, ge=1)
+    match_event_seq: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_placement(self) -> LiveEventContext:
+        if self.leg_number is not None and self.leg_number not in {1, 2}:
+            raise ValueError("live series leg number must be one or two")
+        if self.pairing_number is not None and self.leg_number is None:
+            raise ValueError("tournament event context requires a leg number")
+        return self
+
+
+class LiveEventItem(_PublicModel):
+    """One event ordered by the broker-wide sequence of its live session."""
+
+    seq: int = Field(ge=0)
+    context: LiveEventContext
+    event: PublicEvent
+
+    @model_validator(mode="after")
+    def _context_matches_event(self) -> LiveEventItem:
+        if self.context.match_event_seq != self.event.seq:
+            raise ValueError("live event context and public event sequence differ")
+        return self
+
+
+class LiveMatchSummary(_PublicModel):
+    """Disclosure-safe state for one top-level match, series, or tournament run."""
+
+    live_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    mode: GameMode
+    status: LiveMatchStatus
+    game: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    players: tuple[str, ...]
+    started_at: datetime
+    updated_at: datetime
+    event_count: int = Field(ge=0, le=10_000)
+    pairing_number: int | None = Field(default=None, ge=1)
+    pairing_count: int | None = Field(default=None, ge=1)
+    leg_number: int | None = Field(default=None, ge=1)
+    final_kind: LiveFinalKind | None = None
+    final_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    final_match_ids: tuple[str, ...] = ()
+
+    @field_serializer("started_at", "updated_at")
+    def _serialize_times(self, value: datetime) -> str:
+        return _utc_json(value)
+
+    @field_validator("players")
+    @classmethod
+    def _validate_players(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) < 2 or len(value) > 16 or len(value) != len(set(value)) or any(
+            not player
+            or len(player) > 512
+            or any(
+                ord(character) < 32
+                or 127 <= ord(character) <= 159
+                or 0xD800 <= ord(character) <= 0xDFFF
+                or character in _BIDI_CONTROL_CHARACTERS
+                for character in player
+            )
+            for player in value
+        ):
+            raise ValueError("live players must contain at least two display names")
+        return value
+
+    @field_validator("final_match_ids")
+    @classmethod
+    def _validate_final_match_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 10_000 or len(value) != len(set(value)):
+            raise ValueError("final match ids must be bounded and unique")
+        if any(_SAFE_PUBLIC_ID_RE.fullmatch(match_id) is None for match_id in value):
+            raise ValueError("final match id is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_live_state(self) -> LiveMatchSummary:
+        if self.updated_at < self.started_at:
+            raise ValueError("live updated_at precedes started_at")
+        if self.pairing_number is not None and self.pairing_count is None:
+            raise ValueError("pairing_number requires pairing_count")
+        if (
+            self.pairing_number is not None
+            and self.pairing_count is not None
+            and self.pairing_number > self.pairing_count
+        ):
+            raise ValueError("pairing_number exceeds pairing_count")
+        if self.mode == "play" and (
+            self.pairing_number is not None
+            or self.pairing_count is not None
+            or self.leg_number is not None
+        ):
+            raise ValueError("single-match live runs cannot have series context")
+        if self.mode == "series" and (
+            self.pairing_number is not None or self.pairing_count is not None
+        ):
+            raise ValueError("series live runs cannot have tournament context")
+        if self.mode in {"series", "round_robin"} and (
+            self.leg_number is not None and self.leg_number not in {1, 2}
+        ):
+            raise ValueError("live series leg number must be one or two")
+        if self.mode == "round_robin" and self.pairing_count is None:
+            raise ValueError("tournament live runs require pairing_count")
+        if self.status == "completed":
+            if (
+                self.final_kind != _MODE_FINAL_KIND[self.mode]
+                or self.final_id is None
+                or not self.final_match_ids
+            ):
+                raise ValueError("completed live runs require matching final archive references")
+            if self.mode == "play" and self.final_match_ids != (self.final_id,):
+                raise ValueError("completed match must reference its one final match archive")
+            if self.mode == "series" and len(self.final_match_ids) != 2:
+                raise ValueError("completed series must reference exactly two match archives")
+            if (
+                self.mode == "round_robin"
+                and self.pairing_count is not None
+                and len(self.final_match_ids) != self.pairing_count * 2
+            ):
+                raise ValueError("completed tournament match archive count is inconsistent")
+        elif self.final_kind is not None or self.final_id is not None or self.final_match_ids:
+            raise ValueError("unfinished live runs cannot expose final archive references")
+        return self
+
+
+class LiveMatchListResponse(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    matches: tuple[LiveMatchSummary, ...]
+
+
+class LiveMatchDetail(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    match: LiveMatchSummary
+    events: tuple[LiveEventItem, ...]
+    next_seq: int = Field(ge=0)
+    has_more: bool
+
+    @model_validator(mode="after")
+    def _validate_page(self) -> LiveMatchDetail:
+        if self.events:
+            first = self.events[0].seq
+            if tuple(item.seq for item in self.events) != tuple(
+                range(first, first + len(self.events))
+            ):
+                raise ValueError("live event page must be contiguous")
+            if self.next_seq != first + len(self.events):
+                raise ValueError("next_seq does not follow live event page")
+        if self.next_seq > self.match.event_count:
+            raise ValueError("next_seq exceeds live event count")
+        if self.has_more != (self.next_seq < self.match.event_count):
+            raise ValueError("has_more does not match live event count")
+        return self
+
+
+class WSLiveSnapshotEnvelope(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    type: Literal["live_snapshot"] = "live_snapshot"
+    match: LiveMatchSummary
+    next_seq: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_cursor(self) -> WSLiveSnapshotEnvelope:
+        if self.next_seq > self.match.event_count:
+            raise ValueError("live snapshot cursor exceeds event count")
+        return self
+
+
+class WSLiveEventEnvelope(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    type: Literal["live_event"] = "live_event"
+    live_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    item: LiveEventItem
+
+
+class WSLiveCompleteEnvelope(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    type: Literal["live_complete"] = "live_complete"
+    live_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    event_count: int = Field(ge=0, le=10_000)
+    final_kind: LiveFinalKind
+    final_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    final_match_ids: tuple[str, ...]
+
+    @field_validator("final_match_ids")
+    @classmethod
+    def _validate_match_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or len(value) > 10_000 or len(value) != len(set(value)):
+            raise ValueError("final match ids must be non-empty, bounded, and unique")
+        if any(_SAFE_PUBLIC_ID_RE.fullmatch(match_id) is None for match_id in value):
+            raise ValueError("final match id is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_final_reference(self) -> WSLiveCompleteEnvelope:
+        if self.final_kind == "match" and self.final_match_ids != (self.final_id,):
+            raise ValueError("completed match envelope has inconsistent archive references")
+        if self.final_kind == "series" and len(self.final_match_ids) != 2:
+            raise ValueError("completed series envelope must reference exactly two matches")
+        return self
+
+
+class WSLiveInterruptedEnvelope(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    type: Literal["live_interrupted"] = "live_interrupted"
+    live_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    event_count: int = Field(ge=0, le=10_000)
+
+
+LiveWebSocketEnvelope: TypeAlias = Annotated[
+    WSLiveSnapshotEnvelope
+    | WSLiveEventEnvelope
+    | WSLiveCompleteEnvelope
+    | WSLiveInterruptedEnvelope,
+    Field(discriminator="type"),
+]
+
+
 class MatchDetail(_PublicModel):
     api_version: Literal["v1"] = API_VERSION
     match: MatchSummary
@@ -620,6 +873,14 @@ __all__ = [
     "LeaderboardEntry",
     "LeaderboardEntryPublic",
     "LeaderboardResponse",
+    "LiveEventContext",
+    "LiveEventItem",
+    "LiveFinalKind",
+    "LiveMatchDetail",
+    "LiveMatchListResponse",
+    "LiveMatchStatus",
+    "LiveMatchSummary",
+    "LiveWebSocketEnvelope",
     "MatchDetail",
     "MatchFinishedData",
     "MatchListResponse",
@@ -635,6 +896,10 @@ __all__ = [
     "WSCompleteEnvelope",
     "WSErrorEnvelope",
     "WSEventEnvelope",
+    "WSLiveCompleteEnvelope",
+    "WSLiveEventEnvelope",
+    "WSLiveInterruptedEnvelope",
+    "WSLiveSnapshotEnvelope",
     "WebSocketEnvelope",
     "public_event",
 ]
