@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-14
+
 - 完成阶段四 4.3：新增独立、权限收紧的 SQLite 实时事件 sidecar。`play`、`series` 与
   `round-robin` 会以后台有界队列发布已经过公开 DTO 白名单过滤的事件；Web 即使晚启动，
   仍可发现运行中的本机比赛，并通过 WebSocket 从首个缺失序号续播。
