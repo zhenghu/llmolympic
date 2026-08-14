@@ -932,9 +932,9 @@ def _validate_human_input_mode(
         return normalized_mode, web_url
 
     human_players = [player for player in players if isinstance(player, HumanPlayer)]
-    if len(players) != 2 or len(human_players) != 1:
+    if len(players) < 2 or not human_players:
         raise typer.BadParameter(
-            "Web 人类输入首版仅支持 play 中恰好 1 名人类与 1 名非人类选手",
+            "Web 人类输入仅支持 play 中至少 2 名选手，且至少包含 1 名人类选手",
             param_hint="--human-input",
         )
 
@@ -1839,34 +1839,52 @@ def play(
         max_estimated_cost_usd=max_estimated_cost_usd,
     )
     store = _open_store(database)
-    browser_human: BrowserHumanPlayer | None = None
+    browser_humans: list[BrowserHumanPlayer] = []
     try:
         if human_input == "web":
-            terminal_human = next(
+            terminal_humans = [
                 player for player in selected_players if isinstance(player, HumanPlayer)
-            )
-            browser_human = BrowserHumanPlayer.create(
-                store.path,
-                selected_game,
-                selected_players,
-                terminal_human,
-            )
+            ]
+            for terminal_human in terminal_humans:
+                browser_humans.append(
+                    BrowserHumanPlayer.create(
+                        store.path,
+                        selected_game,
+                        selected_players,
+                        terminal_human,
+                    )
+                )
+            replacements = {
+                id(terminal): browser
+                for terminal, browser in zip(
+                    terminal_humans,
+                    browser_humans,
+                    strict=True,
+                )
+            }
             selected_players = [
-                browser_human if player is terminal_human else player
+                replacements.get(id(player), player)
                 for player in selected_players
             ]
-            participation = Text("浏览器人类输入已就绪\n", style="green")
-            participation.append(
-                literal_text(
-                    browser_human.participation_url(web_url),
-                    style="bold underline",
-                ),
+            participation = Text(
+                f"浏览器人类输入已就绪（{len(browser_humans)} 个独立席位）",
+                style="green",
             )
+            for index, browser_human in enumerate(browser_humans, start=1):
+                participation.append(f"\n\n席位 {index} · ")
+                participation.append(literal_text(browser_human.name, style="bold"))
+                participation.append("\n")
+                participation.append(
+                    literal_text(
+                        browser_human.participation_url(web_url),
+                        style="bold underline",
+                    ),
+                )
             participation.append(
-                "\n先启动 llmolympic web，再只在本机浏览器打开此一次性链接。",
+                "\n\n先启动 llmolympic web，再把每条一次性链接分别交给对应的本机浏览器席位。",
                 style="dim",
             )
-            console.print(Panel(participation, title=Text("Web 参与链接")))
+            console.print(Panel(participation, title=Text("Web 参与链接（请勿混用）")))
         if judge_panel is None:
             asyncio.run(_run(selected_game, selected_players, seed, store))
         else:
@@ -1914,7 +1932,7 @@ def play(
         console.print(line)
         raise typer.Exit(code=1) from exc
     finally:
-        if browser_human is not None:
+        for browser_human in browser_humans:
             browser_human.close()
         _best_effort_render(_render_usage_summary, runtime_budget)
 

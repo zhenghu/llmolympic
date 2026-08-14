@@ -244,7 +244,7 @@
     status: "active",
     game: "gomoku",
     player_name: "Alice",
-    players: ["Alice", "Bob"],
+    players: ["Alice", "Bob", "Carol"],
     created_at: "2026-08-14T11:59:00.000000Z",
     updated_at: "2026-08-14T12:00:00.000000Z",
     lease_expires_at: "2026-08-14T12:02:00.000000Z",
@@ -257,7 +257,20 @@
   );
   assert(
     observer.validateParticipationSnapshot(participationSnapshot, "session-7", "seat-1"),
-    "an active capability-scoped participation snapshot is accepted",
+    "an active three-player capability-scoped participation snapshot is accepted",
+  );
+  const secondSeatSnapshot = {
+    ...participationSnapshot,
+    seat_id: "seat-2",
+    player_name: "Bob",
+  };
+  assert(
+    observer.validateParticipationSnapshot(secondSeatSnapshot, "session-7", "seat-2"),
+    "a second seat accepts only its matching route identity",
+  );
+  assert(
+    !observer.validateParticipationSnapshot(secondSeatSnapshot, "session-7", "seat-1"),
+    "a second seat snapshot is rejected on the first seat route",
   );
   assert(
     observer.participationKeepsCapability("active"),
@@ -296,6 +309,20 @@
     }, "session-7", "seat-1"),
     "GET snapshots fail closed if submitted content appears",
   );
+  const invalidParticipationRosters = [
+    ["Alice", ...Array.from({ length: 16 }, (_, index) => `player-${index}`)],
+    ["Alice", "Bob", "Alice"],
+    ["Bob", "Carol"],
+  ];
+  invalidParticipationRosters.forEach((players) => {
+    assert(
+      !observer.validateParticipationSnapshot({
+        ...participationSnapshot,
+        players,
+      }, "session-7", "seat-1"),
+      `participation snapshots reject invalid roster: ${JSON.stringify(players)}`,
+    );
+  });
   assert(
     !observer.validateParticipationRequest({
       ...participationRequest,

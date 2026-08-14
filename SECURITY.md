@@ -20,8 +20,10 @@ Web API 使用独立的 SQLite 只读连接，不创建或迁移主档案数据�
 相同的字段白名单，发布失败只会关闭直播，不会改变比赛、预算、ELO 或存档。Web 只公开
 白名单展示字段，并拒绝跨源 WebSocket。
 
-阶段 4.4 的 Web 写权限严格限于独立 `*.input.db`：比赛进程先显式创建一个 `play` 席位，
-浏览器再用 URL fragment 交付的 256-bit capability 对当前 request 做一次同源 JSON POST。
+阶段 4.4/4.5a 的 Web 写权限严格限于独立 `*.input.db`：比赛进程为每名浏览器 Human 显式
+创建独立的 `play` 席位，浏览器再用 URL fragment 交付的 256-bit capability 对对应席位的
+当前 request 做一次同源 JSON POST。capability 隔离 request 的读取与提交；公开题面和动作
+事件仍可能由同机观战页展示，因此当前实现不是同一操作系统账户内的保密边界。
 服务端仅保存 capability 摘要；request ID、submission ID、截止时间、租约与 SQLite CAS 防止
 重放、旧题串线和双标签覆盖。POST 要求精确同源 Origin、Bearer header、JSON content type，
 并限制请求体和 move 大小；它不能创建比赛、选择/调用 Provider、读取凭据、写正式档案、

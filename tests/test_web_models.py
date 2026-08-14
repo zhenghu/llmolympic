@@ -556,7 +556,7 @@ def test_participation_dtos_expose_only_current_prompt_metadata() -> None:
         status="active",
         game="gomoku",
         player_name="Alice",
-        players=("Alice", "Bob"),
+        players=("Alice", "Bob", "Carol"),
         created_at=STAMP,
         updated_at=STAMP + timedelta(seconds=1),
         lease_expires_at=STAMP + timedelta(minutes=1),
@@ -564,6 +564,7 @@ def test_participation_dtos_expose_only_current_prompt_metadata() -> None:
     )
 
     payload = snapshot.model_dump(mode="json")
+    assert payload["players"] == ["Alice", "Bob", "Carol"]
     assert payload["request"] == {
         "request_id": "request-1",
         "request_seq": 1,
@@ -594,6 +595,15 @@ def test_participation_dtos_expose_only_current_prompt_metadata() -> None:
         ParticipationSnapshotResponse.model_validate(payload | {"submission_id": "0" * 32})
     with pytest.raises(ValidationError):
         ParticipationRequest.model_validate(payload["request"] | {"move": "H8"})
+
+    invalid_rosters = (
+        ["Alice", *(f"player-{index}" for index in range(16))],
+        ["Alice", "Bob", "Alice"],
+        ["Bob", "Carol"],
+    )
+    for players in invalid_rosters:
+        with pytest.raises(ValidationError):
+            ParticipationSnapshotResponse.model_validate(payload | {"players": players})
 
 
 def test_participation_submission_and_terminal_contracts_are_strict() -> None:
