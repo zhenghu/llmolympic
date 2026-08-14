@@ -17,6 +17,7 @@ from decimal import Decimal
 from itertools import combinations
 from pathlib import Path
 from typing import Annotated, Self
+from urllib.parse import urlsplit
 
 import typer
 from rich.console import Console
@@ -92,6 +93,7 @@ from llmolympic.core.usage import (
 )
 from llmolympic.diagnostics import run_diagnostics
 from llmolympic.games import create_game, list_games
+from llmolympic.human_input import BrowserHumanPlayer, HumanInputError
 from llmolympic.live import GameMode, LiveFinalKind, LivePublisher
 from llmolympic.providers import create_profile_provider, create_provider
 from llmolympic.providers.base import validate_route_id
@@ -913,6 +915,55 @@ def _prepare_contest(
     return selected_game, selected_players
 
 
+def _validate_human_input_mode(
+    players: Sequence[Player],
+    mode: str,
+    web_url: str,
+) -> tuple[str, str]:
+    """Validate the optional browser input backend before opening SQLite."""
+
+    normalized_mode = mode.strip().casefold()
+    if normalized_mode not in {"terminal", "web"}:
+        raise typer.BadParameter(
+            "人类输入方式必须是 terminal 或 web",
+            param_hint="--human-input",
+        )
+    if normalized_mode == "terminal":
+        return normalized_mode, web_url
+
+    human_players = [player for player in players if isinstance(player, HumanPlayer)]
+    if len(players) != 2 or len(human_players) != 1:
+        raise typer.BadParameter(
+            "Web 人类输入首版仅支持 play 中恰好 1 名人类与 1 名非人类选手",
+            param_hint="--human-input",
+        )
+
+    candidate = web_url.strip()
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError as exc:
+        raise typer.BadParameter("Web 地址无效", param_hint="--web-url") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or port is None
+        or port < 1
+    ):
+        raise typer.BadParameter(
+            "Web 地址必须是带端口的本机 HTTP 根地址，例如 http://127.0.0.1:8000",
+            param_hint="--web-url",
+        )
+    display_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return normalized_mode, f"http://{display_host}:{port}"
+
+
 def _prepare_judge_panel(
     game: Game,
     contestants: list[Player],
@@ -1198,10 +1249,15 @@ async def _run(
     judge_panel: LLMJudgePanel | None = None,
 ) -> None:
     live = _LiveRun(store.path, "play")
+    browser_humans = [
+        player for player in players if isinstance(player, BrowserHumanPlayer)
+    ]
     guarded_render = _guard_renderer(_render)
     saved = False
 
     def on_event(event: MatchEvent) -> None:
+        for browser_human in browser_humans:
+            browser_human.observe_event(event)
         guarded_render(event)
         live.observe(event)
 
@@ -1215,6 +1271,13 @@ async def _run(
         )
         result = store.save_match(archive, rating_source="engine")
         saved = True
+        for browser_human in browser_humans:
+            try:
+                browser_human.complete(archive.match_id)
+            except HumanInputError as exc:
+                line = Text("对局已存档，但浏览器参与页终态更新失败：", style="yellow")
+                line.append(literal_text(exc.code))
+                console.print(line)
         live.complete(
             final_kind="match",
             final_id=archive.match_id,
@@ -1224,6 +1287,13 @@ async def _run(
     finally:
         if not saved:
             live.interrupt()
+            for browser_human in browser_humans:
+                try:
+                    browser_human.interrupt()
+                except HumanInputError:
+                    pass
+        for browser_human in browser_humans:
+            browser_human.close()
         live.close()
 
 
@@ -1666,6 +1736,16 @@ def play(
     timeout: float = typer.Option(
         60.0, "--timeout", "-t", min=0.001, help="人类选手每次行动限时（秒）"
     ),
+    human_input: str = typer.Option(
+        "terminal",
+        "--human-input",
+        help="人类输入方式：terminal（当前终端）或 web（本机浏览器）",
+    ),
+    web_url: str = typer.Option(
+        "http://127.0.0.1:8000",
+        "--web-url",
+        help="Web 人类输入页的本机根地址（仅 --human-input web 使用）",
+    ),
     llm_timeout: float | None = typer.Option(
         None,
         "--llm-timeout",
@@ -1737,6 +1817,11 @@ def play(
         no_llm_timeout=no_llm_timeout,
         mode="play",
     )
+    human_input, web_url = _validate_human_input_mode(
+        selected_players,
+        human_input,
+        web_url,
+    )
     judge_panel = _prepare_judge_panel(
         selected_game,
         selected_players,
@@ -1754,7 +1839,34 @@ def play(
         max_estimated_cost_usd=max_estimated_cost_usd,
     )
     store = _open_store(database)
+    browser_human: BrowserHumanPlayer | None = None
     try:
+        if human_input == "web":
+            terminal_human = next(
+                player for player in selected_players if isinstance(player, HumanPlayer)
+            )
+            browser_human = BrowserHumanPlayer.create(
+                store.path,
+                selected_game,
+                selected_players,
+                terminal_human,
+            )
+            selected_players = [
+                browser_human if player is terminal_human else player
+                for player in selected_players
+            ]
+            participation = Text("浏览器人类输入已就绪\n", style="green")
+            participation.append(
+                literal_text(
+                    browser_human.participation_url(web_url),
+                    style="bold underline",
+                ),
+            )
+            participation.append(
+                "\n先启动 llmolympic web，再只在本机浏览器打开此一次性链接。",
+                style="dim",
+            )
+            console.print(Panel(participation, title=Text("Web 参与链接")))
         if judge_panel is None:
             asyncio.run(_run(selected_game, selected_players, seed, store))
         else:
@@ -1791,12 +1903,19 @@ def play(
             detail.append(literal_text(failure.get("error_type")))
             console.print(detail)
         raise typer.Exit(code=1) from exc
+    except HumanInputError as exc:
+        line = Text("浏览器人类输入不可用；对局未存档且未更新 ELO：", style="red")
+        line.append(literal_text(exc.code))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
     except (OSError, sqlite3.Error, StorageError) as exc:
         line = Text("对局已完成，但 SQLite 存档失败：", style="red")
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
     finally:
+        if browser_human is not None:
+            browser_human.close()
         _best_effort_render(_render_usage_summary, runtime_budget)
 
 
@@ -2289,7 +2408,10 @@ def round_robin(
 def serve_web(
     database: Annotated[
         Path | None,
-        typer.Option("--db", help="只读打开的 SQLite 文件；默认读取现有数据库配置"),
+        typer.Option(
+            "--db",
+            help="主档案只读；浏览器人类提交仅写独立 input sidecar",
+        ),
     ] = None,
     host: Annotated[
         str,
@@ -2300,7 +2422,7 @@ def serve_web(
         typer.Option("--port", min=1, max=65_535, help="监听端口"),
     ] = 8000,
 ) -> None:
-    """启动本机只读观战 API、运行中事件流与已完成对局回放。"""
+    """启动本机 Web 参与页、只读观战与对局回放。"""
 
     normalized_host = host.strip().casefold()
     if normalized_host not in LOCAL_WEB_HOSTS:
@@ -2314,9 +2436,11 @@ def serve_web(
     resolved_database = database_path(database)
     web_app = create_app(resolved_database)
     display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
-    console.print(f"只读观战页：http://{display_host}:{port}/")
-    console.print(f"只读观战 API（健康检查）：http://{display_host}:{port}/api/v1/health")
-    console.print("可只读观看本机运行中公开事件与已完成存档；按 Ctrl-C 停止。")
+    console.print(f"本机 Web 页面：http://{display_host}:{port}/")
+    console.print(f"Web API（健康检查）：http://{display_host}:{port}/api/v1/health")
+    console.print(
+        "可观看公开事件与存档；持参与链接的本机浏览器可提交人类走法。按 Ctrl-C 停止。"
+    )
     uvicorn.run(
         web_app,
         host=normalized_host,

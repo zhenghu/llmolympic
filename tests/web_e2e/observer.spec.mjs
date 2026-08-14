@@ -2,6 +2,9 @@ import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
 const MATCH_ID = "web-e2e-match";
+const PARTICIPATION_SESSION_ID = "browser-session";
+const PARTICIPATION_SEAT_ID = "browser-seat";
+const PARTICIPATION_CAPABILITY = "A".repeat(43);
 const XSS_SENTINEL = '<img src=x onerror="globalThis.__LLMOLYMPIC_XSS__=true">';
 const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 
@@ -127,4 +130,83 @@ test("completed live detail falls back to REST polling without executing archive
   await expect(page.getByText(XSS_SENTINEL, { exact: true }).first()).toBeVisible();
   await expectNoWcagViolations(page);
   expect(browserErrors).toEqual([]);
+});
+
+test("participation keeps an active refresh credential and clears it at completion", async ({
+  page,
+}) => {
+  let status = "active";
+  const endpoint = `/api/v1/participation/${PARTICIPATION_SESSION_ID}/${PARTICIPATION_SEAT_ID}`;
+  const createdAt = new Date(Date.now() - 10_000).toISOString();
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+  await page.route(`**${endpoint}`, async (route) => {
+    expect(route.request().headers().authorization).toBe(`Bearer ${PARTICIPATION_CAPABILITY}`);
+    const completed = status === "completed";
+    await route.fulfill({
+      contentType: "application/json",
+      json: {
+        api_version: "v1",
+        session_id: PARTICIPATION_SESSION_ID,
+        seat_id: PARTICIPATION_SEAT_ID,
+        status,
+        game: "gomoku",
+        player_name: XSS_SENTINEL,
+        players: [XSS_SENTINEL, "安全对手"],
+        created_at: createdAt,
+        updated_at: new Date().toISOString(),
+        lease_expires_at: expiresAt,
+        request: completed ? null : {
+          request_id: "browser-request",
+          request_seq: 0,
+          match_event_seq: 1,
+          state: "pending",
+          prompt: `${XSS_SENTINEL}\n请输入 H8`,
+          created_at: createdAt,
+          expires_at: expiresAt,
+        },
+        final_match_id: completed ? MATCH_ID : null,
+      },
+      status: 200,
+    });
+  });
+
+  const participationPath = `/participate/${PARTICIPATION_SESSION_ID}/${PARTICIPATION_SEAT_ID}`;
+  await page.goto(`${participationPath}#capability=${PARTICIPATION_CAPABILITY}`);
+  await expect(page).toHaveURL(new RegExp(`${participationPath}$`));
+  await expect(page.locator(".participation-prompt")).toContainText("请输入 H8");
+  expect(await page.evaluate(() => window.location.hash)).toBe("");
+  expect(await page.evaluate(() => window.sessionStorage.length)).toBe(1);
+  expect(await page.locator('img[src="x"]').count()).toBe(0);
+  expect(await page.evaluate(() => globalThis.__LLMOLYMPIC_XSS__)).toBeUndefined();
+  await expectNoWcagViolations(page);
+
+  await page.reload();
+  await expect(page.locator(".participation-prompt")).toContainText("请输入 H8");
+  expect(await page.evaluate(() => window.sessionStorage.length)).toBe(1);
+
+  status = "completed";
+  await expect(page.getByRole("heading", { name: "比赛已完成" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "打开存档回放" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.sessionStorage.length)).toBe(0);
+  await expectNoWcagViolations(page);
+});
+
+test("participation clears a capability rejected with a public terminal error", async ({
+  page,
+}) => {
+  const endpoint = "/api/v1/participation/missing-session/missing-seat";
+  await page.route(`**${endpoint}`, async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      json: { error: { code: "participation_not_found" } },
+      status: 404,
+    });
+  });
+
+  await page.goto(
+    `/participate/missing-session/missing-seat#capability=${PARTICIPATION_CAPABILITY}`,
+  );
+  await expect(page.getByText("无法打开参与席位", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/participate\/missing-session\/missing-seat$/);
+  await expect.poll(() => page.evaluate(() => window.sessionStorage.length)).toBe(0);
 });

@@ -22,6 +22,9 @@ WEB_ASSET_PATHS = (
     "llmolympic/web/static/assets/app.css",
     "llmolympic/web/static/assets/app.js",
 )
+RUNTIME_PACKAGE_PATHS = (
+    "llmolympic/human_input.py",
+)
 LEGACY_REACT_ASSET_PATHS = (
     "llmolympic/web/static/assets/react.production.min.js",
     "llmolympic/web/static/assets/react-dom.production.min.js",
@@ -57,6 +60,9 @@ def _verify_metadata(metadata: Message) -> None:
 def verify_distributions(dist_dir: Path) -> None:
     expected_legal_files = {name: (PROJECT_ROOT / name).read_bytes() for name in LEGAL_FILES}
     expected_web_assets = {name: (PROJECT_ROOT / name).read_bytes() for name in WEB_ASSET_PATHS}
+    expected_runtime_files = {
+        name: (PROJECT_ROOT / name).read_bytes() for name in RUNTIME_PACKAGE_PATHS
+    }
     expected_build_inputs = {
         name: (PROJECT_ROOT / name).read_bytes() for name in WEB_BUILD_INPUT_PATHS
     }
@@ -85,6 +91,9 @@ def verify_distributions(dist_dir: Path) -> None:
         for filename, expected in expected_web_assets.items():
             if filename not in names or archive.read(filename) != expected:
                 raise AssertionError(f"wheel Web asset is missing or changed: {filename}")
+        for filename, expected in expected_runtime_files.items():
+            if filename not in names or archive.read(filename) != expected:
+                raise AssertionError(f"wheel runtime package file is missing or changed: {filename}")
         for filename in LEGACY_REACT_ASSET_PATHS:
             if filename in names:
                 raise AssertionError(f"wheel contains obsolete standalone React asset: {filename}")
@@ -123,6 +132,20 @@ def verify_distributions(dist_dir: Path) -> None:
             asset_file = archive.extractfile(str(asset_member))
             if asset_file is None or asset_file.read() != expected:
                 raise AssertionError(f"sdist Web asset is missing or changed: {filename}")
+        for filename, expected in expected_runtime_files.items():
+            runtime_member = _single(
+                [
+                    Path(member.name)
+                    for member in members
+                    if member.name.endswith(f"/{filename}")
+                ],
+                f"sdist runtime package file {filename}",
+            )
+            runtime_file = archive.extractfile(str(runtime_member))
+            if runtime_file is None or runtime_file.read() != expected:
+                raise AssertionError(
+                    f"sdist runtime package file is missing or changed: {filename}"
+                )
         member_names = {member.name for member in members}
         for filename in LEGACY_REACT_ASSET_PATHS:
             if any(name.endswith(f"/{filename}") for name in member_names):

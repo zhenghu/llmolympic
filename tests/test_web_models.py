@@ -25,6 +25,10 @@ from llmolympic.web.models import (
     MatchDetail,
     MatchListResponse,
     MatchSummary,
+    ParticipationRequest,
+    ParticipationSnapshotResponse,
+    ParticipationSubmissionRequest,
+    ParticipationSubmissionResponse,
     PublicEvent,
     WSArchiveEnvelope,
     WSCompleteEnvelope,
@@ -533,4 +537,100 @@ def test_live_completion_and_page_contracts_fail_closed() -> None:
             events=(),
             next_seq=2,
             has_more=False,
+        )
+
+
+def test_participation_dtos_expose_only_current_prompt_metadata() -> None:
+    request = ParticipationRequest(
+        request_id="request-1",
+        request_seq=1,
+        match_event_seq=4,
+        state="pending",
+        prompt='<script>alert("prompt")</script>',
+        created_at=STAMP,
+        expires_at=STAMP + timedelta(seconds=30),
+    )
+    snapshot = ParticipationSnapshotResponse(
+        session_id="session-1",
+        seat_id="seat-1",
+        status="active",
+        game="gomoku",
+        player_name="Alice",
+        players=("Alice", "Bob"),
+        created_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=1),
+        lease_expires_at=STAMP + timedelta(minutes=1),
+        request=request,
+    )
+
+    payload = snapshot.model_dump(mode="json")
+    assert payload["request"] == {
+        "request_id": "request-1",
+        "request_seq": 1,
+        "match_event_seq": 4,
+        "state": "pending",
+        "prompt": '<script>alert("prompt")</script>',
+        "created_at": "2026-01-02T01:04:05.006789Z",
+        "expires_at": "2026-01-02T01:04:35.006789Z",
+    }
+    assert "move" not in snapshot.model_dump_json()
+    assert "submission_id" not in snapshot.model_dump_json()
+    assert "capability" not in snapshot.model_dump_json()
+
+    copied = ParticipationSnapshotResponse.from_input_snapshot(
+        payload | {
+            "owner_token": "owner-secret",
+            "request": payload["request"] | {
+                "move": "H8",
+                "submission_id": "0" * 32,
+            },
+        }
+    )
+    assert copied == snapshot
+    assert "owner-secret" not in copied.model_dump_json()
+    assert "H8" not in copied.model_dump_json()
+
+    with pytest.raises(ValidationError):
+        ParticipationSnapshotResponse.model_validate(payload | {"submission_id": "0" * 32})
+    with pytest.raises(ValidationError):
+        ParticipationRequest.model_validate(payload["request"] | {"move": "H8"})
+
+
+def test_participation_submission_and_terminal_contracts_are_strict() -> None:
+    submission = ParticipationSubmissionRequest(submission_id="a" * 32, move="")
+    response = ParticipationSubmissionResponse(request_id="request-1", status="submitted")
+    completed = ParticipationSnapshotResponse(
+        session_id="session-1",
+        seat_id="seat-1",
+        status="completed",
+        game="math_quiz",
+        player_name="Alice",
+        players=("Alice", "Bob"),
+        created_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=2),
+        lease_expires_at=STAMP + timedelta(minutes=1),
+        final_match_id="match-1",
+    )
+
+    assert submission.move == ""
+    assert response.status == "submitted"
+    assert completed.request is None
+
+    with pytest.raises(ValidationError):
+        ParticipationSubmissionRequest(submission_id="not-hex", move="H8")
+    with pytest.raises(ValidationError):
+        ParticipationSubmissionRequest(submission_id="a" * 32, move="x" * 4097)
+    with pytest.raises(ValidationError):
+        ParticipationSubmissionResponse(request_id="request-1", status="accepted")
+    with pytest.raises(ValidationError):
+        ParticipationSnapshotResponse.model_validate(
+            completed.model_dump(mode="python") | {"request": {
+                "request_id": "request-2",
+                "request_seq": 2,
+                "match_event_seq": 5,
+                "state": "pending",
+                "prompt": "next",
+                "created_at": STAMP,
+                "expires_at": STAMP + timedelta(seconds=30),
+            }}
         )

@@ -12,6 +12,10 @@ const h = React.createElement;
 
 const API_VERSION = "v1";
 const MAX_MATCHES = 100;
+const MAX_MOVE_CHARACTERS = 4096;
+const PARTICIPATION_POLL_INTERVAL = 1000;
+const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
 const EVENT_LABELS = {
   match_started: "比赛开始",
   turn_prompt: "题面 / 局面",
@@ -37,13 +41,22 @@ const ERROR_COPY = {
   database_unavailable: "无法读取本地数据库。请确认数据库存在且版本兼容。",
   invalid_host: "当前地址不受支持，请使用命令行显示的本机地址。",
   invalid_request: "请求无效，请返回观战大厅后重试。",
+  capability_invalid: "参与凭证无效或已经失效。请使用命令行最新输出的完整链接。",
   live_not_found: "这场运行中的比赛不存在，或直播保留期已经结束。",
   live_unavailable: "本机实时事件流暂时不可用，比赛本身不受影响。",
   match_not_found: "对局不存在，或已经不再可用。",
   network_error: "与本机观战服务的连接中断。",
   overloaded: "回放服务正忙，请稍后重试。",
+  participation_expired: "这个参与席位已经过期，请重新从命令行开始比赛。",
+  participation_not_found: "这个参与席位不存在，或已经不再可用。",
+  participation_unavailable: "本机人类输入服务暂时不可用，比赛进程会按既定超时规则处理。",
   protocol_error: "页面与服务的回放协议不一致。",
+  request_expired: "本轮提交时间已结束，请等待最新题面。",
   request_failed: "暂时无法加载数据，请稍后重试。",
+  request_not_found: "本轮题面已更新，请等待页面同步。",
+  request_stale: "本轮题面已更新，请根据最新题面重新提交。",
+  request_too_large: "提交内容超过 Web 请求上限，请缩短后重试。",
+  submission_conflict: "本轮已经收到另一份提交，请等待比赛继续。",
 };
 const PUBLIC_ERROR_CODES = new Set(Object.keys(ERROR_COPY));
 const RETRYABLE_CLOSE_CODES = new Set([1000, 1006, 1011, 1012, 1013, 4429]);
@@ -185,6 +198,241 @@ async function fetchJSON(path, signal) {
   return payload;
 }
 
+const participationCapabilities = new Map();
+
+function participationCredentialKey(sessionId, seatId) {
+  return `llmolympic.participation.${sessionId}.${seatId}`;
+}
+
+function participationComponentKey(sessionId, seatId) {
+  return `${encodeURIComponent(sessionId)}/${encodeURIComponent(seatId)}`;
+}
+
+function participationPath(pathname) {
+  const match = pathname.match(/^\/participate\/([^/]+)\/([^/]+)$/);
+  if (!match) return null;
+  try {
+    const sessionId = decodeURIComponent(match[1]);
+    const seatId = decodeURIComponent(match[2]);
+    return SAFE_PUBLIC_ID.test(sessionId) && SAFE_PUBLIC_ID.test(seatId)
+      ? { seatId, sessionId }
+      : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function captureParticipationCapability() {
+  if (typeof window === "undefined") return;
+  const route = participationPath(window.location.pathname);
+  if (!route || !window.location.hash) return;
+  const storageKey = participationCredentialKey(route.sessionId, route.seatId);
+  let capability = null;
+  try {
+    const parameters = new URLSearchParams(window.location.hash.slice(1));
+    const keys = Array.from(parameters.keys());
+    const candidates = parameters.getAll("capability");
+    if (keys.length === 1 && keys[0] === "capability" && candidates.length === 1) {
+      capability = CAPABILITY_TOKEN.test(candidates[0]) ? candidates[0] : null;
+    }
+  } catch (_error) {
+    capability = null;
+  }
+
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${window.location.pathname}${window.location.search}`,
+  );
+  participationCapabilities.delete(storageKey);
+  try {
+    window.sessionStorage.removeItem(storageKey);
+  } catch (_error) {
+    // Private browsing can deny Web Storage; the in-memory fallback still works.
+  }
+  if (!capability) return;
+  participationCapabilities.set(storageKey, capability);
+  try {
+    window.sessionStorage.setItem(storageKey, capability);
+  } catch (_error) {
+    // Keep the capability only in this page when Web Storage is unavailable.
+  }
+}
+
+function readParticipationCapability(sessionId, seatId) {
+  const storageKey = participationCredentialKey(sessionId, seatId);
+  const captured = participationCapabilities.get(storageKey);
+  if (captured) return captured;
+  try {
+    const stored = window.sessionStorage.getItem(storageKey);
+    if (stored && CAPABILITY_TOKEN.test(stored)) {
+      participationCapabilities.set(storageKey, stored);
+      return stored;
+    }
+  } catch (_error) {
+    // Missing Web Storage is handled as a missing credential.
+  }
+  return null;
+}
+
+function clearParticipationCapability(sessionId, seatId) {
+  const storageKey = participationCredentialKey(sessionId, seatId);
+  participationCapabilities.delete(storageKey);
+  try {
+    window.sessionStorage.removeItem(storageKey);
+  } catch (_error) {
+    // Nothing else to clear.
+  }
+}
+
+function participationKeepsCapability(status) {
+  return status === "active";
+}
+
+function participationErrorClearsCapability(status) {
+  return [401, 403, 404, 410].includes(status);
+}
+
+function exactKeys(value, keys) {
+  const actual = Object.keys(value).sort();
+  const expected = keys.slice().sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function validTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function validateParticipationRequest(request) {
+  if (!isObject(request) || !exactKeys(request, [
+    "created_at",
+    "expires_at",
+    "match_event_seq",
+    "prompt",
+    "request_id",
+    "request_seq",
+    "state",
+  ])) return false;
+  return SAFE_PUBLIC_ID.test(request.request_id)
+    && Number.isInteger(request.request_seq)
+    && request.request_seq >= 0
+    && Number.isInteger(request.match_event_seq)
+    && request.match_event_seq >= 0
+    && ["pending", "submitted", "consumed", "accepted", "rejected", "expired", "cancelled"].includes(request.state)
+    && typeof request.prompt === "string"
+    && Array.from(request.prompt).length <= 65536
+    && validTimestamp(request.created_at)
+    && validTimestamp(request.expires_at)
+    && Date.parse(request.expires_at) > Date.parse(request.created_at);
+}
+
+function validateParticipationSnapshot(snapshot, sessionId, seatId) {
+  if (!isObject(snapshot) || !exactKeys(snapshot, [
+    "api_version",
+    "created_at",
+    "final_match_id",
+    "game",
+    "lease_expires_at",
+    "player_name",
+    "players",
+    "request",
+    "seat_id",
+    "session_id",
+    "status",
+    "updated_at",
+  ])) return false;
+  if (
+    snapshot.api_version !== API_VERSION
+    || snapshot.session_id !== sessionId
+    || snapshot.seat_id !== seatId
+    || !["active", "completed", "interrupted", "expired"].includes(snapshot.status)
+    || typeof snapshot.game !== "string"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(snapshot.game)
+    || typeof snapshot.player_name !== "string"
+    || !snapshot.player_name
+    || Array.from(snapshot.player_name).length > 512
+    || !Array.isArray(snapshot.players)
+    || snapshot.players.length !== 2
+    || new Set(snapshot.players).size !== 2
+    || snapshot.players.some((player) => typeof player !== "string"
+      || !player
+      || Array.from(player).length > 512)
+    || !snapshot.players.includes(snapshot.player_name)
+    || !validTimestamp(snapshot.created_at)
+    || !validTimestamp(snapshot.updated_at)
+    || !validTimestamp(snapshot.lease_expires_at)
+    || Date.parse(snapshot.updated_at) < Date.parse(snapshot.created_at)
+    || Date.parse(snapshot.lease_expires_at) <= Date.parse(snapshot.created_at)
+  ) return false;
+  if (snapshot.request !== null && !validateParticipationRequest(snapshot.request)) return false;
+  if (snapshot.status !== "active" && snapshot.request !== null) return false;
+  if (snapshot.status === "completed") {
+    return typeof snapshot.final_match_id === "string"
+      && SAFE_PUBLIC_ID.test(snapshot.final_match_id);
+  }
+  return snapshot.final_match_id === null;
+}
+
+function validateParticipationSubmission(payload, requestId) {
+  return isObject(payload)
+    && exactKeys(payload, ["api_version", "request_id", "status"])
+    && payload.api_version === API_VERSION
+    && payload.request_id === requestId
+    && ["submitted", "duplicate"].includes(payload.status);
+}
+
+async function fetchParticipationJSON(path, capability, { body = null, method = "GET", signal } = {}) {
+  let response;
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${capability}`,
+  };
+  if (body !== null) headers["Content-Type"] = "application/json";
+  try {
+    response = await fetch(path, {
+      body: body === null ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers,
+      method,
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    throw new PublicError("network_error");
+  }
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
+  }
+  if (!isObject(payload) || payload.api_version !== API_VERSION) {
+    throw new PublicError("protocol_error");
+  }
+  return payload;
+}
+
+function countCharacters(value) {
+  return Array.from(value).length;
+}
+
+function createSubmissionId() {
+  if (!globalThis.crypto || typeof globalThis.crypto.getRandomValues !== "function") {
+    throw new PublicError("request_failed");
+  }
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 function navigate(path) {
   if (window.location.pathname + window.location.search === path) return;
   window.history.pushState({}, "", path);
@@ -227,7 +475,7 @@ function StatusPill({ health }) {
   );
 }
 
-function Header({ health }) {
+function Header({ health, participation = false }) {
   return h(
     "header",
     { className: "topbar" },
@@ -236,20 +484,20 @@ function Header({ health }) {
       { className: "topbar-inner" },
       h(
         AppLink,
-        { className: "brand", href: "/", "aria-label": "LLM Olympics 观战台首页" },
+        { className: "brand", href: "/", "aria-label": "LLM Olympics 首页" },
         h("span", { className: "brand-mark", "aria-hidden": "true" }, "L²"),
         h(
           "span",
           null,
           h("span", { className: "brand-name" }, "LLM Olympics"),
-          h("span", { className: "brand-sub" }, "ARCHIVE OBSERVER"),
+          h("span", { className: "brand-sub" }, participation ? "HUMAN PARTICIPATION" : "ARCHIVE OBSERVER"),
         ),
       ),
       h(
         "div",
         { className: "status-cluster" },
-        h("span", { className: "status-pill local" }, "本机 · 只读观战"),
-        h(StatusPill, { health }),
+        h("span", { className: "status-pill local" }, participation ? "本机 · 安全参赛" : "本机 · 只读观战"),
+        participation ? null : h(StatusPill, { health }),
       ),
     ),
   );
@@ -1669,12 +1917,438 @@ function LiveDetailPage({ liveId }) {
   );
 }
 
+function participationEndpoint(sessionId, seatId) {
+  return `/api/v1/participation/${encodeURIComponent(sessionId)}/${encodeURIComponent(seatId)}`;
+}
+
+function useParticipation(sessionId, seatId, capability, reloadKey) {
+  const [state, setState] = useState({
+    error: null,
+    phase: capability ? "loading" : "missing-capability",
+    snapshot: null,
+  });
+
+  useEffect(() => {
+    if (!capability) {
+      setState({ error: null, phase: "missing-capability", snapshot: null });
+      return undefined;
+    }
+    let cancelled = false;
+    let controller = null;
+    let loading = false;
+    let timer = null;
+
+    const schedule = (delay) => {
+      if (cancelled || timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        load(false);
+      }, delay);
+    };
+    const load = async (initial) => {
+      if (cancelled || loading) return;
+      loading = true;
+      controller = new AbortController();
+      if (initial) {
+        setState((previous) => ({ ...previous, error: null, phase: "loading" }));
+      }
+      try {
+        const payload = await fetchParticipationJSON(
+          participationEndpoint(sessionId, seatId),
+          capability,
+          { signal: controller.signal },
+        );
+        if (!validateParticipationSnapshot(payload, sessionId, seatId)) {
+          throw new PublicError("protocol_error");
+        }
+        if (cancelled) return;
+        setState({ error: null, phase: "ready", snapshot: payload });
+        if (participationKeepsCapability(payload.status)) {
+          schedule(PARTICIPATION_POLL_INTERVAL);
+        } else {
+          clearParticipationCapability(sessionId, seatId);
+        }
+      } catch (error) {
+        if (cancelled || (error && error.name === "AbortError")) return;
+        const publicError = error instanceof PublicError
+          ? error
+          : new PublicError("network_error");
+        if (participationErrorClearsCapability(publicError.status)) {
+          clearParticipationCapability(sessionId, seatId);
+        }
+        setState((previous) => ({ ...previous, error: publicError, phase: "error" }));
+        if (![401, 403, 404, 410].includes(publicError.status)) schedule(2000);
+      } finally {
+        loading = false;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible" || cancelled || loading) return;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      load(false);
+    };
+
+    load(true);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (timer !== null) window.clearTimeout(timer);
+      if (controller) controller.abort();
+    };
+  }, [capability, reloadKey, seatId, sessionId]);
+
+  return state;
+}
+
+function remainingCopy(expiresAt, now) {
+  const milliseconds = Date.parse(expiresAt) - now;
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "提交时间已结束";
+  const seconds = Math.ceil(milliseconds / 1000);
+  if (seconds < 60) return `剩余 ${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  return `剩余 ${minutes} 分 ${seconds % 60} 秒`;
+}
+
+function participationStatusCopy(snapshot, submission) {
+  if (snapshot.status === "completed") return "比赛已完成，提交入口已经关闭。";
+  if (snapshot.status === "interrupted") return "比赛已中断，提交入口已经关闭。";
+  if (snapshot.status === "expired") return "参与席位已过期，提交入口已经关闭。";
+  if (!snapshot.request) return "已连接，正在等待轮到你。";
+  if (snapshot.request.state === "submitted" || snapshot.request.state === "consumed") {
+    return "本轮提交已送达，正在等待游戏规则校验。";
+  }
+  if (snapshot.request.state === "accepted") return "本轮提交已通过游戏规则校验。";
+  if (snapshot.request.state === "rejected") return "本轮提交未通过规则校验，正在等待新的输入请求。";
+  if (snapshot.request.state === "expired") return "本轮输入已经超时，正在等待比赛继续。";
+  if (snapshot.request.state === "cancelled") return "本轮输入已取消，正在等待比赛继续。";
+  if (submission.requestId === snapshot.request.request_id) {
+    if (submission.phase === "submitting") return "正在把本轮提交送到比赛进程。";
+    if (submission.phase === "submitted") return "提交已送达，正在等待游戏规则校验。";
+    if (submission.phase === "duplicate") return "已确认同一份提交先前送达，正在等待比赛继续。";
+    if (submission.phase === "error") return "提交未获确认；可以用同一内容安全重试。";
+  }
+  return `轮到你了，这是输入请求 ${snapshot.request.request_seq}。`;
+}
+
+function ParticipationPage({ seatId, sessionId }) {
+  const [capability] = useState(() => readParticipationCapability(sessionId, seatId));
+  const [reloadKey, setReloadKey] = useState(0);
+  const participation = useParticipation(sessionId, seatId, capability, reloadKey);
+  const [move, setMove] = useState("");
+  const [now, setNow] = useState(Date.now);
+  const [submission, setSubmission] = useState({
+    error: null,
+    phase: "idle",
+    requestId: null,
+    submissionId: null,
+  });
+  const inputRef = useRef(null);
+  const snapshot = participation.snapshot;
+  const request = snapshot && snapshot.status === "active" ? snapshot.request : null;
+  const requestId = request ? request.request_id : null;
+
+  useEffect(() => {
+    setMove("");
+    setSubmission({ error: null, phase: "idle", requestId: null, submissionId: null });
+    if (!requestId) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      if (inputRef.current) inputRef.current.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [requestId]);
+
+  useEffect(() => {
+    if (!request) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [requestId]);
+
+  if (!capability) {
+    return h(
+      "main",
+      { className: "page participation-page", id: "main-content", tabIndex: -1 },
+      h(StateCard, {
+        title: "缺少参与凭证",
+        copy: "请使用 play 命令输出的完整本机参与链接。为了保护席位，凭证不会显示在页面或地址栏中。",
+        error: true,
+      }),
+    );
+  }
+
+  if (participation.phase === "loading" && !snapshot) {
+    return h(
+      "main",
+      { className: "page participation-page", id: "main-content", tabIndex: -1 },
+      h("section", { className: "panel" },
+        h("div", { className: "panel-body" }, h(LoadingRows, { count: 3 })),
+      ),
+    );
+  }
+
+  if (!snapshot) {
+    return h(
+      "main",
+      { className: "page participation-page", id: "main-content", tabIndex: -1 },
+      h(StateCard, {
+        title: "无法打开参与席位",
+        copy: errorCopy(participation.error),
+        error: true,
+        action: participation.error && [401, 403].includes(participation.error.status)
+          ? null
+          : h("button", {
+            className: "button",
+            onClick: () => setReloadKey((value) => value + 1),
+            type: "button",
+          }, "重新连接"),
+      }),
+    );
+  }
+
+  const characterCount = countCharacters(move);
+  const overLimit = characterCount > MAX_MOVE_CHARACTERS;
+  const locallyExpired = request ? Date.parse(request.expires_at) <= now : false;
+  const requestClosed = request && request.state !== "pending";
+  const locallySubmitted = request
+    && submission.requestId === request.request_id
+    && ["submitted", "duplicate"].includes(submission.phase);
+  const canSubmit = Boolean(request)
+    && request.state === "pending"
+    && !locallyExpired
+    && !overLimit
+    && submission.phase !== "submitting"
+    && !locallySubmitted;
+  const closedButtonCopy = request && {
+    accepted: "本轮已接受",
+    cancelled: "本轮已取消",
+    consumed: "正在校验",
+    expired: "本轮已超时",
+    rejected: "本轮未接受",
+    submitted: "本轮已提交",
+  }[request.state];
+  const statusCopy = participationStatusCopy(snapshot, submission);
+
+  const submit = async () => {
+    if (!canSubmit || !request) return;
+    let submissionId = submission.requestId === request.request_id
+      && submission.submissionId
+      ? submission.submissionId
+      : null;
+    if (!submissionId) {
+      try {
+        submissionId = createSubmissionId();
+      } catch (error) {
+        setSubmission({
+          error: error instanceof PublicError ? error : new PublicError("request_failed"),
+          phase: "error",
+          requestId: request.request_id,
+          submissionId: null,
+        });
+        return;
+      }
+    }
+    setSubmission({
+      error: null,
+      phase: "submitting",
+      requestId: request.request_id,
+      submissionId,
+    });
+    try {
+      const payload = await fetchParticipationJSON(
+        `${participationEndpoint(sessionId, seatId)}/requests/${encodeURIComponent(request.request_id)}/submissions`,
+        capability,
+        {
+          body: { move, submission_id: submissionId },
+          method: "POST",
+        },
+      );
+      if (!validateParticipationSubmission(payload, request.request_id)) {
+        throw new PublicError("protocol_error");
+      }
+      setSubmission({
+        error: null,
+        phase: payload.status,
+        requestId: request.request_id,
+        submissionId,
+      });
+      setMove("");
+      setReloadKey((value) => value + 1);
+    } catch (error) {
+      const publicError = error instanceof PublicError ? error : new PublicError("network_error");
+      setSubmission({
+        error: publicError,
+        phase: "error",
+        requestId: request.request_id,
+        submissionId,
+      });
+      if ([404, 409, 410].includes(publicError.status)) {
+        setReloadKey((value) => value + 1);
+      }
+    }
+  };
+  const onSubmit = (event) => {
+    event.preventDefault();
+    submit();
+  };
+  const onMoveKeyDown = (event) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      submit();
+    }
+  };
+
+  const terminalTitle = snapshot.status === "completed"
+    ? "比赛已完成"
+    : snapshot.status === "interrupted"
+      ? "比赛已中断"
+      : snapshot.status === "expired"
+        ? "参与席位已过期"
+        : null;
+  const terminalCopy = snapshot.status === "completed"
+    ? "你的浏览器输入阶段已经结束。"
+    : snapshot.status === "interrupted"
+      ? "比赛进程未能继续；已确认的提交不会被重新发送。"
+      : "这个本机参与链接已经超过有效期。";
+
+  return h(
+    "main",
+    { className: "page participation-page", id: "main-content", tabIndex: -1 },
+    h("section", { className: "participation-hero", "aria-labelledby": "participation-title" },
+      h("div", null,
+        h("p", { className: "eyebrow" }, `${gameLabel(snapshot.game)} · HUMAN INPUT`),
+        h("h1", { className: "detail-title", id: "participation-title" }, snapshot.player_name),
+        h("p", { className: "hero-copy" }, `${snapshot.players.join(" 对 ")}。题面和提交都只在本机比赛进程与这个席位之间传输。`),
+      ),
+      h("div", { className: `participation-connection ${snapshot.status}` },
+        h("span", { className: "status-dot", "aria-hidden": "true" }),
+        h("strong", null, snapshot.status === "active" ? "本机席位已连接" : terminalTitle),
+        h("span", null, snapshot.status === "active" ? "每秒同步最新题面" : "输入已关闭"),
+      ),
+    ),
+    participation.error ? h("div", { className: "participation-alert", role: "alert" },
+      h("strong", null, "连接暂时中断"),
+      h("span", null, errorCopy(participation.error)),
+      h("button", {
+        className: "button small",
+        onClick: () => setReloadKey((value) => value + 1),
+        type: "button",
+      }, "立即重试"),
+    ) : null,
+    terminalTitle ? h("section", {
+      "aria-labelledby": "participation-terminal-heading",
+      className: "panel participation-terminal",
+    },
+    h("div", { className: "state-card" },
+      h("h2", { id: "participation-terminal-heading" }, terminalTitle),
+      h("p", null, terminalCopy),
+      snapshot.final_match_id ? h("div", { className: "state-action" },
+        h(AppLink, {
+          className: "button primary",
+          href: `/matches/${encodeURIComponent(snapshot.final_match_id)}`,
+        }, "打开存档回放"),
+      ) : null,
+    ),
+    ) : h("div", { className: "participation-layout" },
+      h("section", { className: "panel participation-panel", "aria-labelledby": "prompt-heading" },
+        h("div", { className: "panel-head" },
+          h("h2", { id: "prompt-heading" }, request ? "当前题面" : "等待题面"),
+          request ? h("span", { className: "panel-kicker" }, `输入请求 ${request.request_seq}`) : null,
+        ),
+        h("div", { className: "participation-prompt-wrap" },
+          request
+            ? h("pre", { className: "participation-prompt" }, request.prompt || "（空题面）")
+            : h(StateCard, {
+              title: "还没轮到你",
+              copy: "页面会自动同步；出现新题面后，输入框会获得焦点。",
+            }),
+        ),
+      ),
+      h("aside", { className: "participation-sidebar", "aria-label": "提交控制" },
+        h("section", { className: "panel" },
+          h("div", { className: "panel-head" },
+            h("h2", null, "你的提交"),
+            request && request.state === "pending" ? h("time", {
+              className: `participation-deadline${locallyExpired ? " expired" : ""}`,
+              dateTime: request.expires_at,
+            }, remainingCopy(request.expires_at, now)) : request
+              ? h("span", { className: "participation-deadline" }, {
+                accepted: "规则已接受",
+                cancelled: "本轮已取消",
+                consumed: "正在校验",
+                expired: "本轮已超时",
+                rejected: "规则未接受",
+                submitted: "已送达",
+              }[request.state])
+              : null,
+          ),
+          h("form", { className: "participation-form", onSubmit },
+            h("label", { htmlFor: "participation-move" }, "输入动作或答案"),
+            h("p", { className: "field-help", id: "participation-move-help" },
+              "支持多行纯文本。按 Command + Enter（Windows/Linux 为 Ctrl + Enter）提交。",
+            ),
+            h("textarea", {
+              "aria-describedby": "participation-move-help participation-character-count",
+              "aria-invalid": overLimit ? "true" : undefined,
+              disabled: !request || requestClosed || locallySubmitted,
+              id: "participation-move",
+              onChange: (event) => setMove(event.target.value),
+              onKeyDown: onMoveKeyDown,
+              placeholder: request ? "输入本轮动作…" : "等待题面…",
+              ref: inputRef,
+              rows: 8,
+              value: move,
+            }),
+            h("div", { className: "field-meta" },
+              h("span", {
+                className: overLimit ? "character-count over" : "character-count",
+                id: "participation-character-count",
+              }, `${characterCount} / ${MAX_MOVE_CHARACTERS} 字符`),
+              h("span", null, "提交后不能在网页中撤回"),
+            ),
+            h("button", {
+              className: "button primary participation-submit",
+              disabled: !canSubmit,
+              type: "submit",
+            }, submission.phase === "submitting"
+              ? "正在提交…"
+              : requestClosed || locallySubmitted
+                ? closedButtonCopy || "本轮已提交"
+                : locallyExpired
+                  ? "本轮已截止"
+                  : "提交本轮输入"),
+            submission.error ? h("p", { className: "submission-error", role: "alert" },
+              errorCopy(submission.error),
+            ) : null,
+          ),
+        ),
+        h("section", {
+          "aria-atomic": "true",
+          "aria-live": "polite",
+          className: `participation-status ${submission.phase}`,
+        },
+        h("strong", null, request ? "席位状态" : "等待中"),
+        h("p", null, statusCopy),
+        ),
+        h("p", { className: "notice" },
+          "页面不会显示参与凭证，也不会读取 Provider 路由、模型配置或其他选手的提交。",
+        ),
+      ),
+    ),
+  );
+}
+
 function parseRoute() {
   if (window.location.pathname === "/") {
     const candidate = new URLSearchParams(window.location.search).get("game");
     const game = candidate && /^[a-z][a-z0-9_]{0,63}$/.test(candidate) ? candidate : "";
     return { name: "lobby", game };
   }
+  const participation = participationPath(window.location.pathname);
+  if (participation) return { name: "participation", ...participation };
   const match = window.location.pathname.match(/^\/matches\/([^/]+)$/);
   const live = window.location.pathname.match(/^\/live\/([^/]+)$/);
   if (!match && !live) return { name: "not-found" };
@@ -1690,6 +2364,8 @@ function parseRoute() {
   }
 }
 
+captureParticipationCapability();
+
 function App() {
   const [route, setRoute] = useState(parseRoute);
   const [health, setHealth] = useState(null);
@@ -1698,7 +2374,10 @@ function App() {
   const firstRoute = useRef(true);
 
   useEffect(() => {
-    const onPopState = () => setRoute(parseRoute());
+    const onPopState = () => {
+      captureParticipationCapability();
+      setRoute(parseRoute());
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -1710,6 +2389,8 @@ function App() {
         ? "对局回放 · LLM Olympics"
         : route.name === "live"
           ? "实时观战 · LLM Olympics"
+          : route.name === "participation"
+            ? "比赛参与 · LLM Olympics"
           : "页面不存在 · LLM Olympics";
     if (firstRoute.current) {
       firstRoute.current = false;
@@ -1720,9 +2401,14 @@ function App() {
       if (main) main.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [route.game, route.liveId, route.name, route.matchId]);
+  }, [route.game, route.liveId, route.matchId, route.name, route.seatId, route.sessionId]);
 
   useEffect(() => {
+    if (route.name === "participation") {
+      setGames([]);
+      setHealth(null);
+      return undefined;
+    }
     const controller = new AbortController();
     fetchJSON("/api/v1/health", controller.signal)
       .then(setHealth)
@@ -1731,7 +2417,7 @@ function App() {
       .then((payload) => setGames(Array.isArray(payload.games) ? payload.games : []))
       .catch(() => setGames([]));
     return () => controller.abort();
-  }, [metaRefresh]);
+  }, [metaRefresh, route.name]);
 
   let content;
   if (route.name === "lobby") {
@@ -1745,11 +2431,17 @@ function App() {
     content = h(MatchDetailPage, { matchId: route.matchId });
   } else if (route.name === "live") {
     content = h(LiveDetailPage, { liveId: route.liveId });
+  } else if (route.name === "participation") {
+    content = h(ParticipationPage, {
+      key: participationComponentKey(route.sessionId, route.seatId),
+      seatId: route.seatId,
+      sessionId: route.sessionId,
+    });
   } else {
     content = h("main", { className: "page", id: "main-content", tabIndex: -1 },
       h(StateCard, {
         title: "没有这个页面",
-        copy: "返回观战大厅，选择一场已经存档的比赛。",
+        copy: "请返回首页，或使用命令行输出的完整本机链接。",
         action: h(AppLink, { className: "button primary", href: "/" }, "返回首页"),
       }),
     );
@@ -1761,25 +2453,39 @@ function App() {
       ? "已打开对局回放"
       : route.name === "live"
         ? "已打开实时观战"
+        : route.name === "participation"
+          ? "已打开比赛参与席位"
         : "页面不存在";
-  const healthAnnouncement = health
+  const healthAnnouncement = route.name === "participation"
+    ? ""
+    : health
     ? (health.status === "ok" ? "数据库可用" : "数据库不可用")
     : "正在检查数据库";
 
   return h(
     "div",
     { className: "site-shell" },
-    h(Header, { health }),
+    h(Header, { health, participation: route.name === "participation" }),
     content,
-    h("div", { className: "live-region", "aria-atomic": "true", "aria-live": "polite" }, `${routeAnnouncement}。${healthAnnouncement}`),
-    h("footer", { className: "footer" }, "LLM Olympics · 本机只读观战 · 实时事件与已完成存档"),
+    h("div", { className: "live-region", "aria-atomic": "true", "aria-live": "polite" }, `${routeAnnouncement}${healthAnnouncement ? `。${healthAnnouncement}` : ""}`),
+    h("footer", { className: "footer" }, route.name === "participation"
+      ? "LLM Olympics · 本机人类输入 · 凭证仅保存在当前浏览器标签页"
+      : "LLM Olympics · 本机只读观战 · 实时事件与已完成存档"),
   );
 }
 
 if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
   globalThis.__LLMOLYMPIC_OBSERVER_TEST__ = Object.freeze({
     classifyReplayClose,
+    countCharacters,
+    participationComponentKey,
+    participationErrorClearsCapability,
+    participationKeepsCapability,
     playbackReducer,
+    remainingCopy,
+    validateParticipationRequest,
+    validateParticipationSnapshot,
+    validateParticipationSubmission,
     validateLiveItem,
     validateLiveSummary,
   });

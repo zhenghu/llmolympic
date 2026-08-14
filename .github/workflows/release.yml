@@ -273,7 +273,10 @@ jobs:
             exit 1
           fi
           cd "${GITHUB_WORKSPACE}"
-          LLMOLYMPIC_WEB_E2E_URL=http://127.0.0.1:8765 npm run test:web-e2e
+          LLMOLYMPIC_WEB_E2E_URL=http://127.0.0.1:8765 \
+            LLMOLYMPIC_WEB_E2E_CLI="${smoke_venv}/bin/llmolympic" \
+            LLMOLYMPIC_WEB_E2E_DB="${e2e_root}/observer.db" \
+            npm run test:web-e2e
 
       - name: Generate checksums
         working-directory: dist

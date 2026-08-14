@@ -307,10 +307,10 @@ llmolympic history
 llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 ```
 
-### 本地只读 React 观战页（阶段四 4.3）
+### 本机 React 参与与观战页（阶段四 4.4）
 
-阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；当前 `main` 的阶段 4.3 在此基础上加入
-运行中事件 broker，正式发布前需从源码安装才能使用 4.3。Web 服务端依赖仍通过可选的
+阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；当前开发线的阶段 4.3/4.4 在此基础上加入
+运行中事件 broker 与本机浏览器人类输入，正式发布前需从源码安装才能使用。Web 服务端依赖仍通过可选的
 `web` extra 安装；若上面只安装了基础 wheel，可使用同一发布资产补齐依赖：
 
 ```bash
@@ -318,7 +318,8 @@ python -m pip install \
   "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.5.1/llmolympic-0.5.1-py3-none-any.whl"
 ```
 
-安装后可以只读打开现有 SQLite 存档：
+安装后可以打开本机 Web 服务。正式存档和实时 sidecar 始终只读；只有持一次性参与链接的
+浏览器才可向独立 input sidecar 提交人类走法：
 
 ```bash
 llmolympic web --db ~/.llmolympic/llmolympic.db
@@ -335,6 +336,28 @@ macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项
 `round-robin`，也可按项目筛选最近对局和总体/分项目 ELO。实时详情支持跟随、暂停、逐条
 查看和回到最新；完成存档详情仍可播放、前后单步、拖动进度、切换速度或重新播放。五子棋
 和国际象棋暂时都使用通用事件时间线，不提供专用棋盘。
+
+要从浏览器真正参加一场比赛，先保持 Web 服务运行，再在另一个终端启动单场 `play`：
+
+```bash
+llmolympic play \
+  --game gomoku \
+  --players human:我,mock:fixed \
+  --human-input web \
+  --timeout 120 \
+  --db ~/.llmolympic/llmolympic.db
+```
+
+CLI 会打印形如 `/participate/<SESSION>/<SEAT>#capability=...` 的一次性本机链接。浏览器读取
+fragment 中的高熵 capability 后立即从地址栏移除，只在当前标签页会话中保存；服务端数据库
+只保存摘要。参与页显示引擎生成的原始文本题面，并把最多 4096 个 Unicode 字符的文本提交
+给同一个 `HumanPlayer` 异步接口。提交成功只代表“引擎已收到”，合法性仍由具体 Game 判断；
+非法走法会生成新的 request ID 和修正题面，不会把旧提交串到下一轮。
+
+4.4 首个切片仅支持 `play` 中恰好 1 名浏览器人类和 1 名 mock/LLM，对所有项目使用通用
+文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。它不允许网页创建比赛、
+选择 Provider、读取凭据、管理 ELO，也不开放 `series`、`round-robin`、多人浏览器人类或
+局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
 
 React 19.2.8、ReactDOM 19.2.8 与 Scheduler 0.27.0 通过锁定依赖和可复现构建合并为同源
 生产 bundle，随 wheel/sdist 离线分发；打开页面不访问 CDN，运行时也不需要 Node、外部
@@ -355,11 +378,16 @@ Web 未启动或客户端过慢都不会改变比赛结果、Provider 预算、E
 观战缓存，不是正式比赛档案。停止相关比赛与 Web 服务后可以删除它，之后运行新比赛会按需
 重新创建；不要把它提交到 Git，也不要用它替代主数据库备份。
 
+浏览器人类输入使用另一份 `example.db.input.db`。它以 `0600` 保存短期席位、题面和尚未
+消费的提交，比赛进程持有 owner fencing 与租约，Web 仅能凭 seat capability 对当前 request
+做一次原子提交。比赛与 Web 服务均停止后可删除；它不是正式档案，不应提交、同步或备份。
+
 Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `query_only` 连接，不创建、
-迁移或修改它们，也不更新权限或 ELO。sidecar 和公开 DTO 都只保存展示所需白名单字段，不
+迁移或修改它们，也不更新权限或 ELO。唯一写端点使用同源 POST、Bearer capability、严格
+JSON/体积上限和幂等 submission ID，只能推进已有 input request。sidecar 和公开 DTO 都不
 包含 Provider 路由、Profile、模型配置、凭据、请求头或原始失败详情。旧版、外部导入、超大
-或语义不一致的档案不会经 Web 详情接口原样公开。远程人类落子和单场多题锦标赛模式仍留给
-后续阶段四切片；当前实时观战不增加任何 Web 写入或远程控制能力。
+或语义不一致的档案不会经 Web 详情接口原样公开。带认证/TLS 的远程多人输入和单场多题
+锦标赛模式仍留给后续阶段四切片。
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
@@ -394,7 +422,8 @@ Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `quer
 
 这保证了引擎与远程/独立客户端的盲答语义。单个共享终端仍不能为多名人类
 提供彼此隔离的私密输入界面；本地 reader 只会串行化共享 stdin 的提示，不会隐藏
-已经输入的内容。多人类实战应使用后续 Web/独立客户端。
+已经输入的内容。4.4 的本机浏览器后端解决了单个 Web Human 的隔离输入；多人类实战仍需
+后续的多席位 Web/独立客户端与正式认证授权边界。
 
 `series` 固定进行两局：第一局按命令中的选手顺序，第二局完整交换顺序；两局
 使用相同 seed。五子棋中这表示双方各执黑一次，国际象棋中表示双方各执白一次。

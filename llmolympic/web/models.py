@@ -249,6 +249,16 @@ class ErrorResponse(_PublicModel):
 GameMode: TypeAlias = Literal["play", "series", "round_robin"]
 LiveMatchStatus: TypeAlias = Literal["running", "completed", "interrupted"]
 LiveFinalKind: TypeAlias = Literal["match", "series", "tournament"]
+ParticipationStatus: TypeAlias = Literal["active", "completed", "interrupted", "expired"]
+ParticipationRequestState: TypeAlias = Literal[
+    "pending",
+    "submitted",
+    "consumed",
+    "accepted",
+    "rejected",
+    "expired",
+    "cancelled",
+]
 _MODE_FINAL_KIND: dict[GameMode, LiveFinalKind] = {
     "play": "match",
     "series": "series",
@@ -696,6 +706,168 @@ class LiveMatchDetail(_PublicModel):
         return self
 
 
+class ParticipationRequest(_PublicModel):
+    """Current human-input prompt, with no submitted content or capability data."""
+
+    request_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    request_seq: int = Field(ge=0)
+    match_event_seq: int = Field(ge=0)
+    state: ParticipationRequestState
+    prompt: str = Field(max_length=65_536)
+    created_at: datetime
+    expires_at: datetime
+
+    @field_serializer("created_at", "expires_at")
+    def _serialize_times(self, value: datetime) -> str:
+        return _utc_json(value)
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> ParticipationRequest:
+        if self.expires_at <= self.created_at:
+            raise ValueError("participation request must expire after it is created")
+        return self
+
+    @classmethod
+    def from_input_snapshot(cls, source: object) -> ParticipationRequest:
+        """Copy the broker request through an explicit disclosure allow-list."""
+
+        return cls(
+            request_id=_storage_field(source, "request_id"),
+            request_seq=_storage_field(source, "request_seq"),
+            match_event_seq=_storage_field(source, "match_event_seq"),
+            state=_storage_field(source, "state"),
+            prompt=_storage_field(source, "prompt"),
+            created_at=_storage_field(source, "created_at"),
+            expires_at=_storage_field(source, "expires_at"),
+        )
+
+
+class ParticipationSnapshotResponse(_PublicModel):
+    """Capability-scoped input state safe to return from the participation GET."""
+
+    api_version: Literal["v1"] = API_VERSION
+    session_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    seat_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    status: ParticipationStatus
+    game: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    player_name: str = Field(min_length=1, max_length=512)
+    players: tuple[str, ...]
+    created_at: datetime
+    updated_at: datetime
+    lease_expires_at: datetime
+    request: ParticipationRequest | None = None
+    final_match_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+
+    @field_serializer("created_at", "updated_at", "lease_expires_at")
+    def _serialize_times(self, value: datetime) -> str:
+        return _utc_json(value)
+
+    @field_validator("player_name")
+    @classmethod
+    def _validate_player_name(cls, value: str) -> str:
+        if any(
+            ord(character) < 32
+            or 127 <= ord(character) <= 159
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or character in _BIDI_CONTROL_CHARACTERS
+            for character in value
+        ):
+            raise ValueError("participation player name contains unsafe controls")
+        return value
+
+    @field_validator("players")
+    @classmethod
+    def _validate_players(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != 2 or len(set(value)) != 2 or any(
+            not player
+            or len(player) > 512
+            or any(
+                ord(character) < 32
+                or 127 <= ord(character) <= 159
+                or 0xD800 <= ord(character) <= 0xDFFF
+                or character in _BIDI_CONTROL_CHARACTERS
+                for character in player
+            )
+            for player in value
+        ):
+            raise ValueError("participation players must contain two safe display names")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_snapshot(self) -> ParticipationSnapshotResponse:
+        if self.player_name not in self.players:
+            raise ValueError("participation player is not in the match")
+        if self.updated_at < self.created_at:
+            raise ValueError("participation updated_at precedes created_at")
+        if self.lease_expires_at <= self.created_at:
+            raise ValueError("participation lease must expire after creation")
+        if self.status != "active" and self.request is not None:
+            raise ValueError("terminal participation snapshots cannot expose a request")
+        if self.status == "completed":
+            if self.final_match_id is None:
+                raise ValueError("completed participation requires a final match archive")
+        elif self.final_match_id is not None:
+            raise ValueError("unfinished participation cannot expose a final match archive")
+        return self
+
+    @classmethod
+    def from_input_snapshot(cls, source: object) -> ParticipationSnapshotResponse:
+        """Copy only the public, capability-scoped broker snapshot fields."""
+
+        raw_request = _storage_field(source, "request", None)
+        return cls(
+            session_id=_storage_field(source, "session_id"),
+            seat_id=_storage_field(source, "seat_id"),
+            status=_storage_field(source, "status"),
+            game=_storage_field(source, "game"),
+            player_name=_storage_field(source, "player_name"),
+            players=_public_player_list(_storage_field(source, "players")),
+            created_at=_storage_field(source, "created_at"),
+            updated_at=_storage_field(source, "updated_at"),
+            lease_expires_at=_storage_field(source, "lease_expires_at"),
+            request=(
+                ParticipationRequest.from_input_snapshot(raw_request)
+                if raw_request is not None
+                else None
+            ),
+            final_match_id=_storage_field(source, "final_match_id", None),
+        )
+
+
+class ParticipationSubmissionRequest(_PublicModel):
+    """Idempotent browser submission bound to the request in the URL path."""
+
+    submission_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    move: str = Field(max_length=4_096)
+
+
+class ParticipationSubmissionResponse(_PublicModel):
+    api_version: Literal["v1"] = API_VERSION
+    request_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    status: Literal["submitted", "duplicate"]
+
+
 class WSLiveSnapshotEnvelope(_PublicModel):
     api_version: Literal["v1"] = API_VERSION
     type: Literal["live_snapshot"] = "live_snapshot"
@@ -889,6 +1061,12 @@ __all__ = [
     "MatchSummaryPublic",
     "MoveReceivedData",
     "MoveRejectedData",
+    "ParticipationRequest",
+    "ParticipationRequestState",
+    "ParticipationSnapshotResponse",
+    "ParticipationStatus",
+    "ParticipationSubmissionRequest",
+    "ParticipationSubmissionResponse",
     "PublicEvent",
     "PublicEventData",
     "TurnPromptData",
