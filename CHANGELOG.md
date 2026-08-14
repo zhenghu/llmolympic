@@ -13,6 +13,15 @@
 - 观战大厅新增实时比赛卡片，直播详情提供跟随、暂停、逐条查看、回到最新、断线续播和
   REST 只读轮询回退；完成后可进入既有存档回放。HTTP 面仍只有 GET/WebSocket，并继续
   限制回环 Host、同源 Origin、严格 CSP，不提供远程落子、管理操作、认证或公网访问。
+- 完成阶段四 4.4 的首个可玩切片：`play --human-input web` 可将恰好一名 `HumanPlayer`
+  接入本机浏览器通用文本参与页。CLI 生成 fragment capability 链接，题面、非法重试、超时、
+  接受事件和最终存档仍复用同一个 Match 引擎流程；网页不能创建比赛或调用 Provider。
+- 新增与正式档案及直播缓存分离的 `*.input.db`：比赛进程拥有席位、租约和 request 生命周期，
+  Web 只可凭 capability 以同源 JSON POST 原子提交当前 request。令牌只保存摘要，submission ID
+  支持网络幂等重试；旧 request、双标签竞争、超时/取消、错误令牌和跨源请求均 fail closed。
+- 参与页会立即清除 URL fragment、在标签页会话中保存 capability，并明确区分“已提交给引擎”
+  与“已通过游戏规则”。首版仍限回环地址、单个 Web Human、`play` 和通用文本输入；远程多席位、
+  专用棋盘、认证/TLS 与网页建赛不在本切片范围。
 
 ## [0.5.1] - 2026-08-13
 

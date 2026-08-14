@@ -82,8 +82,8 @@ def test_web_starts_hardened_local_server(
         )
     ]
     output = _plain(result.output)
-    assert f"只读观战页：http://{display_host}:8765/" in output
-    assert f"只读观战 API（健康检查）：http://{display_host}:8765/api/v1/health" in output
+    assert f"本机 Web 页面：http://{display_host}:8765/" in output
+    assert f"Web API（健康检查）：http://{display_host}:8765/api/v1/health" in output
 
 
 def test_web_help_does_not_load_optional_runtime(monkeypatch) -> None:
@@ -95,4 +95,4 @@ def test_web_help_does_not_load_optional_runtime(monkeypatch) -> None:
     result = runner.invoke(main.app, ["web", "--help"])
 
     assert result.exit_code == 0
-    assert "只读观战 API" in _plain(result.output)
+    assert "Web 参与页、只读观战" in _plain(result.output)

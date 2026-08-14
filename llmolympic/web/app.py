@@ -1,8 +1,9 @@
-"""FastAPI application for local, read-only live and archived observation."""
+"""Loopback-only browser participation plus live and archived observation."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -17,6 +18,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from llmolympic import __version__
 from llmolympic.games import GAME_REGISTRY
+from llmolympic.human_input import HumanInputError, WebSubmissionStore
 from llmolympic.web.live_reader import LiveReadError, LiveSQLiteReader
 from llmolympic.web.models import (
     ErrorResponse,
@@ -28,6 +30,9 @@ from llmolympic.web.models import (
     LiveMatchListResponse,
     MatchDetail,
     MatchListResponse,
+    ParticipationSnapshotResponse,
+    ParticipationSubmissionRequest,
+    ParticipationSubmissionResponse,
     WSArchiveEnvelope,
     WSCompleteEnvelope,
     WSEventEnvelope,
@@ -44,6 +49,8 @@ MAX_CONCURRENT_LIVE_STREAMS = 16
 WEBSOCKET_SEND_TIMEOUT_SECONDS = 5.0
 LIVE_POLL_SECONDS = 0.2
 LIVE_PAGE_LIMIT = 256
+MAX_CONCURRENT_INPUT_REQUESTS = 8
+MAX_INPUT_BODY_BYTES = 32 * 1024
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _SAFE_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -103,6 +110,16 @@ _LIVE_ERROR_RESPONSES = {
     503: {"model": ErrorResponse, "description": "Live event stream unavailable"},
 }
 
+_PARTICIPATION_ERROR_RESPONSES = {
+    400: {"model": ErrorResponse, "description": "Invalid request"},
+    404: {"model": ErrorResponse, "description": "Participation seat not found"},
+    409: {"model": ErrorResponse, "description": "Submission conflicts with current request"},
+    410: {"model": ErrorResponse, "description": "Participation request expired"},
+    413: {"model": ErrorResponse, "description": "Submission body too large"},
+    429: {"model": ErrorResponse, "description": "Participation input overloaded"},
+    503: {"model": ErrorResponse, "description": "Participation input unavailable"},
+}
+
 
 def _error(code: str, status_code: int) -> JSONResponse:
     payload = ErrorResponse(error={"code": code})
@@ -138,6 +155,57 @@ def _public_live_error(exc: LiveReadError) -> tuple[str, int]:
     if exc.code == "database_busy":
         return "database_busy", 503
     return "live_unavailable", 503
+
+
+def _public_input_error(exc: HumanInputError) -> tuple[str, int]:
+    if exc.code == "invalid_request":
+        return "invalid_request", 400
+    if exc.code in {"input_forbidden", "capability_invalid", "participation_not_found"}:
+        return "participation_not_found", 404
+    if exc.code in {"request_not_found", "request_stale", "input_not_ready"}:
+        return "request_stale", 409
+    if exc.code == "already_submitted":
+        return "submission_conflict", 409
+    if exc.code == "request_expired":
+        return "request_expired", 410
+    if exc.code == "input_body_too_large":
+        return "request_too_large", 413
+    if exc.code in {"session_interrupted", "input_interrupted"}:
+        return "participation_expired", 410
+    if exc.code == "input_overloaded":
+        return "overloaded", 429
+    return "participation_unavailable", 503
+
+
+def _bearer_capability(request: Request) -> str:
+    value = request.headers.get("authorization")
+    if value is None or len(value) > 512 or not value.startswith("Bearer "):
+        raise HumanInputError("input_forbidden")
+    capability = value.removeprefix("Bearer ")
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,256}", capability) is None:
+        raise HumanInputError("input_forbidden")
+    return capability
+
+
+async def _bounded_json_body(request: Request) -> object:
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().casefold() != "application/json":
+        raise HumanInputError("invalid_request")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        if not content_length.isascii() or not content_length.isdigit():
+            raise HumanInputError("invalid_request")
+        if int(content_length) > MAX_INPUT_BODY_BYTES:
+            raise HumanInputError("input_body_too_large")
+    payload = bytearray()
+    async for chunk in request.stream():
+        payload.extend(chunk)
+        if len(payload) > MAX_INPUT_BODY_BYTES:
+            raise HumanInputError("input_body_too_large")
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HumanInputError("invalid_request") from exc
 
 
 def _same_loopback_origin(origin: str | None, host: str | None, scheme: str) -> bool:
@@ -197,18 +265,20 @@ async def _send_json(websocket: WebSocket, payload: object) -> None:
 
 
 def create_app(database: str | Path) -> FastAPI:
-    """Build the optional local observer app without opening the database."""
+    """Build the local Web app without opening any database at import time."""
 
     reader = WebSQLiteReader(database)
     live_reader = LiveSQLiteReader(database)
+    input_store = WebSubmissionStore(database)
     read_slots = asyncio.Semaphore(MAX_CONCURRENT_READS)
     replay_slots = asyncio.Semaphore(MAX_CONCURRENT_REPLAYS)
     live_slots = asyncio.Semaphore(MAX_CONCURRENT_LIVE_STREAMS)
+    input_slots = asyncio.Semaphore(MAX_CONCURRENT_INPUT_REQUESTS)
     static_root = Path(__file__).with_name("static")
     index_path = static_root / "index.html"
     assets_path = static_root / "assets"
     app = FastAPI(
-        title="LLM Olympics local observer API",
+        title="LLM Olympics local Web API",
         version=__version__,
         docs_url=None,
         redoc_url=None,
@@ -278,9 +348,28 @@ def create_app(database: str | Path) -> FastAPI:
         code, status = _public_live_error(exc)
         return _error(code, status)
 
+    @app.exception_handler(HumanInputError)
+    async def human_input_error_handler(
+        request: Request,
+        exc: HumanInputError,
+    ) -> JSONResponse:
+        del request
+        code, status = _public_input_error(exc)
+        return _error(code, status)
+
     async def read(callable_: Callable[[], object]) -> object:
         async with read_slots:
             return await run_in_threadpool(callable_)
+
+    async def input_call(callable_: Callable[[], object]) -> object:
+        try:
+            await asyncio.wait_for(input_slots.acquire(), timeout=0.05)
+        except TimeoutError as exc:
+            raise HumanInputError("input_overloaded") from exc
+        try:
+            return await run_in_threadpool(callable_)
+        finally:
+            input_slots.release()
 
     app.mount("/assets", StaticFiles(directory=assets_path), name="observer-assets")
 
@@ -299,6 +388,98 @@ def create_app(database: str | Path) -> FastAPI:
         if _SAFE_PATH_ID_RE.fullmatch(live_id) is None:
             return Response(status_code=404)
         return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get(
+        "/participate/{session_id}/{seat_id}",
+        include_in_schema=False,
+        response_class=FileResponse,
+    )
+    async def participate_page(session_id: str, seat_id: str) -> Response:
+        if (
+            _SAFE_PATH_ID_RE.fullmatch(session_id) is None
+            or _SAFE_PATH_ID_RE.fullmatch(seat_id) is None
+        ):
+            return Response(status_code=404)
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get(
+        "/api/v1/participation/{session_id}/{seat_id}",
+        response_model=ParticipationSnapshotResponse,
+        responses=_PARTICIPATION_ERROR_RESPONSES,
+    )
+    async def participation_snapshot(
+        request: Request,
+        session_id: str,
+        seat_id: str,
+    ) -> ParticipationSnapshotResponse:
+        if (
+            _SAFE_PATH_ID_RE.fullmatch(session_id) is None
+            or _SAFE_PATH_ID_RE.fullmatch(seat_id) is None
+        ):
+            raise HumanInputError("participation_not_found")
+        capability = _bearer_capability(request)
+        snapshot = await input_call(
+            lambda: input_store.load(
+                session_id,
+                seat_id,
+                capability=capability,
+            )
+        )
+        try:
+            return ParticipationSnapshotResponse.from_input_snapshot(snapshot)
+        except (TypeError, ValueError) as exc:
+            raise HumanInputError("input_invalid") from exc
+
+    @app.post(
+        "/api/v1/participation/{session_id}/{seat_id}/requests/{request_id}/submissions",
+        response_model=ParticipationSubmissionResponse,
+        responses=_PARTICIPATION_ERROR_RESPONSES,
+        status_code=202,
+    )
+    async def participation_submit(
+        request: Request,
+        session_id: str,
+        seat_id: str,
+        request_id: str,
+    ) -> Response:
+        host = request.headers.get("host")
+        origin = request.headers.get("origin")
+        fetch_site = request.headers.get("sec-fetch-site")
+        if not _same_loopback_origin(origin, host, request.url.scheme) or (
+            fetch_site is not None and fetch_site.casefold() != "same-origin"
+        ):
+            return _error("cross_origin_forbidden", 403)
+        if any(
+            _SAFE_PATH_ID_RE.fullmatch(value) is None
+            for value in (session_id, seat_id, request_id)
+        ):
+            raise HumanInputError("invalid_request")
+        capability = _bearer_capability(request)
+        raw_payload = await _bounded_json_body(request)
+        try:
+            submission = ParticipationSubmissionRequest.model_validate(raw_payload)
+        except (TypeError, ValueError) as exc:
+            raise HumanInputError("invalid_request") from exc
+        result = await input_call(
+            lambda: input_store.submit(
+                session_id,
+                seat_id,
+                request_id,
+                capability=capability,
+                submission_id=submission.submission_id,
+                move=submission.move,
+            )
+        )
+        public_status = "duplicate" if result.status == "idempotent" else "submitted"
+        payload = ParticipationSubmissionResponse(
+            request_id=result.request_id,
+            status=public_status,
+        )
+        return JSONResponse(
+            status_code=200 if public_status == "duplicate" else 202,
+            content=payload.model_dump(mode="json"),
+            headers=_security_headers(),
+        )
 
     @app.get("/api/v1/health", response_model=HealthResponse)
     async def health() -> HealthResponse:

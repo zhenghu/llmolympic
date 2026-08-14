@@ -228,6 +228,104 @@
     "a malformed public event is rejected",
   );
 
+  const participationRequest = {
+    request_id: "request-7",
+    request_seq: 7,
+    match_event_seq: 12,
+    state: "pending",
+    prompt: '<img src=x onerror="alert(1)">\nH8?',
+    created_at: "2026-08-14T12:00:00.000000Z",
+    expires_at: "2026-08-14T12:01:00.000000Z",
+  };
+  const participationSnapshot = {
+    api_version: "v1",
+    session_id: "session-7",
+    seat_id: "seat-1",
+    status: "active",
+    game: "gomoku",
+    player_name: "Alice",
+    players: ["Alice", "Bob"],
+    created_at: "2026-08-14T11:59:00.000000Z",
+    updated_at: "2026-08-14T12:00:00.000000Z",
+    lease_expires_at: "2026-08-14T12:02:00.000000Z",
+    request: participationRequest,
+    final_match_id: null,
+  };
+  assert(
+    observer.validateParticipationRequest(participationRequest),
+    "a current participation prompt is accepted as plain text",
+  );
+  assert(
+    observer.validateParticipationSnapshot(participationSnapshot, "session-7", "seat-1"),
+    "an active capability-scoped participation snapshot is accepted",
+  );
+  assert(
+    observer.participationKeepsCapability("active"),
+    "an active seat keeps its tab-scoped capability for refresh recovery",
+  );
+  assert(
+    observer.participationComponentKey("session-a", "seat-1")
+      !== observer.participationComponentKey("session-b", "seat-1"),
+    "changing participation sessions remounts the credential-scoped page",
+  );
+  assert(
+    observer.participationComponentKey("session-a", "seat-1")
+      !== observer.participationComponentKey("session-a", "seat-2"),
+    "changing participation seats remounts the credential-scoped page",
+  );
+  ["completed", "interrupted", "expired"].forEach((status) => {
+    assert(
+      !observer.participationKeepsCapability(status),
+      `${status} clears its no-longer-needed capability`,
+    );
+  });
+  [401, 403, 404, 410].forEach((status) => {
+    assert(
+      observer.participationErrorClearsCapability(status),
+      `HTTP ${status} clears an unusable capability`,
+    );
+  });
+  assert(
+    !observer.participationErrorClearsCapability(503),
+    "a transient input-service failure keeps the capability for retry",
+  );
+  assert(
+    !observer.validateParticipationSnapshot({
+      ...participationSnapshot,
+      submitted_move: "H8",
+    }, "session-7", "seat-1"),
+    "GET snapshots fail closed if submitted content appears",
+  );
+  assert(
+    !observer.validateParticipationRequest({
+      ...participationRequest,
+      submission_id: "a".repeat(32),
+    }),
+    "request DTOs reject submission identifiers",
+  );
+  assert(
+    observer.validateParticipationSubmission({
+      api_version: "v1",
+      request_id: "request-7",
+      status: "submitted",
+    }, "request-7"),
+    "a transport-level submitted acknowledgement is accepted",
+  );
+  assert(
+    !observer.validateParticipationSubmission({
+      api_version: "v1",
+      request_id: "request-7",
+      status: "accepted",
+    }, "request-7"),
+    "the browser never mistakes persistence for game-rule acceptance",
+  );
+  equal(observer.countCharacters("A😀B"), 3, "character counts use Unicode code points");
+  equal(
+    observer.remainingCopy("2026-08-14T12:00:30.000Z", Date.parse("2026-08-14T12:00:00.000Z")),
+    "剩余 30 秒",
+    "the visible request deadline is deterministic",
+  );
+
   if (typeof console !== "undefined" && console.log) {
     console.log("observer client state tests passed");
   } else if (typeof print === "function") {

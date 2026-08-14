@@ -28,5 +28,11 @@ test-results/
 *.live.db-wal
 *.live.db-shm
 
+# 本地浏览器人类输入 sidecar（含短期题面与提交，不属于正式档案）
+*.input.db
+*.input.db-journal
+*.input.db-wal
+*.input.db-shm
+
 # 系统
 .DS_Store
