@@ -13,6 +13,7 @@ const h = React.createElement;
 const API_VERSION = "v1";
 const MAX_MATCHES = 100;
 const MAX_MOVE_CHARACTERS = 4096;
+const MAX_PARTICIPATION_PLAYERS = 16;
 const PARTICIPATION_POLL_INTERVAL = 1000;
 const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
@@ -353,8 +354,9 @@ function validateParticipationSnapshot(snapshot, sessionId, seatId) {
     || !snapshot.player_name
     || Array.from(snapshot.player_name).length > 512
     || !Array.isArray(snapshot.players)
-    || snapshot.players.length !== 2
-    || new Set(snapshot.players).size !== 2
+    || snapshot.players.length < 2
+    || snapshot.players.length > MAX_PARTICIPATION_PLAYERS
+    || new Set(snapshot.players).size !== snapshot.players.length
     || snapshot.players.some((player) => typeof player !== "string"
       || !player
       || Array.from(player).length > 512)
@@ -2221,7 +2223,9 @@ function ParticipationPage({ seatId, sessionId }) {
       h("div", null,
         h("p", { className: "eyebrow" }, `${gameLabel(snapshot.game)} · HUMAN INPUT`),
         h("h1", { className: "detail-title", id: "participation-title" }, snapshot.player_name),
-        h("p", { className: "hero-copy" }, `${snapshot.players.join(" 对 ")}。题面和提交都只在本机比赛进程与这个席位之间传输。`),
+        h("p", { className: "hero-copy" }, `${snapshot.players.length === 2
+          ? snapshot.players.join(" 对 ")
+          : `参赛者：${snapshot.players.join("、")}`}。这个 capability 只可读取并提交当前席位的请求；对局公开事件仍可能出现在本机观战页。`),
       ),
       h("div", { className: `participation-connection ${snapshot.status}` },
         h("span", { className: "status-dot", "aria-hidden": "true" }),

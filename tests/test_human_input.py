@@ -55,6 +55,7 @@ def _session(
     heartbeat_seconds: float = 0.05,
     poll_seconds: float = 0.01,
     player_name: str = "浏览器人类",
+    players: tuple[str, ...] | None = None,
 ) -> InputSessionStore:
     options = {
         "player_name": player_name,
@@ -63,6 +64,8 @@ def _session(
     }
     if clock is not None:
         options["clock"] = clock
+    if players is not None:
+        options["players"] = players
     return InputSessionStore(archive, **options)
 
 
@@ -249,43 +252,280 @@ def test_atomic_double_submit_and_idempotent_retry_keep_the_first_move(
         session.close()
 
 
-def test_wrong_or_cross_session_capability_cannot_read_or_submit(tmp_path: Path) -> None:
+def test_two_seats_share_one_roster_without_cross_capability_or_move_leakage(
+    tmp_path: Path,
+) -> None:
     archive = tmp_path / "archive.db"
-    first = _session(archive, player_name="甲")
-    second = _session(archive, player_name="乙")
+    roster = ("甲", "乙")
+    first = _session(archive, player_name="甲", players=roster)
+    second = _session(archive, player_name="乙", players=roster)
     web = _web(archive)
 
     async def scenario() -> None:
-        pending = asyncio.create_task(first.resolve("move", timeout_seconds=1.0))
-        request = await _wait_for_request(web, first)
+        first_pending = asyncio.create_task(
+            first.resolve("甲的题面", timeout_seconds=2.0, match_event_seq=3)
+        )
+        second_pending = asyncio.create_task(
+            second.resolve("乙的题面", timeout_seconds=2.0, match_event_seq=4)
+        )
+        first_request, second_request = await asyncio.gather(
+            _wait_for_request(web, first),
+            _wait_for_request(web, second),
+        )
+        first_snapshot = _load(web, first)
+        second_snapshot = _load(web, second)
+
+        assert first.session_id != second.session_id
+        assert first.seat_id != second.seat_id
+        assert first.capability != second.capability
+        assert first_snapshot.players == roster
+        assert second_snapshot.players == roster
+        assert first_snapshot.player_name == "甲"
+        assert second_snapshot.player_name == "乙"
+        assert first_request.request_id != second_request.request_id
+        assert first_request.request_seq == second_request.request_seq == 0
+        assert first_request.match_event_seq == 3
+        assert second_request.match_event_seq == 4
+
         wrong = "A" * len(first.capability)
         assert _error_code(
             lambda: web.load(first.session_id, first.seat_id, capability=wrong)
         ) == "input_forbidden"
         assert _error_code(
+            lambda: web.load(
+                first.session_id,
+                first.seat_id,
+                capability=second.capability,
+            )
+        ) == "input_forbidden"
+        assert _error_code(
+            lambda: web.load(
+                second.session_id,
+                second.seat_id,
+                capability=first.capability,
+            )
+        ) == "input_forbidden"
+        assert _error_code(
             lambda: _submit(
                 web,
                 first,
-                request.request_id,
-                "A1",
+                first_request.request_id,
+                "乙越权提交",
                 submission_id="4" * 32,
                 capability=second.capability,
             )
         ) == "input_forbidden"
-        _submit(
-            web,
-            first,
-            request.request_id,
-            "H8",
-            submission_id="5" * 32,
-        )
-        assert await pending == "H8"
+        assert _error_code(
+            lambda: _submit(
+                web,
+                second,
+                second_request.request_id,
+                "甲越权提交",
+                submission_id="5" * 32,
+                capability=first.capability,
+            )
+        ) == "input_forbidden"
+        assert _load(web, first).request.state == "pending"
+        assert _load(web, second).request.state == "pending"
+
+        barrier = threading.Barrier(2)
+
+        def submit(
+            session: InputSessionStore,
+            request_id: str,
+            move: str,
+            submission_id: str,
+        ) -> str:
+            barrier.wait(timeout=1.0)
+            return _submit(
+                web,
+                session,
+                request_id,
+                move,
+                submission_id=submission_id,
+            ).status
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_submit = executor.submit(
+                submit,
+                first,
+                first_request.request_id,
+                "甲的动作",
+                "6" * 32,
+            )
+            second_submit = executor.submit(
+                submit,
+                second,
+                second_request.request_id,
+                "乙的动作",
+                "7" * 32,
+            )
+            assert first_submit.result(timeout=2) == "accepted"
+            assert second_submit.result(timeout=2) == "accepted"
+
+        assert await asyncio.gather(first_pending, second_pending) == [
+            "甲的动作",
+            "乙的动作",
+        ]
+        assert "乙的动作" not in repr(_load(web, first))
+        assert "甲的动作" not in repr(_load(web, second))
 
     try:
         asyncio.run(scenario())
     finally:
         first.close()
         second.close()
+
+
+def test_sixteen_seats_retry_contention_across_heartbeat_and_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "sixteen-seat-contention.db"
+    roster = tuple(f"选手 {index}" for index in range(16))
+    sessions: list[InputSessionStore] = []
+    state_lock = threading.Lock()
+
+    heartbeat_barrier = threading.Barrier(len(roster))
+    heartbeat_injected: set[str] = set()
+    heartbeat_recovered: set[str] = set()
+    heartbeat_recovered_event = threading.Event()
+    original_heartbeat_once = InputSessionStore._heartbeat_once
+
+    def contended_heartbeat(session: InputSessionStore) -> None:
+        with state_lock:
+            inject = session.session_id not in heartbeat_injected
+            if inject:
+                heartbeat_injected.add(session.session_id)
+        if inject:
+            heartbeat_barrier.wait(timeout=5.0)
+            raise sqlite3.OperationalError("database is locked")
+
+        original_heartbeat_once(session)
+        session._heartbeat_seconds = 59.0
+        with state_lock:
+            heartbeat_recovered.add(session.session_id)
+            if len(heartbeat_recovered) == len(roster):
+                heartbeat_recovered_event.set()
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_heartbeat_once",
+        contended_heartbeat,
+    )
+
+    try:
+        sessions = [
+            _session(
+                archive,
+                heartbeat_seconds=0.01,
+                poll_seconds=0.005,
+                player_name=name,
+                players=roster,
+            )
+            for name in roster
+        ]
+        assert heartbeat_recovered_event.wait(timeout=5.0)
+        assert heartbeat_injected == {session.session_id for session in sessions}
+        assert all(session._failure is None for session in sessions)
+        assert all(
+            session._thread is not None and session._thread.is_alive()
+            for session in sessions
+        )
+
+        poll_injected: set[str] = set()
+        poll_recovered: set[str] = set()
+        poll_injected_event = threading.Event()
+        original_consume_if_ready = InputSessionStore._consume_if_ready
+
+        def contended_poll(session: InputSessionStore, request_id: str) -> str | None:
+            with state_lock:
+                inject = session.session_id not in poll_injected
+                if inject:
+                    poll_injected.add(session.session_id)
+                    if len(poll_injected) == len(roster):
+                        poll_injected_event.set()
+            if inject:
+                raise sqlite3.OperationalError("database is locked")
+
+            result = original_consume_if_ready(session, request_id)
+            with state_lock:
+                poll_recovered.add(session.session_id)
+            return result
+
+        monkeypatch.setattr(
+            InputSessionStore,
+            "_consume_if_ready",
+            contended_poll,
+        )
+        web = _web(archive)
+
+        async def scenario() -> None:
+            pending = [
+                asyncio.create_task(
+                    session.resolve(
+                        f"{session.player_name} 的私有题面",
+                        timeout_seconds=5.0,
+                        match_event_seq=index,
+                    )
+                )
+                for index, session in enumerate(sessions)
+            ]
+            requests = await asyncio.gather(
+                *(_wait_for_request(web, session) for session in sessions)
+            )
+            assert await asyncio.to_thread(poll_injected_event.wait, 3.0)
+
+            submissions = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        _submit,
+                        web,
+                        session,
+                        request.request_id,
+                        f"move-{index}",
+                        submission_id=f"{index:032x}",
+                    )
+                    for index, (session, request) in enumerate(
+                        zip(sessions, requests, strict=True)
+                    )
+                )
+            )
+            assert all(result.status == "accepted" for result in submissions)
+            moves = await asyncio.wait_for(asyncio.gather(*pending), timeout=5.0)
+            assert moves == [f"move-{index}" for index in range(len(roster))]
+
+        asyncio.run(scenario())
+        assert poll_injected == {session.session_id for session in sessions}
+        assert poll_recovered == {session.session_id for session in sessions}
+        assert all(session._failure is None for session in sessions)
+    finally:
+        for session in sessions:
+            session.close()
+
+
+def test_heartbeat_contention_exhaustion_becomes_explicit_session_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def always_contended(_session: InputSessionStore) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_heartbeat_once",
+        always_contended,
+    )
+    session = _session(tmp_path / "heartbeat-failure.db", heartbeat_seconds=0.01)
+    try:
+        assert session._stop.wait(timeout=1.0)
+        assert session._failure is not None
+        assert session._failure.code == "input_unavailable"
+        assert session._thread is not None
+        session._thread.join(timeout=1.0)
+        assert not session._thread.is_alive()
+    finally:
+        session.close()
 
 
 def test_web_process_restart_can_submit_the_same_pending_request(tmp_path: Path) -> None:
@@ -516,6 +756,57 @@ def test_engine_verdict_closes_request_and_next_request_has_new_identity(
 
     try:
         asyncio.run(scenario())
+    finally:
+        session.close()
+
+
+def test_engine_verdict_retries_transient_sqlite_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "verdict-contention.db"
+    session = _session(archive)
+    web = _web(archive)
+    original = InputSessionStore._resolve_request_once
+    attempts = 0
+
+    def contended_verdict(
+        current: InputSessionStore,
+        *,
+        accepted: bool,
+        reason: str | None,
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original(current, accepted=accepted, reason=reason)
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_resolve_request_once",
+        contended_verdict,
+    )
+
+    async def scenario() -> None:
+        pending = asyncio.create_task(session.resolve("move", timeout_seconds=1.0))
+        request = await _wait_for_request(web, session)
+        _submit(
+            web,
+            session,
+            request.request_id,
+            "H8",
+            submission_id="b" * 32,
+        )
+        assert await pending == "H8"
+        session.resolve_request(accepted=True)
+        snapshot = _load(web, session)
+        assert snapshot.request is not None
+        assert snapshot.request.state == "accepted"
+
+    try:
+        asyncio.run(scenario())
+        assert attempts == 2
     finally:
         session.close()
 
@@ -950,6 +1241,86 @@ def test_browser_human_player_uses_fragment_capability_and_async_inbox(
         assert terminal.final_match_id == "browser-final"
     finally:
         browser.close()
+
+
+def test_browser_human_player_accepts_bounded_multiplayer_rosters(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "multiplayer-archive.db"
+    humans = [
+        HumanPlayer(
+            f"人类 {index}",
+            timeout=1.0,
+            entrant_id=f"human:web-player-{index}",
+        )
+        for index in range(2)
+    ]
+    players = [*humans, SimpleNamespace(name="模型")]
+    game = SimpleNamespace(name="math_quiz")
+    browsers = [
+        BrowserHumanPlayer.create(archive, game, players, human)
+        for human in humans
+    ]
+    web = _web(archive)
+
+    try:
+        for browser in browsers:
+            snapshot = web.load(
+                browser.session_id,
+                browser.seat_id,
+                capability=urlsplit(
+                    browser.participation_url("http://127.0.0.1:8000")
+                ).fragment.removeprefix("capability="),
+            )
+            assert snapshot.players == ("人类 0", "人类 1", "模型")
+            assert snapshot.player_name == browser.name
+
+        boundary_human = HumanPlayer(
+            "边界人类",
+            timeout=1.0,
+            entrant_id="human:web-player-boundary",
+        )
+        boundary_players = [
+            boundary_human,
+            *(SimpleNamespace(name=f"边界选手 {index}") for index in range(1, 16)),
+        ]
+        boundary_browser = BrowserHumanPlayer.create(
+            archive,
+            game,
+            boundary_players,
+            boundary_human,
+        )
+        try:
+            assert web.load(
+                boundary_browser.session_id,
+                boundary_browser.seat_id,
+                capability=urlsplit(
+                    boundary_browser.participation_url("http://127.0.0.1:8000")
+                ).fragment.removeprefix("capability="),
+            ).players == tuple(player.name for player in boundary_players)
+        finally:
+            boundary_browser.close()
+
+        extra_human = HumanPlayer(
+            "选手 0",
+            timeout=1.0,
+            entrant_id="human:web-player-over-limit",
+        )
+        too_many = [
+            extra_human,
+            *(SimpleNamespace(name=f"选手 {index}") for index in range(1, 17)),
+        ]
+        with pytest.raises(HumanInputError) as caught:
+            BrowserHumanPlayer.create(
+                archive,
+                game,
+                too_many,
+                extra_human,
+            )
+        assert caught.value.code == "input_invalid"
+    finally:
+        for browser in browsers:
+            browser.close()
 
 
 def test_runtime_sidecar_corruption_cannot_modify_the_archive(tmp_path: Path) -> None:

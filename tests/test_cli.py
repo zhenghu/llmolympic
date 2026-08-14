@@ -35,6 +35,7 @@ from llmolympic.core.tournament import (
     resume_round_robin,
 )
 from llmolympic.games import create_game
+from llmolympic.human_input import HumanInputError
 from llmolympic.providers.base import Provider
 from llmolympic.providers.mock import MockProvider
 from llmolympic.web.live_reader import LiveSQLiteReader
@@ -1862,19 +1863,8 @@ def test_invalid_llm_timeout_environment_does_not_block_human_only_match(
     [
         (["--human-input", "browser"], "terminal 或 web"),
         (
-            [
-                "--game",
-                "gomoku",
-                "--players",
-                "human:a,human:b",
-                "--human-input",
-                "web",
-            ],
-            "Web 人类输入首版仅支持",
-        ),
-        (
             ["--players", "mock:fixed,mock:random", "--human-input", "web"],
-            "Web 人类输入首版仅支持",
+            "至少包含 1 名人类选手",
         ),
         (
             [
@@ -1914,7 +1904,7 @@ def test_web_human_input_rejects_unsafe_configuration_before_database_creation(
     assert not path.exists()
 
 
-def test_play_web_human_uses_browser_backend_and_completes_after_archive(
+def test_play_web_humans_create_independent_seats_and_complete_after_archive(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1922,12 +1912,14 @@ def test_play_web_human_uses_browser_backend_and_completes_after_archive(
     instances = []
 
     class FakeBrowserHuman(HumanPlayer):
-        def __init__(self, human: HumanPlayer) -> None:
+        def __init__(self, human: HumanPlayer, seat_number: int) -> None:
             super().__init__(
                 human.name,
                 timeout=human.timeout,
                 entrant_id=human.entrant_id,
             )
+            self.seat_number = seat_number
+            self.prompts = []
             self.events = []
             self.final_match_id = None
             self.closed = False
@@ -1937,19 +1929,25 @@ def test_play_web_human_uses_browser_backend_and_completes_after_archive(
             assert database == path.resolve()
             assert game.name == "math_quiz"
             assert human in players
-            instance = cls(human)
+            assert [player.name for player in players] == ["甲", "乙"]
+            instance = cls(human, len(instances) + 1)
             instances.append(instance)
             return instance
 
         def participation_url(self, base_url: str) -> str:
-            return f"{base_url}/participate/session/seat#capability=secret"
+            return (
+                f"{base_url}/participate/session-{self.seat_number}/"
+                f"seat-{self.seat_number}#capability=secret-{self.seat_number}"
+            )
 
         async def get_move(self, prompt: str) -> str:
             assert prompt
+            self.prompts.append(prompt)
             return "0"
 
         def observe_event(self, event) -> None:
-            self.events.append(event)
+            if event.player == self.name:
+                self.events.append(event)
 
         def complete(self, final_match_id: str) -> None:
             self.final_match_id = final_match_id
@@ -1968,7 +1966,7 @@ def test_play_web_human_uses_browser_backend_and_completes_after_archive(
             "--game",
             "math_quiz",
             "--players",
-            "human:我,mock:fixed",
+            "human:甲,human:乙",
             "--rounds",
             "1",
             "--human-input",
@@ -1979,17 +1977,147 @@ def test_play_web_human_uses_browser_backend_and_completes_after_archive(
     )
 
     assert result.exit_code == 0, result.output
-    assert "/participate/session/seat#capability=secret" in result.output
-    assert len(instances) == 1
-    instance = instances[0]
+    assert "2 个独立席位" in result.output
+    assert "/participate/session-1/seat-1#capability=secret-1" in result.output
+    assert "/participate/session-2/seat-2#capability=secret-2" in result.output
+    assert [instance.name for instance in instances] == ["甲", "乙"]
     matches = SQLiteStore(path).list_matches()
     assert len(matches) == 1
-    assert instance.final_match_id == matches[0].match_id
-    assert instance.closed
-    assert any(event.type == EventType.TURN_PROMPT for event in instance.events)
+    assert matches[0].players == ("甲", "乙")
+    for instance in instances:
+        assert instance.prompts
+        assert instance.final_match_id == matches[0].match_id
+        assert instance.closed
+        assert any(event.type == EventType.TURN_PROMPT for event in instance.events)
 
 
-def test_play_web_human_closes_session_if_link_display_fails(
+def test_play_web_humans_can_join_unrated_three_player_archive(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "web-human-three-player.db"
+    instances = []
+
+    class FakeBrowserHuman(HumanPlayer):
+        def __init__(self, human: HumanPlayer) -> None:
+            super().__init__(
+                human.name,
+                timeout=human.timeout,
+                entrant_id=human.entrant_id,
+            )
+            self.final_match_id = None
+            self.closed = False
+
+        @classmethod
+        def create(cls, database, game, players, human):
+            assert database == path.resolve()
+            assert game.name == "math_quiz"
+            assert [player.name for player in players] == ["甲", "乙", "mock:fixed"]
+            instance = cls(human)
+            instances.append(instance)
+            return instance
+
+        def participation_url(self, base_url: str) -> str:
+            return f"{base_url}/participate/session-{self.name}/seat#capability=secret"
+
+        async def get_move(self, prompt: str) -> str:
+            assert prompt
+            return "0"
+
+        def observe_event(self, _event) -> None:
+            pass
+
+        def complete(self, final_match_id: str) -> None:
+            self.final_match_id = final_match_id
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("llmolympic.cli.main.BrowserHumanPlayer", FakeBrowserHuman)
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "human:甲,human:乙,mock:fixed",
+            "--rounds",
+            "1",
+            "--human-input",
+            "web",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    summary = SQLiteStore(path).list_matches()[0]
+    assert summary.players == ("甲", "乙", "mock:fixed")
+    assert not summary.rated
+    assert len(instances) == 2
+    assert all(instance.final_match_id == summary.match_id for instance in instances)
+    assert all(instance.closed for instance in instances)
+
+
+def test_play_web_humans_close_created_seats_if_second_creation_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "web-human-creation-failure.db"
+    instances = []
+    create_calls = 0
+
+    class FakeBrowserHuman(HumanPlayer):
+        def __init__(self, human: HumanPlayer) -> None:
+            super().__init__(
+                human.name,
+                timeout=human.timeout,
+                entrant_id=human.entrant_id,
+            )
+            self.closed = False
+
+        @classmethod
+        def create(cls, database, game, players, human):
+            nonlocal create_calls
+            del database, game, players
+            create_calls += 1
+            if create_calls == 2:
+                raise HumanInputError("input_unavailable")
+            instance = cls(human)
+            instances.append(instance)
+            return instance
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("llmolympic.cli.main.BrowserHumanPlayer", FakeBrowserHuman)
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "human:甲,human:乙",
+            "--rounds",
+            "1",
+            "--human-input",
+            "web",
+            "--db",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "input_unavailable" in result.output
+    assert create_calls == 2
+    assert len(instances) == 1
+    assert instances[0].closed
+    assert SQLiteStore(path).list_matches() == []
+
+
+def test_play_web_humans_close_all_sessions_if_link_display_fails(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2013,7 +2141,10 @@ def test_play_web_human_closes_session_if_link_display_fails(
             return instance
 
         def participation_url(self, base_url: str) -> str:
-            return f"{base_url}/participate/session/seat#capability=secret"
+            return (
+                f"{base_url}/participate/session-{self.name}/"
+                f"seat-{self.name}#capability=secret"
+            )
 
         def close(self) -> None:
             self.closed = True
@@ -2032,8 +2163,10 @@ def test_play_web_human_closes_session_if_link_display_fails(
         app,
         [
             "play",
+            "--game",
+            "math_quiz",
             "--players",
-            "human:我,mock:fixed",
+            "human:甲,human:乙",
             "--human-input",
             "web",
             "--db",
@@ -2042,8 +2175,8 @@ def test_play_web_human_closes_session_if_link_display_fails(
     )
 
     assert result.exit_code == 1
-    assert len(instances) == 1
-    assert instances[0].closed
+    assert len(instances) == 2
+    assert all(instance.closed for instance in instances)
 
 
 def test_human_only_match_still_rejects_conflicting_explicit_llm_timeout_flags(

@@ -1,4 +1,4 @@
-"""Capability-scoped browser input for one local human competitor.
+"""Capability-scoped browser input for local human competitors.
 
 The archive database remains owned by :class:`SQLiteStore`, and the live-event
 sidecar remains observer-only.  Browser moves travel through a separate,
@@ -21,13 +21,15 @@ import stat
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, TypeVar
 from urllib.parse import quote
 
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.core.game import MAX_PLATFORM_PLAYERS
 from llmolympic.core.player import (
     DEFAULT_MAX_RESPONSE_CHARS,
     HumanPlayer,
@@ -42,6 +44,10 @@ INPUT_DEFAULT_HEARTBEAT_SECONDS = 10.0
 INPUT_DEFAULT_POLL_SECONDS = 0.1
 INPUT_RETENTION_SECONDS = 24 * 60 * 60.0
 INPUT_MAX_SESSIONS = 64
+_SQLITE_CONTENTION_ATTEMPTS = 4
+_SQLITE_CONTENTION_RETRY_SECONDS = 0.01
+
+_T = TypeVar("_T")
 
 InputSessionStatus = Literal["active", "completed", "interrupted", "expired"]
 InputRequestStatus = Literal[
@@ -143,6 +149,27 @@ def _move_digest(move: str, capability: str) -> bytes:
     return hmac.digest(key, encoded, "sha256")
 
 
+def _is_sqlite_contention(error: BaseException) -> bool:
+    """Recognize SQLite BUSY/LOCKED through the stable wrapped error chain."""
+
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, sqlite3.Error):
+            code = getattr(current, "sqlite_errorcode", None)
+            if isinstance(code, int) and (code & 0xFF) in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                return True
+            message = str(current).casefold()
+            if "database is locked" in message or "database table is locked" in message:
+                return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _validate_text(value: object, *, maximum: int, allow_empty: bool = True) -> str:
     if not isinstance(value, str) or len(value) > maximum or (not allow_empty and not value):
         raise HumanInputError("invalid_request")
@@ -152,7 +179,11 @@ def _validate_text(value: object, *, maximum: int, allow_empty: bool = True) -> 
 
 
 def _validate_names(player_name: str, players: tuple[str, ...]) -> None:
-    if len(players) != 2 or len(set(players)) != 2 or player_name not in players:
+    if (
+        not 2 <= len(players) <= MAX_PLATFORM_PLAYERS
+        or len(set(players)) != len(players)
+        or player_name not in players
+    ):
         raise HumanInputError("input_invalid")
     for name in players:
         _validate_text(name, maximum=512, allow_empty=False)
@@ -325,7 +356,7 @@ class InputSessionStore:
         *,
         player_name: str,
         game: str = "math_quiz",
-        players: tuple[str, str] | None = None,
+        players: tuple[str, ...] | None = None,
         heartbeat_seconds: float = INPUT_DEFAULT_HEARTBEAT_SECONDS,
         poll_seconds: float = INPUT_DEFAULT_POLL_SECONDS,
         clock=time.time,
@@ -370,6 +401,31 @@ class InputSessionStore:
             daemon=True,
         )
         self._thread.start()
+
+    def _retry_sqlite_contention(self, operation: Callable[[], _T]) -> _T:
+        """Retry a complete fenced transaction after bounded SQLite contention."""
+
+        last_error: BaseException | None = None
+        for attempt in range(_SQLITE_CONTENTION_ATTEMPTS):
+            try:
+                return operation()
+            except HumanInputError as exc:
+                if not _is_sqlite_contention(exc):
+                    raise
+                last_error = exc
+            except sqlite3.Error as exc:
+                if not _is_sqlite_contention(exc):
+                    raise HumanInputError("input_unavailable") from exc
+                last_error = exc
+
+            if attempt + 1 < _SQLITE_CONTENTION_ATTEMPTS:
+                delay = _SQLITE_CONTENTION_RETRY_SECONDS * (2**attempt)
+                if self._stop.wait(delay):
+                    raise HumanInputError("input_interrupted") from last_error
+
+        if isinstance(last_error, HumanInputError):
+            raise last_error
+        raise HumanInputError("input_unavailable") from last_error
 
     @property
     def control_fragment(self) -> str:
@@ -452,32 +508,43 @@ class InputSessionStore:
             connection.rollback()
             raise HumanInputError("input_unavailable") from exc
 
+    def _heartbeat_once(self) -> None:
+        connection = _connect(self.path, create=False)
+        try:
+            _validate_schema(connection)
+            now = float(self._clock())
+            updated = connection.execute(
+                "UPDATE input_sessions SET updated_at=?, lease_expires_at=? "
+                "WHERE session_id=? AND status='active' AND owner_digest=? "
+                "AND lease_expires_at > ?",
+                (
+                    now,
+                    now + INPUT_STALE_AFTER_SECONDS,
+                    self.session_id,
+                    _token_digest(self._owner_token),
+                    now,
+                ),
+            ).rowcount
+            connection.commit()
+            if updated != 1:
+                raise HumanInputError("input_session_lost")
+        except HumanInputError:
+            connection.rollback()
+            raise
+        except (OSError, OverflowError, sqlite3.Error, TypeError, ValueError) as exc:
+            connection.rollback()
+            raise HumanInputError("input_unavailable") from exc
+        finally:
+            connection.close()
+            _secure_file(self.path)
+
     def _heartbeat(self) -> None:
         while not self._stop.wait(self._heartbeat_seconds):
             try:
-                connection = _connect(self.path, create=False)
-                try:
-                    _validate_schema(connection)
-                    now = float(self._clock())
-                    updated = connection.execute(
-                        "UPDATE input_sessions SET updated_at=?, lease_expires_at=? "
-                        "WHERE session_id=? AND status='active' AND owner_digest=? "
-                        "AND lease_expires_at > ?",
-                        (
-                            now,
-                            now + INPUT_STALE_AFTER_SECONDS,
-                            self.session_id,
-                            _token_digest(self._owner_token),
-                            now,
-                        ),
-                    ).rowcount
-                    connection.commit()
-                    if updated != 1:
-                        raise HumanInputError("input_session_lost")
-                finally:
-                    connection.close()
-                    _secure_file(self.path)
+                self._retry_sqlite_contention(self._heartbeat_once)
             except HumanInputError as exc:
+                if self._stop.is_set():
+                    return
                 self._failure = exc
                 self._stop.set()
                 return
@@ -514,14 +581,19 @@ class InputSessionStore:
             raise HumanInputError("input_invalid")
         prompt = _validate_text(prompt, maximum=INPUT_MAX_PROMPT_CHARS)
         request_id = await asyncio.to_thread(
-            self._create_request,
-            prompt,
-            timeout_seconds,
-            match_event_seq,
+            self._retry_sqlite_contention,
+            lambda: self._create_request(
+                prompt,
+                timeout_seconds,
+                match_event_seq,
+            ),
         )
         try:
             while True:
-                outcome = await asyncio.to_thread(self._consume_if_ready, request_id)
+                outcome = await asyncio.to_thread(
+                    self._retry_sqlite_contention,
+                    lambda: self._consume_if_ready(request_id),
+                )
                 if outcome is not None:
                     return outcome
                 await asyncio.sleep(self._poll_seconds)
@@ -699,6 +771,16 @@ class InputSessionStore:
     ) -> None:
         """Record the engine verdict for the most recently consumed move."""
 
+        self._retry_sqlite_contention(
+            lambda: self._resolve_request_once(accepted=accepted, reason=reason)
+        )
+
+    def _resolve_request_once(
+        self,
+        *,
+        accepted: bool,
+        reason: str | None,
+    ) -> None:
         connection = self._owner_connection()
         now = float(self._clock())
         try:
@@ -1045,8 +1127,11 @@ class BrowserHumanPlayer(HumanPlayer):
     ) -> BrowserHumanPlayer:
         game_name = getattr(game, "name", None)
         names = tuple(getattr(player, "name", None) for player in players)
-        if not isinstance(game_name, str) or len(names) != 2 or not all(
-            isinstance(name, str) for name in names
+        if (
+            not isinstance(game_name, str)
+            or not 2 <= len(names) <= MAX_PLATFORM_PLAYERS
+            or not all(isinstance(name, str) for name in names)
+            or not any(player is human for player in players)
         ):
             raise HumanInputError("input_invalid")
         session = InputSessionStore(

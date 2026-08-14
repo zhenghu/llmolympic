@@ -26,6 +26,7 @@ from pydantic import (
 
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.events import EventType, MatchEvent
+from llmolympic.core.game import MAX_PLATFORM_PLAYERS
 from llmolympic.core.storage import MatchSummary as StorageMatchSummary
 from llmolympic.core.storage import RatingEntry
 
@@ -795,19 +796,26 @@ class ParticipationSnapshotResponse(_PublicModel):
     @field_validator("players")
     @classmethod
     def _validate_players(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(value) != 2 or len(set(value)) != 2 or any(
-            not player
-            or len(player) > 512
+        if (
+            not 2 <= len(value) <= MAX_PLATFORM_PLAYERS
+            or len(set(value)) != len(value)
             or any(
-                ord(character) < 32
-                or 127 <= ord(character) <= 159
-                or 0xD800 <= ord(character) <= 0xDFFF
-                or character in _BIDI_CONTROL_CHARACTERS
-                for character in player
+                not player
+                or len(player) > 512
+                or any(
+                    ord(character) < 32
+                    or 127 <= ord(character) <= 159
+                    or 0xD800 <= ord(character) <= 0xDFFF
+                    or character in _BIDI_CONTROL_CHARACTERS
+                    for character in player
+                )
+                for player in value
             )
-            for player in value
         ):
-            raise ValueError("participation players must contain two safe display names")
+            raise ValueError(
+                "participation players must contain 2 to "
+                f"{MAX_PLATFORM_PLAYERS} safe display names"
+            )
         return value
 
     @model_validator(mode="after")

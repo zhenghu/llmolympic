@@ -307,10 +307,12 @@ llmolympic history
 llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 ```
 
-### 本机 React 参与与观战页（阶段四 4.4）
+### 本机 React 参与与观战页（阶段四 4.4 / 4.5a）
 
 阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；阶段 4.3/4.4 自 v0.6.0 起在此基础上加入
-运行中事件 broker 与本机浏览器人类输入。Web 服务端依赖仍通过可选的
+运行中事件 broker 与单个本机浏览器人类输入。当前源码的 Unreleased 阶段 4.5a 已进一步
+支持同一场 `play` 的多个独立本机浏览器 Human 席位；该功能尚未包含在 v0.6.0 发布资产中。
+Web 服务端依赖仍通过可选的
 `web` extra 安装；若上面只安装了基础 wheel，可使用同一发布资产补齐依赖：
 
 ```bash
@@ -330,7 +332,7 @@ macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项
 端口或进程名终止其他程序；如果 8000 端口已由手工启动的服务占用，启动脚本会提示先回到
 原终端按 `Ctrl+C`，不会接管或误停该进程。
 
-服务默认仅监听 `127.0.0.1:8000`，首版明确拒绝 `0.0.0.0`、局域网地址和公网地址；
+服务默认仅监听 `127.0.0.1:8000`，当前实现明确拒绝 `0.0.0.0`、局域网地址和公网地址；
 当前没有远程认证或 TLS，不能将它直接暴露到网络。启动后在浏览器打开
 `http://127.0.0.1:8000/`，可以看到同一数据库上正在运行的 `play`、`series` 或
 `round-robin`，也可按项目筛选最近对局和总体/分项目 ELO。实时详情支持跟随、暂停、逐条
@@ -348,16 +350,38 @@ llmolympic play \
   --db ~/.llmolympic/llmolympic.db
 ```
 
-CLI 会打印形如 `/participate/<SESSION>/<SEAT>#capability=...` 的一次性本机链接。浏览器读取
-fragment 中的高熵 capability 后立即从地址栏移除，只在当前标签页会话中保存；服务端数据库
-只保存摘要。参与页显示引擎生成的原始文本题面，并把最多 4096 个 Unicode 字符的文本提交
-给同一个 `HumanPlayer` 异步接口。提交成功只代表“引擎已收到”，合法性仍由具体 Game 判断；
-非法走法会生成新的 request ID 和修正题面，不会把旧提交串到下一轮。
+当前源码还可启动两个本机浏览器 Human 的五子棋；CLI 会分别标注并打印两条链接：
 
-4.4 首个切片仅支持 `play` 中恰好 1 名浏览器人类和 1 名 mock/LLM，对所有项目使用通用
-文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。它不允许网页创建比赛、
-选择 Provider、读取凭据、管理 ELO，也不开放 `series`、`round-robin`、多人浏览器人类或
+```bash
+llmolympic play \
+  --game gomoku \
+  --players human:黑方,human:白方 \
+  --human-input web \
+  --timeout 120 \
+  --db ~/.llmolympic/llmolympic.db
+```
+
+CLI 会为每名浏览器 Human 打印形如
+`/participate/<SESSION>/<SEAT>#capability=...` 的独立一次性本机链接。每条链接只能交给其标注的
+席位使用；浏览器读取 fragment 中的高熵 capability 后立即从地址栏移除，只在当前标签页会话
+中保存，服务端数据库只保存摘要。参与页显示引擎生成的原始文本题面，并把最多 4096 个
+Unicode 字符的文本提交给对应的 `HumanPlayer` 异步接口。提交成功只代表“引擎已收到”，
+合法性仍由具体 Game 判断；非法走法会生成新的 request ID 和修正题面，不会把旧提交串到
+下一轮，也不会把一个席位的提交送入另一个席位。
+
+4.5a 只放宽单场 `play` 的本机浏览器席位数量：比赛需有 2–16 名选手且至少一名 Human，
+最终人数还必须满足具体 Game 的约束；每名 Human 都获得独立的 session、seat 和 capability，
+其余选手仍可为 mock/LLM。三名及以上选手的单场会完整存档但不计入 ELO，只有双人对局参与
+现有 ELO 更新。每个 capability 只允许读取并提交对应席位的当前 request；对局的
+公开题面和动作事件仍会进入同机的实时观战页，因此它不是隐藏题目或公开事件的保密通道。
+所有项目继续使用通用文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。网页
+仍不能创建比赛、选择 Provider、读取凭据或管理 ELO，也不开放 `series`、`round-robin` 或
 局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
+
+这是可信本机操作者场景，不是同一 macOS/Linux 账户内不同用户之间的保密边界：运行命令的
+终端会显示全部 capability 链接，拥有该操作系统账户文件访问权的人也不属于威胁模型。远程
+多席位必须在后续切片加入正式身份认证、席位授权、TLS、限流和安全审计，不能通过反向代理
+或修改监听地址直接暴露当前服务。
 
 React 19.2.8、ReactDOM 19.2.8 与 Scheduler 0.27.0 通过锁定依赖和可复现构建合并为同源
 生产 bundle，随 wheel/sdist 离线分发；打开页面不访问 CDN，运行时也不需要 Node、外部
@@ -379,8 +403,9 @@ Web 未启动或客户端过慢都不会改变比赛结果、Provider 预算、E
 重新创建；不要把它提交到 Git，也不要用它替代主数据库备份。
 
 浏览器人类输入使用另一份 `example.db.input.db`。它以 `0600` 保存短期席位、题面和尚未
-消费的提交，比赛进程持有 owner fencing 与租约，Web 仅能凭 seat capability 对当前 request
-做一次原子提交。比赛与 Web 服务均停止后可删除；它不是正式档案，不应提交、同步或备份。
+消费的提交；每名浏览器 Human 拥有独立 session、seat 和 capability，比赛进程持有各席位的
+owner fencing 与租约，Web 仅能凭对应 seat capability 对当前 request 做一次原子提交。
+比赛与 Web 服务均停止后可删除；它不是正式档案，不应提交、同步或备份。
 
 Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `query_only` 连接，不创建、
 迁移或修改它们，也不更新权限或 ELO。唯一写端点使用同源 POST、Bearer capability、严格
@@ -422,8 +447,9 @@ JSON/体积上限和幂等 submission ID，只能推进已有 input request。si
 
 这保证了引擎与远程/独立客户端的盲答语义。单个共享终端仍不能为多名人类
 提供彼此隔离的私密输入界面；本地 reader 只会串行化共享 stdin 的提示，不会隐藏
-已经输入的内容。4.4 的本机浏览器后端解决了单个 Web Human 的隔离输入；多人类实战仍需
-后续的多席位 Web/独立客户端与正式认证授权边界。
+已经输入的内容。4.5a 的本机浏览器后端通过每名 Human 独立 capability 席位隔离 request
+读取与提交，但同机公开观战页仍会显示公开事件；它仍依赖可信本机操作者。跨设备或不可信
+参与者实战仍需后续的远程客户端与正式认证、授权和 TLS 边界。
 
 `series` 固定进行两局：第一局按命令中的选手顺序，第二局完整交换顺序；两局
 使用相同 seed。五子棋中这表示双方各执黑一次，国际象棋中表示双方各执白一次。
