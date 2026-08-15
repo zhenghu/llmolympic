@@ -1095,7 +1095,6 @@ def profile_configuration_digest(profile: ProviderProfile) -> str:
     # value, and the endpoint above has already rejected credential-bearing
     # URL forms.  SHA-256 is intentionally a collision-resistant TOCTOU
     # fingerprint here, not a password-storage primitive.
-    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.sha256(b"llmolympic-profile-configuration-v1\0" + encoded).hexdigest()
 
 
