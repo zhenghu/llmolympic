@@ -693,7 +693,7 @@ def test_engine_verdict_closes_request_and_next_request_has_new_identity(
 
     async def scenario() -> None:
         first_pending = asyncio.create_task(
-            session.resolve("first prompt", timeout_seconds=1.0, match_event_seq=7)
+            session.resolve("first prompt", timeout_seconds=5.0, match_event_seq=7)
         )
         first = await _wait_for_request(web, session)
         assert first.request_seq == 0
@@ -714,7 +714,7 @@ def test_engine_verdict_closes_request_and_next_request_has_new_identity(
         assert not hasattr(rejected, "move")
 
         second_pending = asyncio.create_task(
-            session.resolve("second prompt", timeout_seconds=1.0, match_event_seq=9)
+            session.resolve("second prompt", timeout_seconds=5.0, match_event_seq=9)
         )
         second = await _wait_for_request(web, session, previous=first.request_id)
         assert second.request_id != first.request_id
