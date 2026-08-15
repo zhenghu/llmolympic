@@ -42,6 +42,7 @@ from llmolympic.core.game import (
 from llmolympic.core.storage import SCHEMA_VERSION
 from llmolympic.core.tournament import TournamentCheckpoint
 from llmolympic.games import GAME_REGISTRY, create_game, game_supports_mode
+from llmolympic.providers.base import validate_base_url
 from llmolympic.web.models import API_VERSION, GameInfo
 
 CONTROL_SCHEMA_VERSION = 1
@@ -498,8 +499,11 @@ class ControlParticipationLink(_ControlModel):
         if (
             parsed.scheme != "http"
             or parsed.hostname not in {"127.0.0.1", "::1", "localhost"}
+            # Every URL userinfo form, including ``:password@host``, gives
+            # urllib a non-None username.  One check therefore rejects both
+            # usernames and passwords without treating a rejected password as
+            # application data.
             or parsed.username is not None
-            or parsed.password is not None
             or parsed.query
             or len(path) != 4
             or path[1] != "participate"
@@ -1060,18 +1064,39 @@ def _profile_ready(profile: ProviderProfile) -> bool:
     return bool(profile.api_key_env and os.environ.get(profile.api_key_env))
 
 
+def _credential_free_profile_base_url(profile: ProviderProfile) -> str | None:
+    """Return a validated endpoint that cannot carry embedded credentials."""
+
+    if profile.base_url is None:
+        return None
+    validate_base_url(
+        profile.base_url,
+        source=f"Provider Profile {profile.profile_id!r} 的 base_url",
+        require_https_for_remote=profile.provider == "openai",
+    )
+    # Bind the exact configured spelling, not merely validate a canonicalized
+    # equivalent, so any edit between prepare and start changes the digest.
+    return profile.base_url
+
+
 def profile_configuration_digest(profile: ProviderProfile) -> str:
     """Hash a credential-free Profile configuration for prepare/start binding."""
 
     payload = {
         "api_key_env": profile.api_key_env,
-        "base_url": profile.base_url,
+        "base_url": _credential_free_profile_base_url(profile),
         "default_model": profile.default_model,
         "display_name": profile.display_name,
         "profile_id": profile.profile_id,
         "provider": profile.provider,
     }
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    encoded = _canonical_json(payload).encode("utf-8")
+    # ``api_key_env`` is a validated environment-variable *name*, never its
+    # value, and the endpoint above has already rejected credential-bearing
+    # URL forms.  SHA-256 is intentionally a collision-resistant TOCTOU
+    # fingerprint here, not a password-storage primitive.
+    # codeql[py/weak-sensitive-data-hashing]
+    return hashlib.sha256(b"llmolympic-profile-configuration-v1\0" + encoded).hexdigest()
 
 
 def _prepared_profile(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from llmolympic.control import (
     ControlBudgetSpec,
     ControlError,
     ControlJobSpec,
+    ControlParticipationLink,
     ControlPlayerSpec,
     JobStore,
     build_job_argv,
@@ -61,6 +63,26 @@ def _resume_spec(tournament_id: str) -> ControlJobSpec:
     return ControlJobSpec(
         mode="round_robin",
         resume_tournament_id=tournament_id,
+    )
+
+
+def _profile_spec(profile_id: str) -> ControlJobSpec:
+    return ControlJobSpec(
+        mode="play",
+        game="math_quiz",
+        players=(
+            ControlPlayerSpec(kind="profile", profile_id=profile_id),
+            ControlPlayerSpec(kind="mock", strategy="fixed"),
+        ),
+        rounds=1,
+        seed="7",
+        budget=ControlBudgetSpec(
+            max_provider_calls="8",
+            max_input_tokens="16000",
+            max_output_tokens_per_call="512",
+            max_total_output_tokens="4096",
+            max_estimated_cost_usd="1.25",
+        ),
     )
 
 
@@ -346,6 +368,71 @@ def test_control_models_forbid_commands_routes_environment_and_model_overrides()
         ControlJobSpec.model_validate({**baseline, "seed": "01"})
     with pytest.raises(ValidationError):
         ControlJobSpec.model_validate({**baseline, "seed": "1; touch never"})
+
+
+@pytest.mark.parametrize("userinfo", ["user@", "user:secret@", ":secret@", "@"])
+def test_participation_link_rejects_every_userinfo_form(userinfo: str) -> None:
+    with pytest.raises(ValidationError, match="participation URL is invalid"):
+        ControlParticipationLink(
+            player_name="Human",
+            url=f"http://{userinfo}localhost/participate/session/seat#capability={'a' * 43}",
+        )
+
+
+def test_profile_configuration_digest_binds_every_credential_free_field() -> None:
+    profile = ProviderProfile(
+        profile_id="private-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://private-provider.example/v1",
+        api_key_env="PRIVATE_CONTROL_API_KEY",
+        display_name="Private profile",
+    )
+    baseline = profile_configuration_digest(profile)
+    variants = (
+        replace(profile, profile_id="other-profile"),
+        replace(profile, provider="ollama"),
+        replace(profile, default_model="other-model"),
+        replace(profile, base_url="https://private-provider.example/v2"),
+        replace(profile, api_key_env="OTHER_CONTROL_API_KEY"),
+        replace(profile, display_name="Renamed profile"),
+    )
+
+    assert all(profile_configuration_digest(item) != baseline for item in variants)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://user:embedded-secret@private-provider.example/v1",
+        "https://private-provider.example/v1?api_key=embedded-secret",
+        "https://private-provider.example/v1#embedded-secret",
+    ],
+)
+def test_web_prepare_rejects_credential_bearing_profile_url_before_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="unsafe-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url=base_url,
+        api_key_env="UNSAFE_CONTROL_API_KEY",
+    )
+    monkeypatch.setenv("UNSAFE_CONTROL_API_KEY", "environment-secret")
+    monkeypatch.setattr(control, "load_profiles", lambda: {profile.profile_id: profile})
+    monkeypatch.setattr(
+        control.hashlib,
+        "sha256",
+        lambda *_args, **_kwargs: pytest.fail("unsafe URL reached the digest"),
+    )
+
+    with pytest.raises(ControlError, match="profile_unavailable") as rejected:
+        validate_job_spec(_profile_spec(profile.profile_id))
+
+    assert rejected.value.code == "profile_unavailable"
+    assert "embedded-secret" not in str(rejected.value)
 
 
 def test_cost_budget_matches_cli_maximum() -> None:
@@ -689,23 +776,15 @@ def test_job_store_never_persists_provider_credentials_or_route(
     credential_marker = "provider-value-that-must-not-reach-jobs-db"
     monkeypatch.setenv(profile.api_key_env or "", credential_marker)
     monkeypatch.setattr(control, "load_profiles", lambda: {profile.profile_id: profile})
-    spec = ControlJobSpec(
-        mode="play",
-        game="math_quiz",
-        players=(
-            ControlPlayerSpec(kind="profile", profile_id=profile.profile_id),
-            ControlPlayerSpec(kind="mock", strategy="fixed"),
-        ),
-        rounds=1,
-        seed="7",
-        budget=ControlBudgetSpec(
-            max_provider_calls="8",
-            max_input_tokens="16000",
-            max_output_tokens_per_call="512",
-            max_total_output_tokens="4096",
-            max_estimated_cost_usd="1.25",
-        ),
-    )
+    digest_inputs: list[bytes] = []
+    real_sha256 = control.hashlib.sha256
+
+    def capture_digest_input(value: bytes = b""):
+        digest_inputs.append(value)
+        return real_sha256(value)
+
+    monkeypatch.setattr(control.hashlib, "sha256", capture_digest_input)
+    spec = _profile_spec(profile.profile_id)
     store = JobStore(tmp_path / "archive.db")
 
     preview = validate_job_spec(spec)
@@ -730,6 +809,10 @@ def test_job_store_never_persists_provider_credentials_or_route(
     stored = store.path.read_bytes()
     public_snapshot = job.model_dump_json()
     assert prepared_profile.configuration_digest.encode("ascii") in stored
+    assert digest_inputs
+    assert all(credential_marker.encode() not in item for item in digest_inputs)
+    assert any((profile.api_key_env or "").encode() in item for item in digest_inputs)
+    assert any((profile.base_url or "").encode() in item for item in digest_inputs)
     for forbidden in (
         credential_marker,
         profile.api_key_env,

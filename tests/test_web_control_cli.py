@@ -6,14 +6,17 @@ import stat
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from llmolympic.cli import main as cli_main
 
 
+@pytest.mark.parametrize("terminal_columns", [20, 80])
 def test_web_non_tty_requires_a_private_control_token_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    terminal_columns: int,
 ) -> None:
     calls: list[str] = []
 
@@ -37,10 +40,23 @@ def test_web_non_tty_requires_a_private_control_token_file(
     result = CliRunner().invoke(
         cli_main.app,
         ["web", "--db", str(tmp_path / "archive.db")],
+        env={"COLUMNS": str(terminal_columns)},
+    )
+    semantic_result = CliRunner().invoke(
+        cli_main.app,
+        ["web", "--db", str(tmp_path / "archive.db")],
+        env={"COLUMNS": str(terminal_columns)},
+        standalone_mode=False,
     )
 
-    assert result.exit_code != 0
-    assert "--control-token-file" in result.output
+    assert result.exit_code == 2
+    error = semantic_result.exception
+    assert isinstance(error, typer.BadParameter)
+    assert error.param_hint == "--control-token-file"
+    assert error.message == (
+        "非交互输出不会打印管理凭证；请使用 "
+        "--control-token-file 指定权限 0600 的文件"
+    )
     assert "#admin=" not in result.output
     assert calls == []
 
