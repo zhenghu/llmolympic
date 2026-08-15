@@ -650,7 +650,9 @@ def test_existing_default_database_directory_is_tightened(
     _create_legacy_database(path, version=2)
     path.chmod(0o644)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-    monkeypatch.setattr("llmolympic.core.storage.cfg_get", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "llmolympic.core._storage_types.cfg_get", lambda *args, **kwargs: None
+    )
 
     SQLiteStore(create=False)
 

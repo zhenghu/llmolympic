@@ -13,6 +13,7 @@ import pytest
 from rich.text import Text
 from typer.testing import CliRunner
 
+import llmolympic.core._storage_tournament as tournament_storage_module
 import llmolympic.core.storage as storage_module
 from llmolympic import config
 from llmolympic.cli.main import app
@@ -988,7 +989,7 @@ def test_finalize_never_writes_time_before_checkpoint_when_wall_clock_moves_back
             value = STARTED - timedelta(days=1)
             return value if tz is not None else value.replace(tzinfo=None)
 
-    monkeypatch.setattr(storage_module, "datetime", ClockBehind)
+    monkeypatch.setattr(tournament_storage_module, "datetime", ClockBehind)
 
     store.finalize_tournament_checkpoint(tournament.tournament_id, lease=lease)
 
