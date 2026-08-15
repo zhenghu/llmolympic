@@ -14,9 +14,37 @@ const API_VERSION = "v1";
 const MAX_MATCHES = 100;
 const MAX_MOVE_CHARACTERS = 4096;
 const MAX_PARTICIPATION_PLAYERS = 16;
+const MAX_CONTROL_PLAYERS = 16;
 const PARTICIPATION_POLL_INTERVAL = 1000;
 const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
+const ADMIN_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
+const ADMIN_STORAGE_KEY = "llmolympic.control.admin";
+const CONTROL_MODES = ["play", "series", "round_robin"];
+const CONTROL_ACTIVE_STATUSES = new Set([
+  "prepared",
+  "starting",
+  "running",
+  "cancel_requested",
+  "finalizing",
+]);
+const CONTROL_STOPPABLE_STATUSES = new Set(["prepared", "starting", "running"]);
+const CONTROL_STATUS_LABELS = {
+  prepared: "等待确认",
+  starting: "正在启动",
+  running: "运行中",
+  cancel_requested: "已请求停止",
+  finalizing: "正在归档",
+  cancelled: "已停止",
+  completed: "已完成",
+  failed: "失败",
+  interrupted: "已中断",
+};
+const CONTROL_JOB_STATUSES = new Set(Object.keys(CONTROL_STATUS_LABELS));
+const CONTROL_WARNING_COPY = {
+  large_tournament: "这项循环赛包含较多对局；请再次核对 Provider 硬预算和预计耗时。",
+  resume_uses_frozen_configuration: "恢复任务会沿用 checkpoint 中冻结的项目、参赛者、裁判与随机种子；若 checkpoint 含 Provider 硬预算，也会沿用该冻结预算。",
+};
 const EVENT_LABELS = {
   match_started: "比赛开始",
   turn_prompt: "题面 / 局面",
@@ -51,6 +79,32 @@ const ERROR_COPY = {
   participation_expired: "这个参与席位已经过期，请重新从命令行开始比赛。",
   participation_not_found: "这个参与席位不存在，或已经不再可用。",
   participation_unavailable: "本机人类输入服务暂时不可用，比赛进程会按既定超时规则处理。",
+  admin_invalid: "管理凭证无效或已经失效。请重新使用服务输出的完整管理链接。",
+  control_unauthorized: "管理凭证无效或已经失效。请重新使用服务输出的完整管理链接。",
+  catalog_unavailable: "暂时无法读取可用项目与 Provider Profile。",
+  job_conflict: "任务状态已经变化，请刷新后再操作。",
+  job_state_conflict: "任务状态已经变化，请刷新后再操作。",
+  job_not_found: "这个任务不存在，或已经不再可用。",
+  job_not_stoppable: "这个任务当前不能停止，请刷新状态。",
+  job_queue_full: "本机任务队列已满，请等待其他任务结束后重试。",
+  job_capacity: "本机已有一项待确认或运行中的任务，请先完成或停止它。",
+  idempotency_conflict: "同一操作标识对应了不同内容，请重新提交。",
+  budget_required: "使用 Provider Profile 时必须填写完整的五项硬预算。",
+  control_unavailable: "本机比赛控制服务暂时不可用。",
+  control_overloaded: "本机比赛控制服务正忙，请稍后重试。",
+  large_tournament_confirmation_required: "循环赛规模超过默认保护门槛；请勾选规模确认后重新生成预览。",
+  profile_unavailable: "所选 Provider Profile 当前不可用，请检查服务环境后重试。",
+  preview_stale: "这份准备态预览已经失效，请重新创建任务。",
+  resume_unavailable: "无法从这份循环赛 checkpoint 恢复，请刷新任务状态或检查本机存档。",
+  controller_restarted: "本机控制服务曾重启；为避免重复调用或计费，这项任务不会自动重跑。",
+  worker_failed: "比赛进程异常退出，未完成的结果不会写入正式存档或 ELO。",
+  worker_interrupted: "比赛进程被系统中断，未完成的结果不会写入正式存档或 ELO。",
+  worker_missing: "本机控制服务已经失去这项比赛进程的所有权。",
+  worker_protocol_incomplete: "比赛进程未返回完整的受认证完成状态。",
+  worker_shutdown_timeout: "比赛进程在服务关闭时未及时退出，已被安全终止。",
+  worker_start_failed: "比赛进程启动失败；请检查本机 Profile、依赖和配置。",
+  worker_start_interrupted: "比赛进程在启动阶段被中断。",
+  worker_start_timeout: "比赛进程未在限定时间内就绪，已被安全停止。",
   protocol_error: "页面与服务的回放协议不一致。",
   request_expired: "本轮提交时间已结束，请等待最新题面。",
   request_failed: "暂时无法加载数据，请稍后重试。",
@@ -192,6 +246,109 @@ async function fetchJSON(path, signal) {
   if (!response.ok) {
     const code = payload && payload.error && payload.error.code;
     throw new PublicError(typeof code === "string" ? code : "request_failed", response.status);
+  }
+  if (!isObject(payload) || payload.api_version !== API_VERSION) {
+    throw new PublicError("protocol_error");
+  }
+  return payload;
+}
+
+let inMemoryAdminToken = null;
+
+function clearAdminToken() {
+  inMemoryAdminToken = null;
+  try {
+    window.sessionStorage.removeItem(ADMIN_STORAGE_KEY);
+  } catch (_error) {
+    // Private browsing can deny Web Storage; there is nothing else to clear.
+  }
+}
+
+function readAdminToken() {
+  if (inMemoryAdminToken) return inMemoryAdminToken;
+  try {
+    const stored = window.sessionStorage.getItem(ADMIN_STORAGE_KEY);
+    if (stored && ADMIN_TOKEN.test(stored)) {
+      inMemoryAdminToken = stored;
+      return stored;
+    }
+    if (stored) window.sessionStorage.removeItem(ADMIN_STORAGE_KEY);
+  } catch (_error) {
+    // Missing Web Storage is handled as a missing credential.
+  }
+  return null;
+}
+
+function captureAdminToken() {
+  if (typeof window === "undefined" || !window.location.hash) return readAdminToken();
+  let recognized = false;
+  let token = null;
+  try {
+    const parameters = new URLSearchParams(window.location.hash.slice(1));
+    const keys = Array.from(parameters.keys());
+    const candidates = parameters.getAll("admin");
+    recognized = parameters.has("admin");
+    if (keys.length === 1 && keys[0] === "admin" && candidates.length === 1) {
+      token = ADMIN_TOKEN.test(candidates[0]) ? candidates[0] : null;
+    }
+  } catch (_error) {
+    recognized = window.location.hash.startsWith("#admin=");
+  }
+  if (!recognized) return readAdminToken();
+
+  window.history.replaceState(
+    window.history.state,
+    "",
+    `${window.location.pathname}${window.location.search}`,
+  );
+  clearAdminToken();
+  if (!token) return null;
+  inMemoryAdminToken = token;
+  try {
+    window.sessionStorage.setItem(ADMIN_STORAGE_KEY, token);
+  } catch (_error) {
+    // Keep the token only in this page when Web Storage is unavailable.
+  }
+  return token;
+}
+
+async function fetchControlJSON(
+  path,
+  adminToken,
+  { body = null, idempotencyKey = null, method = "GET", signal } = {},
+) {
+  if (!adminToken || !ADMIN_TOKEN.test(adminToken)) throw new PublicError("control_unauthorized", 401);
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${adminToken}`,
+  };
+  if (body !== null) headers["Content-Type"] = "application/json";
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  let response;
+  try {
+    response = await fetch(path, {
+      body: body === null ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers,
+      method,
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    throw new PublicError("network_error");
+  }
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
   }
   if (!isObject(payload) || payload.api_version !== API_VERSION) {
     throw new PublicError("protocol_error");
@@ -477,7 +634,7 @@ function StatusPill({ health }) {
   );
 }
 
-function Header({ health, participation = false }) {
+function Header({ controlEnabled = false, health, participation = false }) {
   return h(
     "header",
     { className: "topbar" },
@@ -492,13 +649,24 @@ function Header({ health, participation = false }) {
           "span",
           null,
           h("span", { className: "brand-name" }, "LLM Olympics"),
-          h("span", { className: "brand-sub" }, participation ? "HUMAN PARTICIPATION" : "ARCHIVE OBSERVER"),
+          h("span", { className: "brand-sub" }, participation
+            ? "HUMAN PARTICIPATION"
+            : controlEnabled
+              ? "LOCAL CONTROL + OBSERVER"
+              : "ARCHIVE OBSERVER"),
         ),
       ),
       h(
         "div",
         { className: "status-cluster" },
-        h("span", { className: "status-pill local" }, participation ? "本机 · 安全参赛" : "本机 · 只读观战"),
+        controlEnabled && !participation
+          ? h(AppLink, { className: "button topbar-new", href: "/new" }, "新建比赛")
+          : null,
+        h("span", { className: "status-pill local" }, participation
+          ? "本机 · 安全参赛"
+          : controlEnabled
+            ? "本机 · 比赛控制"
+            : "本机 · 只读观战"),
         participation ? null : h(StatusPill, { health }),
       ),
     ),
@@ -735,7 +903,1688 @@ function LiveMatches({ data, loading, error, onRetry }) {
   );
 }
 
-function Lobby({ health, games, initialGame, refreshAll }) {
+function safeControlText(value, maximum = 512) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text
+    && Array.from(text).length <= maximum
+    && !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(text)
+    ? text
+    : null;
+}
+
+function safeControlNumber(value, minimum = 0) {
+  return typeof value === "number" && Number.isFinite(value) && value >= minimum
+    ? value
+    : null;
+}
+
+function normalizeControlCatalog(payload) {
+  const sourceGames = Array.isArray(payload.games) ? payload.games : [];
+  const games = sourceGames.flatMap((item) => {
+    if (!isObject(item)) return [];
+    const name = safeControlText(item.name, 64);
+    const modes = Array.isArray(item.supported_modes)
+      ? item.supported_modes.filter((mode) => CONTROL_MODES.includes(mode))
+      : [];
+    if (!name || !/^[a-z][a-z0-9_]{0,63}$/.test(name) || !modes.length) return [];
+    const minimum = Number.isInteger(item.min_players) ? item.min_players : 2;
+    const maximum = Number.isInteger(item.max_players) ? item.max_players : MAX_CONTROL_PLAYERS;
+    return [{
+      maxPlayers: Math.max(2, Math.min(MAX_CONTROL_PLAYERS, maximum)),
+      minPlayers: Math.max(2, Math.min(MAX_CONTROL_PLAYERS, minimum)),
+      name,
+      requiresJudgePanel: Boolean(item.requires_judge_panel),
+      roundsSupported: Boolean(item.rounds_supported),
+      supportedModes: Array.from(new Set(modes)),
+    }];
+  });
+  if (!games.length) throw new PublicError("protocol_error");
+
+  const profiles = (Array.isArray(payload.profiles) ? payload.profiles : []).flatMap((item) => {
+    if (!isObject(item)) return [];
+    const profileId = safeControlText(item.profile_id, 128);
+    const provider = safeControlText(item.provider, 128);
+    const displayName = safeControlText(item.display_name, 256);
+    const defaultModel = item.default_model === null
+      ? null
+      : safeControlText(item.default_model, 256);
+    if (!profileId || !SAFE_PUBLIC_ID.test(profileId) || !provider || !displayName) return [];
+    return [{
+      available: item.credential_ready === true || item.available === true,
+      defaultModel,
+      displayName,
+      profileId,
+      provider,
+    }];
+  });
+  const strategies = Array.isArray(payload.mock_player_strategies)
+    ? payload.mock_player_strategies.filter((value) => safeControlText(value, 64) && SAFE_PUBLIC_ID.test(value))
+    : [];
+  const judgeStrategies = Array.isArray(payload.mock_judge_strategies)
+    ? payload.mock_judge_strategies.filter((value) => safeControlText(value, 64) && SAFE_PUBLIC_ID.test(value))
+    : [];
+  return {
+    games,
+    judgeStrategies: Array.from(new Set(judgeStrategies)),
+    profiles,
+    strategies: Array.from(new Set(strategies)),
+  };
+}
+
+function safeJobParticipant(value, index) {
+  if (typeof value === "string") return safeControlText(value) || `选手 ${index + 1}`;
+  if (!isObject(value)) return `选手 ${index + 1}`;
+  const displayName = safeControlText(value.display_name) || safeControlText(value.name);
+  if (displayName) return displayName;
+  const profileId = safeControlText(value.profile_id);
+  if (profileId) return `Profile · ${profileId}`;
+  const strategy = safeControlText(value.strategy);
+  if (strategy) return `Mock · ${strategy}`;
+  return `选手 ${index + 1}`;
+}
+
+function safeJobJudge(value) {
+  if (!isObject(value)) return null;
+  if (value.kind === "mock") {
+    const strategy = safeControlText(value.strategy, 64);
+    return strategy && SAFE_PUBLIC_ID.test(strategy) ? `Mock · ${strategy}` : null;
+  }
+  if (value.kind === "profile") {
+    const profileId = safeControlText(value.profile_id, 64);
+    return profileId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profileId)
+      ? `Profile · ${profileId}`
+      : null;
+  }
+  return null;
+}
+
+function safePreparedProfile(value) {
+  if (!isObject(value) || !exactKeys(value, [
+    "configuration_digest",
+    "default_model",
+    "display_name",
+    "effective_models",
+    "profile_id",
+    "provider",
+  ])) return null;
+  const profileId = safeControlText(value.profile_id, 64);
+  const displayName = safeControlText(value.display_name, 256);
+  const defaultModel = safeControlText(value.default_model, 256);
+  const effectiveModels = Array.isArray(value.effective_models)
+    ? value.effective_models.map((model) => safeControlText(model, 256))
+    : [];
+  const provider = safeControlText(value.provider, 32);
+  if (
+    !profileId
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profileId)
+    || !displayName
+    || !defaultModel
+    || effectiveModels.length < 1
+    || effectiveModels.length > 25
+    || effectiveModels.some((model) => !model)
+    || effectiveModels.join("\u0000")
+      !== Array.from(new Set(effectiveModels)).sort().join("\u0000")
+    || !["openai", "ollama"].includes(provider)
+    || typeof value.configuration_digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(value.configuration_digest)
+  ) return null;
+  const effectiveLabel = effectiveModels.join("、");
+  const defaultSuffix = effectiveModels.length === 1 && effectiveModels[0] === defaultModel
+    ? ""
+    : `（当前默认 ${defaultModel}）`;
+  return {
+    defaultModel,
+    displayName,
+    effectiveModels,
+    label: `${displayName} · ${provider} / 执行 ${effectiveLabel}${defaultSuffix}`,
+    profileId,
+    provider,
+  };
+}
+
+function safeSeedText(value) {
+  if (typeof value !== "string" || value.length > 20) return null;
+  return /^(?:0|-?[1-9][0-9]*)$/.test(value) ? value : null;
+}
+
+function safeRounds(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 100 ? value : null;
+}
+
+function safeTimeout(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0.001 && value <= 86400
+    ? value
+    : null;
+}
+
+function safeNumericText(value, decimal = false) {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return String(value);
+  if (typeof value !== "string" || value.length > 32) return null;
+  const pattern = decimal
+    ? /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$/
+    : /^(?:0|[1-9][0-9]*)$/;
+  return pattern.test(value) ? value : null;
+}
+
+function participationLink(value, index) {
+  const source = typeof value === "string"
+    ? value
+    : isObject(value)
+      ? value.url || value.href
+      : null;
+  if (typeof source !== "string" || source.length > 2048) return null;
+  try {
+    const url = new URL(source, window.location.origin);
+    if (url.origin !== window.location.origin || url.search) return null;
+    const route = participationPath(url.pathname);
+    if (!route) return null;
+    const parameters = new URLSearchParams(url.hash.slice(1));
+    const keys = Array.from(parameters.keys());
+    const capabilities = parameters.getAll("capability");
+    if (
+      keys.length !== 1
+      || keys[0] !== "capability"
+      || capabilities.length !== 1
+      || !CAPABILITY_TOKEN.test(capabilities[0])
+    ) return null;
+    const label = isObject(value)
+      ? safeControlText(value.player_name) || safeControlText(value.label)
+      : null;
+    return {
+      href: `${url.pathname}#capability=${encodeURIComponent(capabilities[0])}`,
+      label: label || `人类席位 ${index + 1}`,
+      seatId: route.seatId,
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function normalizeControlJob(payload) {
+  const value = isObject(payload.job) ? payload.job : payload;
+  if (!isObject(value)) throw new PublicError("protocol_error");
+  const jobId = safeControlText(value.job_id || value.id, 128);
+  const status = safeControlText(value.state || value.status, 64);
+  if (!jobId || !SAFE_PUBLIC_ID.test(jobId) || !status || !CONTROL_JOB_STATUSES.has(status)) {
+    throw new PublicError("protocol_error");
+  }
+  const configuration = isObject(value.spec)
+    ? value.spec
+    : isObject(value.configuration)
+    ? value.configuration
+    : isObject(value.request)
+      ? value.request
+      : value;
+  const preview = isObject(value.preview) ? value.preview : {};
+  const mode = CONTROL_MODES.includes(value.mode) ? value.mode : configuration.mode;
+  if (!CONTROL_MODES.includes(mode)) throw new PublicError("protocol_error");
+  const resumeTournamentId = typeof configuration.resume_tournament_id === "string"
+    && SAFE_PUBLIC_ID.test(configuration.resume_tournament_id)
+    ? configuration.resume_tournament_id
+    : null;
+  const isResume = mode === "round_robin" && resumeTournamentId !== null;
+  const configuredGame = safeControlText(value.game, 64)
+    || safeControlText(configuration.game, 64)
+    || "";
+  const frozenGame = safeControlText(preview.frozen_game, 64) || "";
+  const game = isResume ? frozenGame : configuredGame;
+  if (game && !/^[a-z][a-z0-9_]{0,63}$/.test(game)) throw new PublicError("protocol_error");
+  const configuredPlayers = Array.isArray(value.players)
+    ? value.players
+    : Array.isArray(configuration.players)
+      ? configuration.players
+      : [];
+  const frozenPlayerSource = Array.isArray(preview.frozen_players)
+    ? preview.frozen_players.slice(0, MAX_CONTROL_PLAYERS)
+    : [];
+  const frozenPlayers = frozenPlayerSource.flatMap((player) => {
+    const name = safeControlText(player);
+    return name ? [name] : [];
+  });
+  if (frozenPlayers.length !== frozenPlayerSource.length) throw new PublicError("protocol_error");
+  const rawPlayers = isResume ? frozenPlayers : configuredPlayers;
+  const configuredJudges = (Array.isArray(configuration.judges) ? configuration.judges : [])
+    .slice(0, 9)
+    .flatMap((judge) => {
+      const identity = safeJobJudge(judge);
+      return identity ? [identity] : [];
+    });
+  const frozenJudgeSource = Array.isArray(preview.frozen_judges)
+    ? preview.frozen_judges.slice(0, 9)
+    : [];
+  const frozenJudges = frozenJudgeSource.flatMap((judge) => {
+    const identity = safeControlText(judge);
+    return identity ? [identity] : [];
+  });
+  if (frozenJudges.length !== frozenJudgeSource.length) throw new PublicError("protocol_error");
+  const judges = isResume ? frozenJudges : configuredJudges;
+  const configuredRounds = safeRounds(configuration.rounds);
+  const frozenRounds = safeRounds(preview.frozen_rounds);
+  const rounds = isResume ? frozenRounds : configuredRounds;
+  const configuredSeed = safeSeedText(configuration.seed);
+  const frozenSeed = safeSeedText(preview.frozen_seed);
+  const seed = isResume ? frozenSeed : configuredSeed;
+  const configuredLlmTimeoutSeconds = safeTimeout(configuration.llm_timeout_seconds);
+  const frozenLlmTimeoutSeconds = safeTimeout(preview.frozen_llm_timeout_seconds);
+  const preparedProfileSource = Array.isArray(preview.prepared_profiles)
+    ? preview.prepared_profiles
+    : [];
+  if (preparedProfileSource.length > 25) throw new PublicError("protocol_error");
+  const preparedProfiles = preparedProfileSource.flatMap((profile) => {
+    const normalized = safePreparedProfile(profile);
+    return normalized ? [normalized] : [];
+  });
+  if (preparedProfiles.length !== preparedProfileSource.length) {
+    throw new PublicError("protocol_error");
+  }
+  const preparedProfileIds = preparedProfiles.map((profile) => profile.profileId);
+  if (preparedProfileIds.join("\n") !== Array.from(new Set(preparedProfileIds)).sort().join("\n")) {
+    throw new PublicError("protocol_error");
+  }
+  const progressSource = isObject(value.progress) ? value.progress : {};
+  const budgetSource = isObject(configuration.budget) ? configuration.budget : {};
+  const budget = {
+    fromCheckpoint: isResume,
+    maxEstimatedCostUsd: safeNumericText(budgetSource.max_estimated_cost_usd, true),
+    maxInputTokens: safeNumericText(budgetSource.max_input_tokens),
+    maxOutputTokensPerCall: safeNumericText(budgetSource.max_output_tokens_per_call),
+    maxProviderCalls: safeNumericText(budgetSource.max_provider_calls),
+    maxTotalOutputTokens: safeNumericText(budgetSource.max_total_output_tokens),
+    usesFrozenBudget: preview.uses_frozen_budget === true,
+  };
+  const current = safeControlNumber(progressSource.current ?? progressSource.completed ?? value.completed_matches);
+  const total = safeControlNumber(progressSource.total ?? value.total_matches);
+  const liveId = safeControlText(value.live_id, 128)
+    || (isObject(value.live) ? safeControlText(value.live.live_id || value.live.id, 128) : null);
+  const finalSource = Array.isArray(value.final_match_ids)
+    ? value.final_match_ids
+    : isObject(value.result) && Array.isArray(value.result.match_ids)
+      ? value.result.match_ids
+      : value.final_match_id
+        ? [value.final_match_id]
+        : [];
+  const finalMatchIds = Array.from(new Set(finalSource.filter((id) => (
+    typeof id === "string" && SAFE_PUBLIC_ID.test(id)
+  ))));
+  const linkSource = Array.isArray(value.participation_links)
+    ? value.participation_links
+    : Array.isArray(value.participation_urls)
+      ? value.participation_urls
+      : [];
+  const participationLinks = linkSource
+    .map(participationLink)
+    .filter(Boolean);
+  const warningSource = Array.isArray(preview.warnings)
+    ? preview.warnings
+    : Array.isArray(value.warnings)
+      ? value.warnings
+      : [];
+  return {
+    budget,
+    createdAt: validTimestamp(value.created_at) ? value.created_at : null,
+    current,
+    errorCode: typeof (value.failure_code || value.error_code) === "string"
+      && PUBLIC_ERROR_CODES.has(value.failure_code || value.error_code)
+      ? value.failure_code || value.error_code
+      : null,
+    estimatedMatchCount: safeControlNumber(preview.match_count ?? value.estimated_match_count, 1),
+    estimatedProviderCalls: safeControlNumber(preview.estimated_provider_calls ?? value.estimated_provider_calls, 0),
+    finalId: typeof value.final_id === "string" && SAFE_PUBLIC_ID.test(value.final_id)
+      ? value.final_id
+      : null,
+    finalKind: ["match", "series", "tournament"].includes(value.final_kind)
+      ? value.final_kind
+      : null,
+    finalMatchIds,
+    finishedAt: validTimestamp(value.finished_at) ? value.finished_at : null,
+    game,
+    humanTimeoutSeconds: safeTimeout(configuration.human_timeout_seconds),
+    isResume,
+    jobId,
+    judges,
+    largeTournamentAllowed: configuration.allow_large_tournament === true,
+    liveId: liveId && SAFE_PUBLIC_ID.test(liveId) ? liveId : null,
+    llmTimeoutSeconds: isResume ? frozenLlmTimeoutSeconds : configuredLlmTimeoutSeconds,
+    mode,
+    participationLinks,
+    players: rawPlayers.slice(0, MAX_CONTROL_PLAYERS).map(safeJobParticipant),
+    preparedProfiles,
+    resumable: value.resumable === true,
+    rounds,
+    seed,
+    startedAt: validTimestamp(value.started_at) ? value.started_at : null,
+    status,
+    total,
+    tournamentId: [value.tournament_id, resumeTournamentId,
+      value.final_kind === "tournament" ? value.final_id : null]
+      .find((candidate) => typeof candidate === "string" && SAFE_PUBLIC_ID.test(candidate)) || null,
+    updatedAt: validTimestamp(value.updated_at) ? value.updated_at : null,
+    warnings: warningSource.flatMap((warning) => {
+      const code = safeControlText(warning, 128);
+      return code && Object.prototype.hasOwnProperty.call(CONTROL_WARNING_COPY, code)
+        ? [CONTROL_WARNING_COPY[code]]
+        : [];
+    }).slice(0, 20),
+  };
+}
+
+function controlStatusLabel(status) {
+  return CONTROL_STATUS_LABELS[status] || "未知状态";
+}
+
+function controlJobCanResume(job) {
+  return Boolean(
+    job
+    && job.mode === "round_robin"
+    && job.resumable
+    && job.tournamentId
+    && ["cancelled", "failed", "interrupted"].includes(job.status)
+  );
+}
+
+function JobStatus({ status }) {
+  return h("span", { className: `job-status status-${status}` },
+    h("span", { className: "status-dot", "aria-hidden": "true" }),
+    controlStatusLabel(status),
+  );
+}
+
+function ControlBudgetFacts({ budget, compact = false }) {
+  if (budget.fromCheckpoint) {
+    return h("p", { className: "notice" }, budget.usesFrozenBudget
+      ? "沿用 checkpoint 冻结预算"
+      : "该 checkpoint 全为 Mock，无需 Provider 硬预算");
+  }
+  const rows = [
+    ["Provider 调用", budget.maxProviderCalls, "次"],
+    ["输入 Token", budget.maxInputTokens, ""],
+    ["单次输出 Token", budget.maxOutputTokensPerCall, ""],
+    ["累计输出 Token", budget.maxTotalOutputTokens, ""],
+    ["预估成本", budget.maxEstimatedCostUsd, " USD"],
+  ];
+  return h("dl", { className: `budget-preview${compact ? " compact" : ""}` },
+    ...rows.map(([label, value, suffix]) => h("div", { key: label },
+      h("dt", null, label),
+      h("dd", null, value === null ? "未限制" : `${value}${suffix}`),
+    )),
+  );
+}
+
+function ControlJobCard({ job }) {
+  const progress = job.total !== null
+    ? `${job.current === null ? 0 : job.current} / ${job.total}`
+    : null;
+  return h(AppLink, {
+    "aria-label": `${modeLabel(job.mode)}，${job.game ? gameLabel(job.game) : "未知项目"}，${controlStatusLabel(job.status)}`,
+    className: "control-job-card",
+    href: `/jobs/${encodeURIComponent(job.jobId)}`,
+  },
+  h("div", { className: "control-job-main" },
+    h("div", { className: "control-job-meta" },
+      h("span", { className: "game-badge" }, job.game ? gameLabel(job.game) : "未知项目"),
+      h("span", { className: "meta" }, modeLabel(job.mode)),
+    ),
+    h("strong", null, job.players.length ? job.players.join(" · ") : `任务 ${job.jobId}`),
+    h("span", { className: "meta" }, `${dateTime(job.updatedAt || job.createdAt, true)}${progress ? ` · 进度 ${progress}` : ""}`),
+  ),
+  h(JobStatus, { status: job.status }),
+  h("span", { className: "match-arrow", "aria-hidden": "true" }, "→"),
+  );
+}
+
+function ControlJobsPanel({ adminToken, onAuthLost }) {
+  const [state, setState] = useState({ data: null, error: null, loading: true });
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let controller = null;
+    const load = async (initial = false) => {
+      if (cancelled || document.visibilityState === "hidden") return;
+      if (controller) controller.abort();
+      controller = new AbortController();
+      if (initial) setState((previous) => ({ ...previous, loading: true }));
+      try {
+        const payload = await fetchControlJSON("/api/v1/control/jobs?limit=10", adminToken, {
+          signal: controller.signal,
+        });
+        const source = Array.isArray(payload.jobs) ? payload.jobs : [];
+        const jobs = source.slice(0, 10).flatMap((item) => {
+          try {
+            return [normalizeControlJob(item)];
+          } catch (_error) {
+            return [];
+          }
+        });
+        if (!cancelled) setState({ data: jobs, error: null, loading: false });
+      } catch (error) {
+        if (cancelled || error.name === "AbortError") return;
+        if ([401, 403].includes(error.status)) onAuthLost();
+        setState((previous) => ({ ...previous, error, loading: false }));
+      }
+    };
+    load(true);
+    const timer = window.setInterval(() => load(false), 2000);
+    const onVisibility = () => { if (document.visibilityState === "visible") load(false); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (controller) controller.abort();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [adminToken, onAuthLost, reloadKey]);
+
+  let body;
+  if (state.loading && !state.data) {
+    body = h(LoadingRows, { count: 2 });
+  } else if (state.error && !state.data) {
+    body = h(StateCard, {
+      action: h("button", {
+        className: "button small",
+        onClick: () => setReloadKey((value) => value + 1),
+        type: "button",
+      }, "重试"),
+      copy: errorCopy(state.error),
+      error: true,
+      title: "最近任务加载失败",
+    });
+  } else if (!state.data || !state.data.length) {
+    body = h(StateCard, {
+      action: h(AppLink, { className: "button primary", href: "/new" }, "创建第一项任务"),
+      copy: "先准备配置并检查预览；只有再次确认后，比赛进程才会启动。",
+      title: "还没有 Web 任务",
+    });
+  } else {
+    body = h("div", { className: "control-job-list" },
+      ...state.data.map((job) => h(ControlJobCard, { job, key: job.jobId })),
+    );
+  }
+  return h("section", { className: "panel control-jobs-panel", "aria-labelledby": "control-jobs-heading" },
+    h("div", { className: "panel-head" },
+      h("div", null,
+        h("p", { className: "panel-overline" }, "LOCAL CONTROL"),
+        h("h2", { id: "control-jobs-heading" }, "最近任务"),
+      ),
+      h(AppLink, { className: "button primary", href: "/new" }, "+ 新建比赛 / 任务"),
+    ),
+    h("div", { className: "panel-body" }, body),
+  );
+}
+
+function defaultControlPlayer(index, catalog) {
+  const strategies = catalog && catalog.strategies.length ? catalog.strategies : ["random", "fixed"];
+  return { kind: "mock", name: "", profileId: "", strategy: strategies[index % strategies.length] };
+}
+
+function defaultControlJudge(index, catalog) {
+  const strategies = catalog && catalog.judgeStrategies.length
+    ? catalog.judgeStrategies
+    : ["strict", "balanced", "lenient"];
+  return { kind: "mock", profileId: "", strategy: strategies[index % strategies.length] };
+}
+
+function initialControlForm() {
+  return {
+    allowLargeTournament: false,
+    budget: {
+      maxEstimatedCostUsd: "",
+      maxInputTokens: "200000",
+      maxOutputTokensPerCall: "4096",
+      maxProviderCalls: "64",
+      maxTotalOutputTokens: "65536",
+    },
+    game: "",
+    judges: [],
+    llmTimeoutSeconds: "120",
+    mode: "play",
+    players: [defaultControlPlayer(0), defaultControlPlayer(1)],
+    rounds: "1",
+    seed: "42",
+    timeoutSeconds: "300",
+  };
+}
+
+function formNumber(value, { integer = true, maximum = Number.MAX_SAFE_INTEGER, minimum = 0 } = {}) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const number = Number(value);
+  if (
+    !Number.isFinite(number)
+    || number < minimum
+    || number > maximum
+    || (integer && !Number.isSafeInteger(number))
+  ) return null;
+  return number;
+}
+
+function canonicalIntegerText(value, signed = false) {
+  return typeof value === "string"
+    && (signed ? /^(?:0|-?[1-9][0-9]*)$/ : /^(?:0|[1-9][0-9]*)$/).test(value.trim());
+}
+
+function canonicalCostText(value) {
+  return typeof value === "string"
+    && /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$/.test(value.trim());
+}
+
+function controlPlayerIdentity(player) {
+  if (player.kind === "human") return `human:${player.name.trim()}`;
+  if (player.kind === "mock") return `mock:${player.strategy}`;
+  return `profile:${player.profileId}`;
+}
+
+function validateControlForm(form, catalog) {
+  const errors = {};
+  const game = catalog.games.find((item) => item.name === form.game);
+  if (!game || !game.supportedModes.includes(form.mode)) errors.game = "所选项目不支持这个比赛模式。";
+  const minimumPlayers = form.mode === "round_robin" ? 3 : game ? game.minPlayers : 2;
+  const maximumPlayers = form.mode === "round_robin" ? MAX_CONTROL_PLAYERS : game ? game.maxPlayers : 2;
+  if (form.mode === "series" && form.players.length !== 2) {
+    errors.players = "双局赛必须正好有两位选手。";
+  } else if (form.players.length < minimumPlayers || form.players.length > maximumPlayers) {
+    errors.players = `${modeLabel(form.mode)}需要 ${minimumPlayers}–${maximumPlayers} 位选手。`;
+  }
+  form.players.forEach((player, index) => {
+    const key = `player-${index}`;
+    if (!isObject(player) || !["human", "mock", "profile"].includes(player.kind)) {
+      errors[key] = "请选择有效的选手类型。";
+    } else if (player.kind === "human") {
+      if (form.mode !== "play") errors[key] = "只有单场对局支持人类席位。";
+      else if (!safeControlText(player.name, 80) || player.name.includes(",")) errors[key] = "请输入 1–80 个字符且不含逗号的人类选手名称。";
+    } else if (player.kind === "mock") {
+      if (!catalog.strategies.includes(player.strategy)) errors[key] = "请选择可用的 Mock 策略。";
+    } else {
+      const profile = catalog.profiles.find((item) => item.profileId === player.profileId);
+      if (!profile || !profile.available) errors[key] = "请选择当前可用的 Provider Profile。";
+    }
+  });
+  const participantNames = form.players.map(controlPlayerIdentity);
+  if (participantNames.some(Boolean) && new Set(participantNames).size !== participantNames.length) {
+    errors.players = "每位参赛者必须有不同的名称、策略或 Profile。";
+  }
+  if (game && game.requiresJudgePanel) {
+    if (form.judges.length < 3 || form.judges.length > 9) {
+      errors.judges = "这个项目需要 3–9 位裁判。";
+    }
+    form.judges.forEach((judge, index) => {
+      const key = `judge-${index}`;
+      if (judge.kind === "mock") {
+        if (!catalog.judgeStrategies.includes(judge.strategy)) errors[key] = "请选择可用的 Mock 裁判策略。";
+      } else if (judge.kind === "profile") {
+        const profile = catalog.profiles.find((item) => item.profileId === judge.profileId);
+        if (!profile || !profile.available) errors[key] = "请选择当前可用的 Provider Profile。";
+      } else {
+        errors[key] = "请选择有效的裁判类型。";
+      }
+    });
+    const judgeNames = form.judges.map((judge) => judge.kind === "profile"
+      ? `profile:${judge.profileId}`
+      : `mock:${judge.strategy}`);
+    if (new Set(judgeNames).size !== judgeNames.length) {
+      errors.judges = "每位裁判必须使用不同的策略或 Profile。";
+    } else if (judgeNames.some((name) => form.players.some((player) => (
+      player.kind === "profile"
+        ? name === `profile:${player.profileId}`
+        : player.kind === "mock" && name === `mock:${player.strategy}`
+    )))) {
+      errors.judges = "同一个 Mock 策略或 Profile 不能同时作为选手和裁判。";
+    }
+  }
+  if (game && game.roundsSupported && formNumber(form.rounds, { maximum: 100, minimum: 1 }) === null) {
+    errors.rounds = "回合数必须是 1–100 的整数。";
+  }
+  if (!canonicalIntegerText(form.seed, true)
+    || formNumber(form.seed, { maximum: Number.MAX_SAFE_INTEGER, minimum: Number.MIN_SAFE_INTEGER }) === null) {
+    errors.seed = "随机种子必须是浏览器可安全表示的整数。";
+  }
+  if (formNumber(form.timeoutSeconds, { integer: false, maximum: 86400, minimum: 1 }) === null) {
+    errors.timeoutSeconds = "人类席位限时必须是 1–86400 秒。";
+  }
+  if (formNumber(form.llmTimeoutSeconds, { integer: false, maximum: 86400, minimum: 1 }) === null) {
+    errors.llmTimeoutSeconds = "模型单步限时必须是 1–86400 秒。";
+  }
+  const budgetFields = [
+    ["maxProviderCalls", "最大 Provider 调用数", true, 0],
+    ["maxInputTokens", "最大输入 Token", true, 0],
+    ["maxOutputTokensPerCall", "单次最大输出 Token", true, 1],
+    ["maxTotalOutputTokens", "累计最大输出 Token", true, 0],
+    ["maxEstimatedCostUsd", "最大预估成本", false, 0],
+  ];
+  const profileUsed = form.players.some((player) => player.kind === "profile")
+    || (game && game.requiresJudgePanel && form.judges.some((judge) => judge.kind === "profile"));
+  budgetFields.forEach(([key, label, integer, minimum]) => {
+    const value = form.budget[key];
+    if (value === "" && key !== "maxOutputTokensPerCall" && !profileUsed) return;
+    const canonical = integer ? canonicalIntegerText(value) : canonicalCostText(value);
+    if (!canonical || formNumber(value, {
+      integer,
+      maximum: integer ? 1000000000 : 1000000,
+      minimum,
+    }) === null) {
+      const requirement = integer
+        ? minimum === 0 ? "非负整数" : "正整数"
+        : "非负数字";
+      errors[`budget-${key}`] = `${label}必须是${requirement}。`;
+    }
+  });
+  return errors;
+}
+
+function controlRequestBody(form, catalog) {
+  const game = catalog.games.find((item) => item.name === form.game);
+  const entrant = (player) => {
+    if (player.kind === "human") return { kind: "human", name: player.name.trim() };
+    if (player.kind === "profile") return { kind: "profile", profile_id: player.profileId };
+    return { kind: "mock", strategy: player.strategy };
+  };
+  const judge = (item) => item.kind === "profile"
+    ? { kind: "profile", profile_id: item.profileId }
+    : { kind: "mock", strategy: item.strategy };
+  const optionalInteger = (value) => value === "" ? null : value.trim();
+  const optionalCost = (value) => value === "" ? null : value.trim();
+  return {
+    allow_large_tournament: form.mode === "round_robin" && form.allowLargeTournament,
+    budget: {
+      max_estimated_cost_usd: optionalCost(form.budget.maxEstimatedCostUsd),
+      max_input_tokens: optionalInteger(form.budget.maxInputTokens),
+      max_output_tokens_per_call: optionalInteger(form.budget.maxOutputTokensPerCall),
+      max_provider_calls: optionalInteger(form.budget.maxProviderCalls),
+      max_total_output_tokens: optionalInteger(form.budget.maxTotalOutputTokens),
+    },
+    game: form.game,
+    human_timeout_seconds: formNumber(form.timeoutSeconds, { integer: false, maximum: 86400, minimum: 1 }),
+    judges: game && game.requiresJudgePanel ? form.judges.map(judge) : [],
+    llm_timeout_seconds: formNumber(form.llmTimeoutSeconds, { integer: false, maximum: 86400, minimum: 1 }),
+    mode: form.mode,
+    players: form.players.map(entrant),
+    rounds: game && game.roundsSupported
+      ? formNumber(form.rounds, { maximum: 100, minimum: 1 })
+      : null,
+    seed: form.seed.trim(),
+    resume_tournament_id: null,
+  };
+}
+
+function ControlField({ children, error, help, id, label }) {
+  const describedBy = [help ? `${id}-help` : null, error ? `${id}-error` : null].filter(Boolean).join(" ") || undefined;
+  const control = typeof children === "function"
+    ? children({ "aria-describedby": describedBy, "aria-invalid": error ? "true" : undefined, id })
+    : children;
+  return h("div", { className: `control-field${error ? " invalid" : ""}` },
+    h("label", { htmlFor: id }, label),
+    help ? h("p", { className: "field-help", id: `${id}-help` }, help) : null,
+    control,
+    error ? h("p", { className: "field-error", id: `${id}-error` }, error) : null,
+  );
+}
+
+function ControlPlayerEditor({ catalog, error, index, mode, onChange, onRemove, player, removable }) {
+  const id = `player-${index}`;
+  const availableProfiles = catalog.profiles;
+  const kinds = [
+    ...(mode === "play" ? [{ label: "人类浏览器席位", value: "human" }] : []),
+    { label: "内置 Mock", value: "mock" },
+    { label: "Provider Profile", value: "profile" },
+  ];
+  const chooseKind = (kind) => {
+    if (kind === "human") onChange({ kind, name: `人类选手 ${index + 1}`, profileId: "", strategy: "" });
+    else if (kind === "profile") onChange({
+      kind,
+      name: "",
+      profileId: (availableProfiles.find((item) => item.available) || {}).profileId || "",
+      strategy: "",
+    });
+    else onChange(defaultControlPlayer(index, catalog));
+  };
+  return h("fieldset", { className: `roster-card${error ? " invalid" : ""}` },
+    h("legend", null, `选手 ${index + 1}`),
+    h("div", { className: "roster-card-grid" },
+      h(ControlField, { error, id: `${id}-kind`, label: "类型" }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => chooseKind(event.target.value),
+        value: player.kind,
+      }, ...kinds.map((item) => h("option", { key: item.value, value: item.value }, item.label)))),
+      player.kind === "human" ? h(ControlField, { error, id: `${id}-name`, label: "显示名称" }, (attributes) => h("input", {
+        ...attributes,
+        autoComplete: "off",
+        maxLength: 80,
+        onChange: (event) => onChange({ ...player, name: event.target.value }),
+        type: "text",
+        value: player.name,
+      })) : null,
+      player.kind === "mock" ? h(ControlField, { error, id: `${id}-strategy`, label: "策略" }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => onChange({ ...player, strategy: event.target.value }),
+        value: player.strategy,
+      }, ...catalog.strategies.map((strategy) => h("option", { key: strategy, value: strategy }, strategy)))) : null,
+      player.kind === "profile" ? h(ControlField, {
+        error,
+        help: "不可用 Profile 会保留在列表中，但不能选择。",
+        id: `${id}-profile`,
+        label: "Provider Profile",
+      }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => onChange({ ...player, profileId: event.target.value }),
+        value: player.profileId,
+      },
+      h("option", { value: "" }, "请选择 Profile"),
+      ...availableProfiles.map((profile) => h("option", {
+        disabled: !profile.available,
+        key: profile.profileId,
+        value: profile.profileId,
+      }, `${profile.displayName} · ${profile.provider}${profile.defaultModel ? ` · ${profile.defaultModel}` : ""}${profile.available ? "" : "（不可用）"}`)),
+      )) : null,
+    ),
+    removable ? h("button", { className: "button small roster-remove", onClick: onRemove, type: "button" }, `移除选手 ${index + 1}`) : null,
+  );
+}
+
+function ControlJudgeEditor({ catalog, error, index, judge, onChange, onRemove }) {
+  const id = `judge-${index}`;
+  const chooseKind = (kind) => {
+    if (kind === "profile") onChange({
+      kind,
+      profileId: (catalog.profiles.find((item) => item.available) || {}).profileId || "",
+      strategy: "",
+    });
+    else onChange(defaultControlJudge(index, catalog));
+  };
+  return h("fieldset", { className: `roster-card compact${error ? " invalid" : ""}` },
+    h("legend", null, `裁判 ${index + 1}`),
+    h("div", { className: "roster-card-grid" },
+      h(ControlField, { error, id: `${id}-kind`, label: "类型" }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => chooseKind(event.target.value),
+        value: judge.kind,
+      },
+      h("option", { value: "mock" }, "内置 Mock 裁判"),
+      h("option", { value: "profile" }, "Provider Profile"),
+      )),
+      judge.kind === "mock" ? h(ControlField, { error, id: `${id}-strategy`, label: "策略" }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => onChange({ ...judge, strategy: event.target.value }),
+        value: judge.strategy,
+      }, ...catalog.judgeStrategies.map((strategy) => h("option", { key: strategy, value: strategy }, strategy)))) : null,
+      judge.kind === "profile" ? h(ControlField, { error, id: `${id}-profile`, label: "Provider Profile" }, (attributes) => h("select", {
+        ...attributes,
+        onChange: (event) => onChange({ ...judge, profileId: event.target.value }),
+        value: judge.profileId,
+      },
+      h("option", { value: "" }, "请选择 Profile"),
+      ...catalog.profiles.map((profile) => h("option", {
+        disabled: !profile.available,
+        key: profile.profileId,
+        value: profile.profileId,
+      }, `${profile.displayName}${profile.available ? "" : "（不可用）"}`)),
+      )) : null,
+    ),
+    h("button", { className: "button small roster-remove", onClick: onRemove, type: "button" }, `移除裁判 ${index + 1}`),
+  );
+}
+
+function PreparedJobPreview({ backLabel = "取消预览并返回修改", busy, error, job, onBack, onStart }) {
+  const previewRef = useRef(null);
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      if (previewRef.current) previewRef.current.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+  return h("section", {
+    className: "panel prepared-preview",
+    "aria-labelledby": "prepared-heading",
+    ref: previewRef,
+    tabIndex: -1,
+  },
+    h("div", { className: "panel-head" },
+      h("div", null,
+        h("p", { className: "panel-overline" }, "PREPARED · NOT STARTED"),
+        h("h2", { id: "prepared-heading" }, "确认后才会启动"),
+      ),
+      h(JobStatus, { status: job.status }),
+    ),
+    h("div", { className: "prepared-body" },
+      h("p", { className: "prepared-lead" }, "配置已经通过服务端准备校验，目前没有比赛进程在运行。请核对下面的范围与预算。"),
+      h("dl", { className: "preview-grid" },
+        h("div", null, h("dt", null, "模式"), h("dd", null, modeLabel(job.mode))),
+        h("div", null, h("dt", null, "项目"), h("dd", null, job.game ? gameLabel(job.game) : "—")),
+        h("div", null, h("dt", null, "参赛者"), h("dd", null, job.players.length ? job.players.join("、") : "—")),
+        h("div", null, h("dt", null, "裁判"), h("dd", null, job.judges.length ? job.judges.join("、") : "无")),
+        h("div", null, h("dt", null, "回合数"), h("dd", null, job.rounds === null ? "项目默认 / 不适用" : String(job.rounds))),
+        h("div", null, h("dt", null, "随机种子"), h("dd", { className: "mono" }, job.seed || "—")),
+        h("div", null, h("dt", null, "人类席位限时"), h("dd", null, job.humanTimeoutSeconds === null ? "未设置" : `${formatScore(job.humanTimeoutSeconds)} 秒`)),
+        h("div", null, h("dt", null, "模型单步限时"), h("dd", null, job.llmTimeoutSeconds === null ? "未设置" : `${formatScore(job.llmTimeoutSeconds)} 秒`)),
+        job.preparedProfiles.length ? h("div", null,
+          h("dt", null, "已确认 Profile"),
+          h("dd", null, job.preparedProfiles.map((profile) => profile.label).join("；")),
+        ) : null,
+        h("div", null, h("dt", null, "大规模循环赛"), h("dd", null, job.mode === "round_robin" ? job.largeTournamentAllowed ? "已明确允许" : "未允许" : "不适用")),
+        h("div", null, h("dt", null, "预计对局"), h("dd", null, job.estimatedMatchCount === null ? "由服务端运行时确定" : `${job.estimatedMatchCount} 场`)),
+        h("div", null, h("dt", null, "预计 Provider 调用"), h("dd", null, job.estimatedProviderCalls === null ? "按硬预算限制" : `${job.estimatedProviderCalls} 次`)),
+        h("div", null, h("dt", null, "任务编号"), h("dd", { className: "mono" }, job.jobId)),
+      ),
+      h("section", { "aria-labelledby": "preview-budget-heading" },
+        h("h3", { className: "subsection-title", id: "preview-budget-heading" }, "Provider 硬预算"),
+        h(ControlBudgetFacts, { budget: job.budget }),
+      ),
+      job.warnings.length ? h("div", { className: "preview-warnings", role: "status" },
+        h("strong", null, "启动前提示"),
+        h("ul", null, ...job.warnings.map((warning, index) => h("li", { key: index }, warning))),
+      ) : null,
+      error ? h("p", { className: "form-submit-error", role: "alert" }, errorCopy(error)) : null,
+      h("div", { className: "confirmation-box" },
+        h("div", null,
+          h("strong", null, "这是会调用模型并写入本机存档的操作"),
+          h("p", null, "启动后可在任务页查看进度并请求停止；已经产生的 Provider 调用不能撤回。"),
+        ),
+        h("div", { className: "form-actions" },
+          h("button", { className: "button", disabled: busy, onClick: onBack, type: "button" }, backLabel),
+          h("button", { className: "button coral", disabled: busy, onClick: onStart, type: "button" }, busy ? "正在启动…" : "确认并启动"),
+        ),
+      ),
+    ),
+  );
+}
+
+function NewJobPage({ adminToken, onAuthLost }) {
+  const [catalogState, setCatalogState] = useState({ catalog: null, error: null, loading: true });
+  const [form, setForm] = useState(initialControlForm);
+  const [errors, setErrors] = useState({});
+  const [prepared, setPrepared] = useState(null);
+  const [prepareError, setPrepareError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const errorSummaryRef = useRef(null);
+  const prepareKeyRef = useRef(null);
+  const startKeyRef = useRef(null);
+  const discardKeyRef = useRef(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setCatalogState({ catalog: null, error: null, loading: true });
+    fetchControlJSON("/api/v1/control/catalog", adminToken, { signal: controller.signal })
+      .then((payload) => {
+        const catalog = normalizeControlCatalog(payload);
+        const game = catalog.games.find((item) => item.supportedModes.includes("play")) || catalog.games[0];
+        setForm((previous) => ({
+          ...previous,
+          game: game.name,
+          judges: game.requiresJudgePanel
+            ? [0, 1, 2].map((index) => defaultControlJudge(index, catalog))
+            : [],
+          players: [defaultControlPlayer(0, catalog), defaultControlPlayer(1, catalog)],
+        }));
+        setCatalogState({ catalog, error: null, loading: false });
+      })
+      .catch((error) => {
+        if (error.name === "AbortError") return;
+        if ([401, 403].includes(error.status)) onAuthLost();
+        setCatalogState({ catalog: null, error, loading: false });
+      });
+    return () => controller.abort();
+  }, [adminToken, onAuthLost]);
+
+  const catalog = catalogState.catalog;
+  const changeForm = (updater) => {
+    setForm((previous) => typeof updater === "function" ? updater(previous) : { ...previous, ...updater });
+    setErrors({});
+    setPrepared(null);
+    setPrepareError(null);
+    prepareKeyRef.current = null;
+    startKeyRef.current = null;
+    discardKeyRef.current = null;
+  };
+
+  if (catalogState.loading) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+      h("section", { className: "panel" }, h("div", { className: "panel-body" }, h(LoadingRows, { count: 5 }))),
+    );
+  }
+  if (!catalog) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+      h(StateCard, {
+        copy: errorCopy(catalogState.error),
+        error: true,
+        title: "无法打开创建向导",
+      }),
+    );
+  }
+
+  const currentGame = catalog.games.find((item) => item.name === form.game);
+  const availableGames = catalog.games.filter((item) => item.supportedModes.includes(form.mode));
+  const minimumPlayers = form.mode === "round_robin" ? 3 : currentGame ? currentGame.minPlayers : 2;
+  const maximumPlayers = form.mode === "round_robin" ? MAX_CONTROL_PLAYERS : currentGame ? currentGame.maxPlayers : 2;
+
+  const changeMode = (mode) => {
+    const fallbackGame = catalog.games.find((item) => item.supportedModes.includes(mode));
+    if (!fallbackGame) return;
+    changeForm((previous) => {
+      const selectedGame = catalog.games.find((item) => (
+        item.name === previous.game && item.supportedModes.includes(mode)
+      )) || fallbackGame;
+      const desiredCount = mode === "round_robin"
+        ? 3
+        : mode === "series"
+          ? 2
+          : Math.max(2, selectedGame.minPlayers);
+      return {
+        ...previous,
+        allowLargeTournament: mode === "round_robin" ? previous.allowLargeTournament : false,
+        game: selectedGame.name,
+        judges: selectedGame.requiresJudgePanel
+          ? (previous.judges.length >= 3 ? previous.judges : [0, 1, 2].map((index) => defaultControlJudge(index, catalog)))
+          : [],
+        mode,
+        players: Array.from({ length: desiredCount }, (_, index) => {
+          const existing = previous.players[index];
+          return existing && (mode === "play" || existing.kind !== "human")
+            ? existing
+            : defaultControlPlayer(index, catalog);
+        }),
+      };
+    });
+  };
+  const changeGame = (name) => {
+    const game = catalog.games.find((item) => item.name === name);
+    if (!game) return;
+    changeForm((previous) => ({
+      ...previous,
+      game: name,
+      judges: game.requiresJudgePanel
+        ? (previous.judges.length >= 3 ? previous.judges : [0, 1, 2].map((index) => defaultControlJudge(index, catalog)))
+        : [],
+    }));
+  };
+  const updatePlayer = (index, player) => changeForm((previous) => ({
+    ...previous,
+    players: previous.players.map((item, itemIndex) => itemIndex === index ? player : item),
+  }));
+  const removePlayer = (index) => changeForm((previous) => ({
+    ...previous,
+    players: previous.players.filter((_item, itemIndex) => itemIndex !== index),
+  }));
+  const updateJudge = (index, judge) => changeForm((previous) => ({
+    ...previous,
+    judges: previous.judges.map((item, itemIndex) => itemIndex === index ? judge : item),
+  }));
+  const removeJudge = (index) => changeForm((previous) => ({
+    ...previous,
+    judges: previous.judges.filter((_item, itemIndex) => itemIndex !== index),
+  }));
+
+  const prepare = async (event) => {
+    event.preventDefault();
+    const nextErrors = validateControlForm(form, catalog);
+    setErrors(nextErrors);
+    setPrepareError(null);
+    if (Object.keys(nextErrors).length) {
+      window.requestAnimationFrame(() => errorSummaryRef.current && errorSummaryRef.current.focus());
+      return;
+    }
+    setBusy(true);
+    try {
+      const payload = await fetchControlJSON("/api/v1/control/jobs", adminToken, {
+        body: controlRequestBody(form, catalog),
+        idempotencyKey: prepareKeyRef.current || (prepareKeyRef.current = createSubmissionId()),
+        method: "POST",
+      });
+      setPrepared(normalizeControlJob(payload));
+      startKeyRef.current = null;
+      discardKeyRef.current = null;
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setPrepareError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const start = async () => {
+    if (!prepared) return;
+    setBusy(true);
+    setPrepareError(null);
+    try {
+      const payload = await fetchControlJSON(
+        `/api/v1/control/jobs/${encodeURIComponent(prepared.jobId)}/start`,
+        adminToken,
+        {
+          body: {},
+          idempotencyKey: startKeyRef.current || (startKeyRef.current = createSubmissionId()),
+          method: "POST",
+        },
+      );
+      const job = normalizeControlJob(payload);
+      navigate(`/jobs/${encodeURIComponent(job.jobId)}`);
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setPrepareError(error);
+      setBusy(false);
+    }
+  };
+  const discard = async () => {
+    if (!prepared) return;
+    setBusy(true);
+    setPrepareError(null);
+    try {
+      await fetchControlJSON(
+        `/api/v1/control/jobs/${encodeURIComponent(prepared.jobId)}/cancel`,
+        adminToken,
+        {
+          body: {},
+          idempotencyKey: discardKeyRef.current || (discardKeyRef.current = createSubmissionId()),
+          method: "POST",
+        },
+      );
+      setPrepared(null);
+      prepareKeyRef.current = null;
+      startKeyRef.current = null;
+      discardKeyRef.current = null;
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setPrepareError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (prepared) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+      h("section", { className: "control-hero", "aria-labelledby": "new-title" },
+        h("p", { className: "eyebrow" }, "STEP 2 OF 2 · REVIEW"),
+        h("h1", { className: "detail-title", id: "new-title" }, "核对启动预览"),
+      ),
+      h(PreparedJobPreview, {
+        busy,
+        error: prepareError,
+        job: prepared,
+        onBack: discard,
+        onStart: start,
+      }),
+    );
+  }
+
+  const errorMessages = Array.from(new Set(Object.values(errors)));
+  return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+    h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+    h("section", { className: "control-hero", "aria-labelledby": "new-title" },
+      h("p", { className: "eyebrow" }, "STEP 1 OF 2 · CONFIGURE"),
+      h("h1", { className: "detail-title", id: "new-title" }, "新建比赛 / 任务"),
+      h("p", { className: "hero-copy" }, "先选择项目、参赛者和硬预算，再生成不会自动运行的准备态预览。"),
+    ),
+    errorMessages.length ? h("div", {
+      className: "form-error-summary",
+      ref: errorSummaryRef,
+      role: "alert",
+      tabIndex: -1,
+    },
+    h("strong", null, `请修正 ${errorMessages.length} 个配置问题`),
+    h("ul", null, ...errorMessages.map((message) => h("li", { key: message }, message))),
+    ) : null,
+    h("form", { className: "control-form", onSubmit: prepare },
+      h("section", { className: "panel form-section", "aria-labelledby": "format-heading" },
+        h("div", { className: "panel-head" }, h("h2", { id: "format-heading" }, "1. 比赛形式")),
+        h("div", { className: "form-section-body field-grid" },
+          h(ControlField, { id: "control-mode", label: "任务模式" }, (attributes) => h("select", {
+            ...attributes,
+            onChange: (event) => changeMode(event.target.value),
+            value: form.mode,
+          },
+          h("option", { value: "play" }, "单场对局（play）"),
+          h("option", { value: "series" }, "双局交换先后手（series）"),
+          h("option", { value: "round_robin" }, "双循环赛（round-robin）"),
+          )),
+          h(ControlField, { error: errors.game, id: "control-game", label: "比赛项目" }, (attributes) => h("select", {
+            ...attributes,
+            onChange: (event) => changeGame(event.target.value),
+            value: form.game,
+          }, ...availableGames.map((game) => h("option", { key: game.name, value: game.name }, gameLabel(game.name))))),
+          currentGame && currentGame.roundsSupported ? h(ControlField, {
+            error: errors.rounds,
+            help: "应用到每一场对局。",
+            id: "control-rounds",
+            label: "每场回合数",
+          }, (attributes) => h("input", {
+            ...attributes,
+            max: 100,
+            min: 1,
+            onChange: (event) => changeForm({ rounds: event.target.value }),
+            type: "number",
+            value: form.rounds,
+          })) : null,
+          h(ControlField, { error: errors.seed, id: "control-seed", label: "随机种子" }, (attributes) => h("input", {
+            ...attributes,
+            onChange: (event) => changeForm({ seed: event.target.value }),
+            step: 1,
+            type: "number",
+            value: form.seed,
+          })),
+        ),
+      ),
+      h("section", { className: "panel form-section", "aria-labelledby": "players-heading" },
+        h("div", { className: "panel-head" },
+          h("div", null,
+            h("h2", { id: "players-heading" }, "2. 参赛者"),
+            h("span", { className: "panel-kicker" }, `${minimumPlayers}–${maximumPlayers} 位`),
+          ),
+          form.mode !== "series" && form.players.length < maximumPlayers
+            ? h("button", {
+              className: "button small",
+              onClick: () => changeForm((previous) => ({
+                ...previous,
+                players: [...previous.players, defaultControlPlayer(previous.players.length, catalog)],
+              })),
+              type: "button",
+            }, "+ 添加选手")
+            : null,
+        ),
+        h("div", { className: "form-section-body roster-list" },
+          errors.players ? h("p", { className: "section-error", role: "alert" }, errors.players) : null,
+          ...form.players.map((player, index) => h(ControlPlayerEditor, {
+            catalog,
+            error: errors[`player-${index}`],
+            index,
+            key: index,
+            mode: form.mode,
+            onChange: (value) => updatePlayer(index, value),
+            onRemove: () => removePlayer(index),
+            player,
+            removable: form.mode !== "series" && form.players.length > minimumPlayers,
+          })),
+        ),
+      ),
+      currentGame && currentGame.requiresJudgePanel ? h("section", {
+        className: "panel form-section",
+        "aria-labelledby": "judges-heading",
+      },
+      h("div", { className: "panel-head" },
+        h("div", null,
+          h("h2", { id: "judges-heading" }, "3. 创作裁判团"),
+          h("span", { className: "panel-kicker" }, "3–9 位，固定后进入任务"),
+        ),
+        form.judges.length < 9 ? h("button", {
+          className: "button small",
+          onClick: () => changeForm((previous) => ({
+            ...previous,
+            judges: [...previous.judges, defaultControlJudge(previous.judges.length, catalog)],
+          })),
+          type: "button",
+        }, "+ 添加裁判") : null,
+      ),
+      h("div", { className: "form-section-body roster-list" },
+        errors.judges ? h("p", { className: "section-error", role: "alert" }, errors.judges) : null,
+        ...form.judges.map((judge, index) => h(ControlJudgeEditor, {
+          catalog,
+          error: errors[`judge-${index}`],
+          index,
+          judge,
+          key: index,
+          onChange: (value) => updateJudge(index, value),
+          onRemove: () => removeJudge(index),
+        })),
+      ),
+      ) : null,
+      h("section", { className: "panel form-section", "aria-labelledby": "limits-heading" },
+        h("div", { className: "panel-head" }, h("h2", { id: "limits-heading" }, `${currentGame && currentGame.requiresJudgePanel ? "4" : "3"}. 限时与硬预算`)),
+        h("div", { className: "form-section-body" },
+          h("div", { className: "field-grid" },
+            h(ControlField, { error: errors.timeoutSeconds, help: "只影响人类浏览器席位。", id: "control-human-timeout", label: "人类每步限时（秒）" }, (attributes) => h("input", {
+              ...attributes,
+              min: 1,
+              onChange: (event) => changeForm({ timeoutSeconds: event.target.value }),
+              step: "any",
+              type: "number",
+              value: form.timeoutSeconds,
+            })),
+            h(ControlField, { error: errors.llmTimeoutSeconds, id: "control-llm-timeout", label: "模型每步限时（秒）" }, (attributes) => h("input", {
+              ...attributes,
+              min: 1,
+              onChange: (event) => changeForm({ llmTimeoutSeconds: event.target.value }),
+              step: "any",
+              type: "number",
+              value: form.llmTimeoutSeconds,
+            })),
+          ),
+          h("fieldset", { className: "budget-fieldset" },
+            h("legend", null, "Provider 硬预算"),
+            h("p", { className: "field-help" }, "留空表示该维度不设额外上限；单次输出上限必填。预估成本上限要求服务端为每条云端路由配置价格。"),
+            h("div", { className: "budget-grid" },
+              ...[
+                ["maxProviderCalls", "最大调用数", "1", 0],
+                ["maxInputTokens", "最大输入 Token", "1", 0],
+                ["maxOutputTokensPerCall", "单次最大输出 Token", "1", 1],
+                ["maxTotalOutputTokens", "累计最大输出 Token", "1", 0],
+                ["maxEstimatedCostUsd", "最大预估成本（USD）", "0.000001", 0],
+              ].map(([key, label, step, minimum]) => h(ControlField, {
+                error: errors[`budget-${key}`],
+                id: `control-budget-${key}`,
+                key,
+                label,
+              }, (attributes) => h("input", {
+                ...attributes,
+                min: minimum,
+                onChange: (event) => changeForm((previous) => ({
+                  ...previous,
+                  budget: { ...previous.budget, [key]: event.target.value },
+                })),
+                step,
+                type: "number",
+                value: form.budget[key],
+              }))),
+            ),
+          ),
+          form.mode === "round_robin" ? h("label", { className: "control-checkbox" },
+            h("input", {
+              checked: form.allowLargeTournament,
+              onChange: (event) => changeForm({ allowLargeTournament: event.target.checked }),
+              type: "checkbox",
+            }),
+            h("span", null,
+              h("strong", null, "允许超过默认规模门槛的循环赛"),
+              h("small", null, "仅解除规模保护；Provider 硬预算仍然生效。"),
+            ),
+          ) : null,
+        ),
+      ),
+      prepareError ? h("p", { className: "form-submit-error", role: "alert" }, errorCopy(prepareError)) : null,
+      h("div", { className: "form-actions sticky-actions" },
+        h(AppLink, { className: "button", href: "/" }, "取消"),
+        h("button", { className: "button primary", disabled: busy, type: "submit" }, busy ? "正在准备…" : "生成准备态预览"),
+      ),
+    ),
+  );
+}
+
+function resumeControlRequest(job) {
+  return {
+    allow_large_tournament: false,
+    budget: {
+      max_estimated_cost_usd: null,
+      max_input_tokens: null,
+      max_output_tokens_per_call: null,
+      max_provider_calls: null,
+      max_total_output_tokens: null,
+    },
+    game: "",
+    human_timeout_seconds: 120,
+    judges: [],
+    llm_timeout_seconds: null,
+    mode: "round_robin",
+    players: [],
+    resume_tournament_id: job.tournamentId,
+    rounds: null,
+    seed: "0",
+  };
+}
+
+function useControlJob(jobId, adminToken, onAuthLost, reloadKey) {
+  const [state, setState] = useState({ data: null, error: null, loading: true });
+  useEffect(() => {
+    let cancelled = false;
+    let controller = null;
+    let timer = null;
+    const schedule = () => {
+      if (!cancelled && timer === null) timer = window.setTimeout(() => {
+        timer = null;
+        load(false);
+      }, 1500);
+    };
+    const load = async (initial) => {
+      if (cancelled || document.visibilityState === "hidden") return;
+      if (controller) controller.abort();
+      controller = new AbortController();
+      if (initial) setState((previous) => ({ ...previous, loading: true }));
+      try {
+        const payload = await fetchControlJSON(
+          `/api/v1/control/jobs/${encodeURIComponent(jobId)}`,
+          adminToken,
+          { signal: controller.signal },
+        );
+        const data = normalizeControlJob(payload);
+        if (!cancelled) setState({ data, error: null, loading: false });
+        if (CONTROL_ACTIVE_STATUSES.has(data.status)) schedule();
+      } catch (error) {
+        if (cancelled || error.name === "AbortError") return;
+        if ([401, 403].includes(error.status)) onAuthLost();
+        setState((previous) => ({ ...previous, error, loading: false }));
+        if (![401, 403, 404].includes(error.status)) schedule();
+      }
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      load(false);
+    };
+    load(true);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (controller) controller.abort();
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [adminToken, jobId, onAuthLost, reloadKey]);
+  return state;
+}
+
+function JobDetailPage({ adminToken, jobId, onAuthLost }) {
+  const [reloadKey, setReloadKey] = useState(0);
+  const jobState = useControlJob(jobId, adminToken, onAuthLost, reloadKey);
+  const [busyAction, setBusyAction] = useState(null);
+  const [mutationError, setMutationError] = useState(null);
+  const [cancelArmed, setCancelArmed] = useState(false);
+  const [resumePrepared, setResumePrepared] = useState(null);
+  const operationKeysRef = useRef(new Map());
+  const resumePrepareKeyRef = useRef(null);
+  const cancelDialogRef = useRef(null);
+  const stopButtonRef = useRef(null);
+  const restoreStopFocusRef = useRef(false);
+  const job = jobState.data;
+
+  useEffect(() => {
+    const target = cancelArmed
+      ? cancelDialogRef.current
+      : restoreStopFocusRef.current
+        ? stopButtonRef.current
+        : null;
+    restoreStopFocusRef.current = false;
+    if (!target) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      target.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [cancelArmed]);
+
+  const closeCancelConfirmation = () => {
+    restoreStopFocusRef.current = true;
+    setCancelArmed(false);
+  };
+
+  const operationKey = (targetJobId, action) => {
+    const key = `${targetJobId}:${action}`;
+    if (!operationKeysRef.current.has(key)) {
+      operationKeysRef.current.set(key, createSubmissionId());
+    }
+    return operationKeysRef.current.get(key);
+  };
+
+  const mutate = async (targetJobId, action) => {
+    setBusyAction(action);
+    setMutationError(null);
+    try {
+      const payload = await fetchControlJSON(
+        `/api/v1/control/jobs/${encodeURIComponent(targetJobId)}/${action}`,
+        adminToken,
+        { body: {}, idempotencyKey: operationKey(targetJobId, action), method: "POST" },
+      );
+      const result = normalizeControlJob(payload);
+      setCancelArmed(false);
+      if (action === "start" && targetJobId !== jobId) {
+        navigate(`/jobs/${encodeURIComponent(result.jobId)}`);
+      } else {
+        setReloadKey((value) => value + 1);
+      }
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setMutationError(error);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+  const prepareResume = async () => {
+    if (!job || !job.tournamentId) return;
+    setBusyAction("resume");
+    setMutationError(null);
+    try {
+      const payload = await fetchControlJSON("/api/v1/control/jobs", adminToken, {
+        body: resumeControlRequest(job),
+        idempotencyKey: resumePrepareKeyRef.current || (resumePrepareKeyRef.current = createSubmissionId()),
+        method: "POST",
+      });
+      setResumePrepared(normalizeControlJob(payload));
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setMutationError(error);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+  const discardResume = async () => {
+    if (!resumePrepared) return;
+    setBusyAction("discard-resume");
+    setMutationError(null);
+    try {
+      await fetchControlJSON(
+        `/api/v1/control/jobs/${encodeURIComponent(resumePrepared.jobId)}/cancel`,
+        adminToken,
+        {
+          body: {},
+          idempotencyKey: operationKey(resumePrepared.jobId, "cancel"),
+          method: "POST",
+        },
+      );
+      setResumePrepared(null);
+      resumePrepareKeyRef.current = null;
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setMutationError(error);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  if (jobState.loading && !job) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+      h("section", { className: "panel" }, h("div", { className: "panel-body" }, h(LoadingRows, { count: 4 }))),
+    );
+  }
+  if (!job) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+      h(StateCard, {
+        action: jobState.error && [401, 403, 404].includes(jobState.error.status)
+          ? null
+          : h("button", { className: "button", onClick: () => setReloadKey((value) => value + 1), type: "button" }, "重试"),
+        copy: errorCopy(jobState.error),
+        error: true,
+        title: "无法打开任务",
+      }),
+    );
+  }
+  if (resumePrepared) {
+    return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+      h("button", { className: "breadcrumb breadcrumb-button", onClick: discardResume, type: "button" }, "← 取消恢复预览并返回原任务"),
+      h("section", { className: "control-hero", "aria-labelledby": "resume-title" },
+        h("p", { className: "eyebrow" }, "ROUND-ROBIN RESUME · REVIEW"),
+        h("h1", { className: "detail-title", id: "resume-title" }, "核对恢复任务"),
+        h("p", { className: "hero-copy" }, "服务端会从已存储的循环赛 checkpoint 恢复冻结配置；此时仍未启动。"),
+      ),
+      h(PreparedJobPreview, {
+        busy: busyAction !== null,
+        error: mutationError,
+        job: resumePrepared,
+        backLabel: "取消恢复预览",
+        onBack: discardResume,
+        onStart: () => mutate(resumePrepared.jobId, "start"),
+      }),
+    );
+  }
+
+  const active = CONTROL_ACTIVE_STATUSES.has(job.status);
+  const canStop = CONTROL_STOPPABLE_STATUSES.has(job.status);
+  const canResume = controlJobCanResume(job);
+  const progressTotal = job.total !== null ? job.total : job.estimatedMatchCount;
+  const progressCurrent = job.current !== null
+    ? job.current
+    : job.status === "completed" && progressTotal !== null
+      ? progressTotal
+      : Math.min(job.finalMatchIds.length, progressTotal === null ? job.finalMatchIds.length : progressTotal);
+  const facts = [
+    ["任务编号", job.jobId],
+    ["模式", modeLabel(job.mode)],
+    ["项目", job.game ? gameLabel(job.game) : "—"],
+    ["参赛者", job.players.length ? job.players.join("、") : "—"],
+    ["裁判", job.judges.length ? job.judges.join("、") : "无"],
+    ["回合数", job.rounds === null ? "项目默认 / 不适用" : String(job.rounds)],
+    ["随机种子", job.seed || "—"],
+    ["人类席位限时", job.humanTimeoutSeconds === null ? "未设置" : `${formatScore(job.humanTimeoutSeconds)} 秒`],
+    ["模型单步限时", job.llmTimeoutSeconds === null ? "未设置" : `${formatScore(job.llmTimeoutSeconds)} 秒`],
+    ["已确认 Profile", job.preparedProfiles.length ? job.preparedProfiles.map((profile) => profile.label).join("；") : "无"],
+    ["大规模循环赛", job.mode === "round_robin" ? job.largeTournamentAllowed ? "已明确允许" : "未允许" : "不适用"],
+    ["准备时间", dateTime(job.createdAt, true)],
+    ["启动时间", dateTime(job.startedAt, true)],
+    ["结束时间", dateTime(job.finishedAt, true)],
+  ];
+  return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
+    h(AppLink, { className: "breadcrumb", href: "/" }, "← 返回大厅"),
+    h("section", { className: "job-hero", "aria-labelledby": "job-title" },
+      h("div", null,
+        h("p", { className: "eyebrow" }, "LOCAL JOB"),
+        h("h1", { className: "detail-title", id: "job-title" }, job.game ? gameLabel(job.game) : "比赛任务"),
+        h("p", { className: "hero-copy" }, `${modeLabel(job.mode)} · ${job.players.length ? job.players.join(" 对 ") : job.jobId}`),
+      ),
+      h("div", { className: "job-stage", "aria-live": "polite" },
+        h(JobStatus, { status: job.status }),
+        h("span", null, active ? "页面会自动同步任务状态" : `最后更新 ${dateTime(job.updatedAt, true)}`),
+      ),
+    ),
+    jobState.error ? h("div", { className: "participation-alert", role: "alert" },
+      h("strong", null, "状态同步暂时中断"),
+      h("span", null, errorCopy(jobState.error)),
+      h("button", { className: "button small", onClick: () => setReloadKey((value) => value + 1), type: "button" }, "重试"),
+    ) : null,
+    mutationError ? h("p", { className: "form-submit-error", role: "alert" }, errorCopy(mutationError)) : null,
+    job.status === "failed" || job.status === "interrupted" ? h("div", { className: "job-failure", role: "status" },
+      h("strong", null, job.status === "failed" ? "任务没有完成" : "任务已中断"),
+      h("p", null, job.errorCode ? errorCopy(new PublicError(job.errorCode)) : "查看本机服务日志可获取技术细节；页面不会显示敏感 Provider 错误正文。"),
+    ) : null,
+    h("div", { className: "job-layout" },
+      h("section", { className: "panel", "aria-labelledby": "job-actions-heading" },
+        h("div", { className: "panel-head" },
+          h("h2", { id: "job-actions-heading" }, "任务进度与入口"),
+          h("span", { className: "panel-kicker" }, controlStatusLabel(job.status)),
+        ),
+        h("div", { className: "job-action-body" },
+          progressTotal !== null && progressTotal > 0 ? h("section", {
+            className: "job-progress",
+            "aria-labelledby": "job-progress-heading",
+          },
+          h("div", null,
+            h("strong", { id: "job-progress-heading" }, "对局进度"),
+            h("span", null, `${progressCurrent} / ${progressTotal}`),
+          ),
+          h("progress", { max: progressTotal, value: Math.min(progressCurrent, progressTotal) }, `${progressCurrent} / ${progressTotal}`),
+          ) : null,
+          job.status === "prepared" ? h("div", { className: "confirmation-box compact" },
+            h("div", null,
+              h("strong", null, "此任务已准备，但尚未启动"),
+              h("p", null, "启动会调用选定 Provider 并写入本机存档。"),
+            ),
+            h("button", {
+              className: "button coral",
+              disabled: busyAction !== null,
+              onClick: () => mutate(job.jobId, "start"),
+              type: "button",
+            }, busyAction === "start" ? "正在启动…" : "确认并启动"),
+          ) : null,
+          job.liveId ? h("div", { className: "job-link-group" },
+            h("div", null, h("strong", null, "实时观战"), h("p", null, "公开事件流不包含管理凭证。")),
+            h(AppLink, { className: "button primary", href: `/live/${encodeURIComponent(job.liveId)}` }, "打开实时观战"),
+          ) : null,
+          job.participationLinks.length ? h("section", { className: "seat-links", "aria-labelledby": "seat-links-heading" },
+            h("div", null,
+              h("strong", { id: "seat-links-heading" }, "人类浏览器席位"),
+              h("p", null, "每个链接只授权一个席位，并在新标签页打开。不要转发给其他人。"),
+            ),
+            h("div", { className: "seat-link-list" }, ...job.participationLinks.map((link, index) => h("a", {
+              className: "button",
+              href: link.href,
+              key: `${link.seatId}-${index}`,
+              referrerPolicy: "no-referrer",
+              rel: "noopener noreferrer",
+              target: "_blank",
+            }, `打开 ${link.label}`))),
+          ) : null,
+          job.status === "completed" && job.finalMatchIds.length ? h("section", { className: "job-link-group", "aria-labelledby": "archives-heading" },
+            h("div", null,
+              h("strong", { id: "archives-heading" }, "已完成存档"),
+              h("p", null, `${job.finalMatchIds.length} 场对局可安全回放，并已纳入适用的 ELO 结果。`),
+            ),
+            h("div", { className: "archive-button-list" }, ...job.finalMatchIds.map((matchId, index) => h(AppLink, {
+              className: "button primary",
+              href: `/matches/${encodeURIComponent(matchId)}`,
+              key: matchId,
+            }, job.finalMatchIds.length === 1 ? "打开存档回放" : `第 ${index + 1} 场回放`))),
+          ) : null,
+          canResume ? h("div", { className: "job-link-group resume-callout" },
+            h("div", null,
+              h("strong", null, "可以从循环赛 checkpoint 恢复"),
+              h("p", null, "先生成新的准备态任务，再次确认后才会继续未完成赛程。"),
+            ),
+            h("button", {
+              className: "button primary",
+              disabled: busyAction !== null,
+              onClick: prepareResume,
+              type: "button",
+            }, busyAction === "resume" ? "正在准备恢复…" : "准备恢复"),
+          ) : null,
+          canStop && !cancelArmed ? h("button", {
+            className: "button danger-outline",
+            disabled: busyAction !== null,
+            onClick: () => setCancelArmed(true),
+            ref: stopButtonRef,
+            type: "button",
+          }, job.status === "prepared" ? "取消准备态任务" : "请求停止任务") : null,
+          canStop && cancelArmed ? h("div", {
+            className: "cancel-confirmation",
+            role: "group",
+            "aria-describedby": "cancel-copy",
+            "aria-labelledby": "cancel-heading",
+            ref: cancelDialogRef,
+            tabIndex: -1,
+          },
+            h("div", null,
+              h("strong", { id: "cancel-heading" }, "确认停止这项任务？"),
+              h("p", { id: "cancel-copy" }, "正在进行的 Provider 请求可能会完成；服务会安全收尾并保留已完成结果。"),
+            ),
+            h("div", { className: "form-actions" },
+              h("button", { className: "button", disabled: busyAction !== null, onClick: closeCancelConfirmation, type: "button" }, "返回"),
+              h("button", {
+                className: "button danger",
+                disabled: busyAction !== null,
+                onClick: () => mutate(job.jobId, "cancel"),
+                type: "button",
+              }, busyAction === "cancel" ? "正在请求停止…" : "确认停止"),
+            ),
+          ) : null,
+          !job.liveId && job.status !== "completed" && job.status !== "prepared" && !canResume
+            ? h("p", { className: "notice" }, active
+              ? "任务正在建立比赛进程；实时观战与人类席位入口会在就绪后出现。"
+              : "这个任务没有可用的公开入口或回放。")
+            : null,
+        ),
+      ),
+      h("aside", { "aria-label": "任务信息" },
+        h("dl", { className: "facts" }, ...facts.map(([label, value]) => h("div", { className: "fact", key: label },
+          h("dt", null, label),
+          h("dd", null, value),
+        ))),
+        h("section", { className: "job-budget", "aria-labelledby": "job-budget-heading" },
+          h("h2", { id: "job-budget-heading" }, "硬预算"),
+          h(ControlBudgetFacts, { budget: job.budget, compact: true }),
+        ),
+        h("p", { className: "notice" }, "管理页只显示安全 DTO；Provider 密钥、环境变量、路由地址和原始错误正文不会进入浏览器。"),
+      ),
+    ),
+  );
+}
+
+function Lobby({ adminToken, health, games, initialGame, onAuthLost, refreshAll }) {
   const [game, setGame] = useState(initialGame);
   const [limit, setLimit] = useState(20);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -831,9 +2680,11 @@ function Lobby({ health, games, initialGame, refreshAll }) {
       h(
         "div",
         null,
-        h("p", { className: "eyebrow" }, "LIVE + ARCHIVE OBSERVER"),
-        h("h1", { id: "lobby-title" }, "每一场模型较量，都有迹可循。"),
-        h("p", { className: "hero-copy" }, "只读观看本机正在运行的比赛，或浏览已经完成并存档的比赛、ELO 排名与事件回放。页面不会连接模型服务或提交落子。"),
+        h("p", { className: "eyebrow" }, adminToken ? "LOCAL CONTROL + OBSERVER" : "LIVE + ARCHIVE OBSERVER"),
+        h("h1", { id: "lobby-title" }, adminToken ? "从配置到回放，都在一个本机赛场。" : "每一场模型较量，都有迹可循。"),
+        h("p", { className: "hero-copy" }, adminToken
+          ? "准备并确认新的比赛任务，跟踪运行进度，再进入实时观战或已完成存档。管理凭证只保存在当前浏览器标签页。"
+          : "只读观看本机正在运行的比赛，或浏览已经完成并存档的比赛、ELO 排名与事件回放。输入服务输出的完整管理链接后，才可创建比赛。"),
       ),
       h("div", { className: "hero-stat", "aria-label": `当前显示 ${matchCount} 场对局` },
         h("strong", null, matchesLoading ? "—" : String(matchCount).padStart(2, "0")),
@@ -856,6 +2707,7 @@ function Lobby({ health, games, initialGame, refreshAll }) {
       ),
       h("button", { className: "button", type: "button", onClick: refresh }, "↻", " 刷新数据"),
     ),
+    adminToken ? h(ControlJobsPanel, { adminToken, onAuthLost }) : null,
     h(LiveMatches, {
       data: liveData,
       error: liveError,
@@ -2351,34 +4203,45 @@ function parseRoute() {
     const game = candidate && /^[a-z][a-z0-9_]{0,63}$/.test(candidate) ? candidate : "";
     return { name: "lobby", game };
   }
+  if (window.location.pathname === "/new") return { name: "new-job" };
   const participation = participationPath(window.location.pathname);
   if (participation) return { name: "participation", ...participation };
   const match = window.location.pathname.match(/^\/matches\/([^/]+)$/);
   const live = window.location.pathname.match(/^\/live\/([^/]+)$/);
-  if (!match && !live) return { name: "not-found" };
+  const job = window.location.pathname.match(/^\/jobs\/([^/]+)$/);
+  if (!match && !live && !job) return { name: "not-found" };
   try {
-    const id = decodeURIComponent((match || live)[1]);
+    const id = decodeURIComponent((match || live || job)[1]);
     return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)
       ? match
         ? { name: "match", matchId: id }
-        : { name: "live", liveId: id }
+        : live
+          ? { name: "live", liveId: id }
+          : { name: "job", jobId: id }
       : { name: "not-found" };
   } catch (_error) {
     return { name: "not-found" };
   }
 }
 
+captureAdminToken();
 captureParticipationCapability();
 
 function App() {
   const [route, setRoute] = useState(parseRoute);
+  const [adminToken, setAdminToken] = useState(readAdminToken);
   const [health, setHealth] = useState(null);
   const [games, setGames] = useState([]);
   const [metaRefresh, setMetaRefresh] = useState(0);
   const firstRoute = useRef(true);
+  const onAuthLost = useCallback(() => {
+    clearAdminToken();
+    setAdminToken(null);
+  }, []);
 
   useEffect(() => {
     const onPopState = () => {
+      setAdminToken(captureAdminToken());
       captureParticipationCapability();
       setRoute(parseRoute());
     };
@@ -2393,6 +4256,10 @@ function App() {
         ? "对局回放 · LLM Olympics"
         : route.name === "live"
           ? "实时观战 · LLM Olympics"
+          : route.name === "new-job"
+            ? "新建比赛 · LLM Olympics"
+            : route.name === "job"
+              ? "任务进度 · LLM Olympics"
           : route.name === "participation"
             ? "比赛参与 · LLM Olympics"
           : "页面不存在 · LLM Olympics";
@@ -2405,7 +4272,7 @@ function App() {
       if (main) main.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [route.game, route.liveId, route.matchId, route.name, route.seatId, route.sessionId]);
+  }, [route.game, route.jobId, route.liveId, route.matchId, route.name, route.seatId, route.sessionId]);
 
   useEffect(() => {
     if (route.name === "participation") {
@@ -2426,11 +4293,31 @@ function App() {
   let content;
   if (route.name === "lobby") {
     content = h(Lobby, {
+      adminToken,
       games,
       health,
       initialGame: route.game,
+      onAuthLost,
       refreshAll: () => setMetaRefresh((value) => value + 1),
     });
+  } else if (route.name === "new-job") {
+    content = adminToken
+      ? h(NewJobPage, { adminToken, onAuthLost })
+      : h("main", { className: "page", id: "main-content", tabIndex: -1 }, h(StateCard, {
+        action: h(AppLink, { className: "button primary", href: "/" }, "返回观战大厅"),
+        copy: "请使用本机 Web 服务输出的完整管理链接。管理凭证不会显示在页面或地址栏中。",
+        error: true,
+        title: "缺少管理凭证",
+      }));
+  } else if (route.name === "job") {
+    content = adminToken
+      ? h(JobDetailPage, { adminToken, jobId: route.jobId, key: route.jobId, onAuthLost })
+      : h("main", { className: "page", id: "main-content", tabIndex: -1 }, h(StateCard, {
+        action: h(AppLink, { className: "button primary", href: "/" }, "返回观战大厅"),
+        copy: "任务详情需要当前标签页中的管理凭证。请重新使用服务输出的完整管理链接。",
+        error: true,
+        title: "无法打开管理任务",
+      }));
   } else if (route.name === "match") {
     content = h(MatchDetailPage, { matchId: route.matchId });
   } else if (route.name === "live") {
@@ -2457,6 +4344,10 @@ function App() {
       ? "已打开对局回放"
       : route.name === "live"
         ? "已打开实时观战"
+        : route.name === "new-job"
+          ? "已打开新建比赛向导"
+          : route.name === "job"
+            ? "已打开任务进度"
         : route.name === "participation"
           ? "已打开比赛参与席位"
         : "页面不存在";
@@ -2469,24 +4360,33 @@ function App() {
   return h(
     "div",
     { className: "site-shell" },
-    h(Header, { health, participation: route.name === "participation" }),
+    h(Header, { controlEnabled: Boolean(adminToken), health, participation: route.name === "participation" }),
     content,
     h("div", { className: "live-region", "aria-atomic": "true", "aria-live": "polite" }, `${routeAnnouncement}${healthAnnouncement ? `。${healthAnnouncement}` : ""}`),
     h("footer", { className: "footer" }, route.name === "participation"
       ? "LLM Olympics · 本机人类输入 · 凭证仅保存在当前浏览器标签页"
-      : "LLM Olympics · 本机只读观战 · 实时事件与已完成存档"),
+      : adminToken
+        ? "LLM Olympics · 本机比赛控制 · 管理凭证仅保存在当前浏览器标签页"
+        : "LLM Olympics · 本机只读观战 · 实时事件与已完成存档"),
   );
 }
 
 if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
   globalThis.__LLMOLYMPIC_OBSERVER_TEST__ = Object.freeze({
+    captureAdminToken,
     classifyReplayClose,
+    clearAdminToken,
+    controlJobCanResume,
+    controlRequestBody,
     countCharacters,
+    normalizeControlCatalog,
+    normalizeControlJob,
     participationComponentKey,
     participationErrorClearsCapability,
     participationKeepsCapability,
     playbackReducer,
     remainingCopy,
+    validateControlForm,
     validateParticipationRequest,
     validateParticipationSnapshot,
     validateParticipationSubmission,

@@ -252,6 +252,7 @@ jobs:
             --db "${e2e_root}/observer.db" \
             --host 127.0.0.1 \
             --port 8765 \
+            --control-token-file "${e2e_root}/admin.token" \
             >"${e2e_root}/server.log" 2>&1 &
           web_pid="$!"
           cleanup() {

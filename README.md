@@ -307,11 +307,12 @@ llmolympic history
 llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
 ```
 
-### 本机 React 参与与观战页（阶段四 4.4 / 4.5a）
+### 本机 React 比赛控制、参与与观战页（阶段四 4.4 / 4.5a / 4.5b）
 
 阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；阶段 4.3/4.4 自 v0.6.0 起在此基础上加入
-运行中事件 broker 与单个本机浏览器人类输入。当前源码的 Unreleased 阶段 4.5a 已进一步
-支持同一场 `play` 的多个独立本机浏览器 Human 席位；该功能尚未包含在 v0.6.0 发布资产中。
+运行中事件 broker 与单个本机浏览器人类输入。当前源码的 Unreleased 阶段 4.5a 将同一场
+`play` 扩展为多个独立本机浏览器 Human 席位；阶段 4.5b 另行加入可准备、确认启动、
+停止和恢复现有比赛模式的本机全 Web 控制台。这两个阶段尚未包含在 v0.6.0 发布资产中。
 Web 服务端依赖仍通过可选的
 `web` extra 安装；若上面只安装了基础 wheel，可使用同一发布资产补齐依赖：
 
@@ -320,15 +321,17 @@ python -m pip install \
   "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.6.0/llmolympic-0.6.0-py3-none-any.whl"
 ```
 
-安装后可以打开本机 Web 服务。正式存档和实时 sidecar 始终只读；只有持一次性参与链接的
-浏览器才可向独立 input sidecar 提交人类走法：
+安装后可以打开本机 Web 服务。正式存档和实时 sidecar 对 Web 进程始终只读；只有持席位
+链接的浏览器才可向独立 input sidecar 提交人类走法，只有持启动时管理链接的可信本机浏览器
+才可操作独立 jobs 控制面：
 
 ```bash
 llmolympic web --db ~/.llmolympic/llmolympic.db
 ```
 
 macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项目专属的用户级 `launchd`
-服务启动观战页并打开默认浏览器，`stop_web.command` 只卸载这个精确服务。关闭脚本不会按
+服务启动控制台并用临时管理 fragment 打开默认浏览器，`stop_web.command` 只卸载这个精确
+服务并删除管理凭证文件。关闭脚本不会按
 端口或进程名终止其他程序；如果 8000 端口已由手工启动的服务占用，启动脚本会提示先回到
 原终端按 `Ctrl+C`，不会接管或误停该进程。
 
@@ -338,6 +341,29 @@ macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项
 `round-robin`，也可按项目筛选最近对局和总体/分项目 ELO。实时详情支持跟随、暂停、逐条
 查看和回到最新；完成存档详情仍可播放、前后单步、拖动进度、切换速度或重新播放。五子棋
 和国际象棋暂时都使用通用事件时间线，不提供专用棋盘。
+
+`llmolympic web` 会生成一条只显示给当前终端的 `/#admin=...` 本机管理链接；macOS 双击
+启动器会通过项目专属 `0700` 状态目录中的 `0600` 临时文件交付同一凭证，而不会把它写入
+launchd 日志。浏览器会立即从地址栏清除 fragment，并只在当前标签页会话保存凭证。管理页
+可选择 `play`、`series` 或 `round-robin`、内置 Human/mock 或已经配置的 Provider Profile，
+再设置 rounds、seed、超时和硬预算。创建操作只生成不可变的准备态与工作量预览；必须再次
+确认才会启动 worker 或产生 Provider 调用。当前同一数据库最多运行一个 Web 任务；重复请求
+使用幂等键返回原任务，不会因双击或响应丢失重复启动和计费。
+
+浏览器不能录入 API Key、环境变量、Provider endpoint、数据库路径、shell 命令或任意模型
+覆盖；Profile 必须先在本机 `config.toml` 配置，页面只显示脱敏名称、Provider 类型、固定默认
+模型和凭据是否就绪。由 macOS `launchd` 启动时不会把交互式终端中的云密钥复制进 plist，
+因此需要云 Profile 时应在已设置相应环境变量的可信终端运行 `llmolympic web`。Human 仍只
+允许用于 `play`；`series` 和 `round-robin` 保持既有非人类限制。prepare 会把受信
+Profile 的无凭据安全投影和配置摘要冻结在准备态；控制器与 child 在构造 Provider 前会再次核对，如果
+Profile 的 Provider、endpoint、默认模型或凭据环境变量名在确认前发生变化，任务会在任何
+Provider 调用前安全失败。
+
+中断的循环赛只能显式恢复；未过期的 runner lease 仍在活动时不会显示恢复入口。Web
+只允许恢复全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结 Provider
+预算的 checkpoint；旧式直接 Provider checkpoint 仍须从 CLI 恢复；
+含非 Mock Provider 却没有冻结预算的旧 checkpoint 仍可使用 CLI 按既有规则处理，但 Web 不会
+事后附加预算或启动它。`play` 与 `series` 不会自动重跑，以免重复 Provider 调用。
 
 要从浏览器真正参加一场比赛，先保持 Web 服务运行，再在另一个终端启动单场 `play`：
 
@@ -374,9 +400,10 @@ Unicode 字符的文本提交给对应的 `HumanPlayer` 异步接口。提交成
 其余选手仍可为 mock/LLM。三名及以上选手的单场会完整存档但不计入 ELO，只有双人对局参与
 现有 ELO 更新。每个 capability 只允许读取并提交对应席位的当前 request；对局的
 公开题面和动作事件仍会进入同机的实时观战页，因此它不是隐藏题目或公开事件的保密通道。
-所有项目继续使用通用文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。网页
-仍不能创建比赛、选择 Provider、读取凭据或管理 ELO，也不开放 `series`、`round-robin` 或
-局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
+所有项目继续使用通用文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。
+4.5b 的管理页可以从安全目录选择既有 Profile 并控制三种现有比赛模式，但不会读取凭据、
+直接调用 Provider、写正式档案或任意修改 ELO；这些操作仍由固定参数启动的比赛 worker 通过
+现有事务执行。它也不开放局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
 
 这是可信本机操作者场景，不是同一 macOS/Linux 账户内不同用户之间的保密边界：运行命令的
 终端会显示全部 capability 链接，拥有该操作系统账户文件访问权的人也不属于威胁模型。远程
@@ -407,12 +434,23 @@ Web 未启动或客户端过慢都不会改变比赛结果、Provider 预算、E
 owner fencing 与租约，Web 仅能凭对应 seat capability 对当前 request 做一次原子提交。
 比赛与 Web 服务均停止后可删除；它不是正式档案，不应提交、同步或备份。
 
+本机控制任务使用 `example.db.jobs.db`，以 `0600` 保存脱敏配置、准备态摘要、状态、
+子进程引用和最终档案引用。过期的未启动准备态会在 30 分钟后取消，终态记录在 24 小时后
+在服务重新启动或后续准备/启动任务时清理。`example.db.jobs.db.lock` 是权限同样收紧的独立
+manager lock，只用于防止同一数据库被两个 Web 控制器同时管理；它不是任务租约，也不替代
+循环赛 checkpoint 中的
+runner lease。Web 服务或受控 worker 运行时不要删除这两个文件；完全停止后可一并删除，
+之后会按需重建。它们都不是正式存档，不应代替主数据库备份。
+
 Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `query_only` 连接，不创建、
-迁移或修改它们，也不更新权限或 ELO。唯一写端点使用同源 POST、Bearer capability、严格
-JSON/体积上限和幂等 submission ID，只能推进已有 input request。sidecar 和公开 DTO 都不
-包含 Provider 路由、Profile、模型配置、凭据、请求头或原始失败详情。旧版、外部导入、超大
-或语义不一致的档案不会经 Web 详情接口原样公开。带认证/TLS 的远程多人输入和单场多题
-锦标赛模式仍留给后续阶段四切片。
+迁移或修改它们，也不直接更新 ELO。参与写端点只能推进已有 input request；管理写端点只
+推进独立 jobs sidecar 中经过 admin capability 授权的准备/启动/停止状态。两者都使用同源
+POST、Bearer capability、严格 JSON/体积上限和幂等标识。正式主库写入仅发生在受控比赛
+worker 的既有原子存档路径。jobs sidecar 和公开 DTO 只保留 Profile ID、脱敏显示名、Provider
+类型、默认模型与无凭据配置摘要，不包含 endpoint、凭据环境变量名或值、请求头或原始失败详情。
+旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样
+公开。带正式身份认证、资源授权和 TLS 的远程使用，以及独立的单场多题总分制锦标赛模式，
+仍留给后续阶段四切片。
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，

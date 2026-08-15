@@ -60,11 +60,11 @@
   "sources": [
     {
       "path": "web_src/app.js",
-      "sha256": "2eea2c9a927bcd4690ac0385e6156d6fb38b4817354cf331527a036a967d4fa6"
+      "sha256": "23d46cc7e73e0519aba5090aa690f60a5af1b433a698cdcaa24a255ecc901b9d"
     }
   ],
   "output": {
     "path": "llmolympic/web/static/assets/app.js",
-    "sha256": "c7511cce1e83bf37245d2ecd9bf9ac5d4371fc2650aad82f0f8d3b0ae8273de2"
+    "sha256": "ea6d205057cf0f4bed89794b733fd67abd286c4466fd58f0d3b82990ef41a5b1"
   }
 }

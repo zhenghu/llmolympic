@@ -1,5 +1,5 @@
 #!/bin/bash
-# LLM Olympics 本机 Web 观战页启动器（macOS 双击运行）。
+# LLM Olympics 本机 Web 控制台启动器（macOS 双击运行）。
 
 set -u
 umask 077
@@ -27,7 +27,6 @@ PYTHON="$PROJECT_DIR/.venv/bin/python"
 HOST="127.0.0.1"
 PORT="8000"
 BASE_URL="http://$HOST:$PORT"
-URL="$BASE_URL/"
 
 if [ ! -x "$PYTHON" ]; then
     fail "未找到项目虚拟环境。请先在项目目录运行 python3 -m venv .venv 并安装依赖。"
@@ -48,6 +47,7 @@ STATE_DIR="${TEMP_ROOT%/}/llmolympic-web-$PROJECT_HASH"
 PLIST_PATH="$STATE_DIR/$LABEL.plist"
 STDOUT_LOG="$STATE_DIR/web.stdout.log"
 STDERR_LOG="$STATE_DIR/web.stderr.log"
+ADMIN_TOKEN_FILE="$STATE_DIR/admin.token"
 
 /bin/mkdir -p "$STATE_DIR" || fail "无法创建服务状态目录：$STATE_DIR"
 /bin/chmod 700 "$STATE_DIR" || fail "无法保护服务状态目录。"
@@ -73,24 +73,38 @@ wait_for_health() {
     return 1
 }
 
-open_observer() {
-    /usr/bin/open "$URL" || fail "服务已运行，但无法打开默认浏览器。请手动访问 $URL"
-    echo "LLM Olympics Web 观战页已启动：$URL"
+open_console() {
+    if [ ! -f "$ADMIN_TOKEN_FILE" ]; then
+        fail "服务已运行，但没有生成管理凭证。请查看日志：$STDERR_LOG"
+    fi
+    IFS= read -r ADMIN_TOKEN < "$ADMIN_TOKEN_FILE" \
+        || fail "无法读取本机管理凭证：$ADMIN_TOKEN_FILE"
+    case "$ADMIN_TOKEN" in
+        *[!A-Za-z0-9_-]*|'') fail "本机管理凭证格式无效；请重新启动服务。" ;;
+    esac
+    if [ "${#ADMIN_TOKEN}" -ne 43 ]; then
+        fail "本机管理凭证长度无效；请重新启动服务。"
+    fi
+    ADMIN_URL="$BASE_URL/#admin=$ADMIN_TOKEN"
+    /usr/bin/open "$ADMIN_URL" \
+        || fail "服务已运行，但无法打开默认浏览器。请重新双击本启动器。"
+    unset ADMIN_TOKEN ADMIN_URL
+    echo "LLM Olympics Web 控制台已启动：$BASE_URL/"
     echo "数据库：$DATABASE"
     echo "关闭服务：双击 stop_web.command"
 }
 
 if /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
-    if health_ready; then
+    if health_ready && [ -s "$ADMIN_TOKEN_FILE" ]; then
         echo "Web 服务已经在运行。"
-        open_observer
+        open_console
         exit 0
     fi
     echo "正在重新启动已注册的 Web 服务..."
     /bin/launchctl kickstart -k "$SERVICE_TARGET" >/dev/null 2>&1 \
         || fail "无法重新启动已注册的服务。日志：$STDERR_LOG"
     if wait_for_health; then
-        open_observer
+        open_console
         exit 0
     fi
     echo "最近的错误日志：" >&2
@@ -111,6 +125,7 @@ export LLMOLYMPIC_WEB_PORT="$PORT"
 export LLMOLYMPIC_WEB_STDOUT_LOG="$STDOUT_LOG"
 export LLMOLYMPIC_WEB_STDERR_LOG="$STDERR_LOG"
 export LLMOLYMPIC_WEB_PLIST="$PLIST_PATH"
+export LLMOLYMPIC_WEB_ADMIN_TOKEN_FILE="$ADMIN_TOKEN_FILE"
 
 "$PYTHON" - <<'PY' || fail "无法生成 launchd 服务配置。"
 import os
@@ -132,6 +147,8 @@ payload = {
         os.environ["LLMOLYMPIC_WEB_HOST"],
         "--port",
         os.environ["LLMOLYMPIC_WEB_PORT"],
+        "--control-token-file",
+        os.environ["LLMOLYMPIC_WEB_ADMIN_TOKEN_FILE"],
     ],
     "WorkingDirectory": os.environ["LLMOLYMPIC_WEB_PROJECT_DIR"],
     "RunAtLoad": True,
@@ -149,6 +166,8 @@ PY
 
 : > "$STDOUT_LOG"
 : > "$STDERR_LOG"
+: > "$ADMIN_TOKEN_FILE"
+/bin/chmod 600 "$ADMIN_TOKEN_FILE" || fail "无法保护本机管理凭证文件。"
 
 if ! /bin/launchctl bootstrap "gui/$(/usr/bin/id -u)" "$PLIST_PATH" >/dev/null 2>&1; then
     if ! /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
@@ -157,11 +176,12 @@ if ! /bin/launchctl bootstrap "gui/$(/usr/bin/id -u)" "$PLIST_PATH" >/dev/null 2
 fi
 
 if wait_for_health; then
-    open_observer
+    open_console
     exit 0
 fi
 
 echo "最近的错误日志：" >&2
 /usr/bin/tail -n 30 "$STDERR_LOG" 2>/dev/null || true
 /bin/launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
+: > "$ADMIN_TOKEN_FILE"
 fail "服务未能通过健康检查，已安全卸载。日志：$STDERR_LOG"

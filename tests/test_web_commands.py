@@ -38,6 +38,8 @@ def test_start_web_command_uses_hardened_project_launchd_service() -> None:
     assert '"--db",' in launcher
     assert '"--host",' in launcher
     assert '"--port",' in launcher
+    assert '"--control-token-file",' in launcher
+    assert '"LLMOLYMPIC_WEB_ADMIN_TOKEN_FILE"' in launcher
     assert '"RunAtLoad": True' in launcher
     assert '"KeepAlive": False' in launcher
     assert '"WorkingDirectory"' in launcher
@@ -46,7 +48,9 @@ def test_start_web_command_uses_hardened_project_launchd_service() -> None:
     assert "/bin/launchctl bootstrap" in launcher
     assert "/bin/launchctl kickstart -k \"$SERVICE_TARGET\"" in launcher
     assert "/api/v1/health" in launcher
-    assert '/usr/bin/open "$URL"' in launcher
+    assert '/usr/bin/open "$ADMIN_URL"' in launcher
+    assert '#admin=$ADMIN_TOKEN' in launcher
+    assert 'unset ADMIN_TOKEN ADMIN_URL' in launcher
     assert "plistlib.dump" in launcher
     assert "temporary_path.replace(plist_path)" in launcher
 
@@ -58,6 +62,7 @@ def test_stop_web_command_only_unloads_its_exact_launchd_label() -> None:
     assert 'SERVICE_TARGET="gui/$(/usr/bin/id -u)/$LABEL"' in launcher
     assert '/bin/launchctl print "$SERVICE_TARGET"' in launcher
     assert '/bin/launchctl bootout "$SERVICE_TARGET"' in launcher
+    assert '/bin/rm -f "$ADMIN_TOKEN_FILE"' in launcher
     assert not re.search(r"\b(?:kill|killall|pkill)\b", launcher)
 
 

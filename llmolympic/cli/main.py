@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
 import math
+import os
+import re
+import secrets
 import shlex
 import sqlite3
+import stat
+import sys
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -37,6 +44,7 @@ from llmolympic.config import (
 )
 from llmolympic.config import (
     get_profile,
+    load_profiles,
     load_provider_pricing,
     resolve_budget_settings,
 )
@@ -113,6 +121,165 @@ DEFAULT_TOURNAMENT_SEED = 0
 TOURNAMENT_RUNNER_HEARTBEAT_SECONDS = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS / 4
 TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS = 1.0
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_CONTROL_PROTOCOL_PREFIX = "@@LLMOLYMPIC_CONTROL_V1"
+_CONTROL_PROTOCOL_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+_CONTROL_PARENT_WATCHDOG_ENV = "LLMOLYMPIC_CONTROL_PARENT_WATCHDOG"
+_CONTROL_PROFILE_SNAPSHOT_ENV = "LLMOLYMPIC_CONTROL_PROFILE_SNAPSHOT"
+_control_parent_watchdog_started = False
+
+
+def _start_control_parent_watchdog() -> None:
+    """Exit a managed worker immediately when its controller pipe disappears."""
+
+    global _control_parent_watchdog_started
+    if os.environ.get(_CONTROL_PARENT_WATCHDOG_ENV) != "1":
+        return
+    if _control_parent_watchdog_started:
+        return
+    try:
+        descriptor = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise RuntimeError("本机 Web 控制通道不可用") from exc
+    _control_parent_watchdog_started = True
+
+    def watch_parent() -> None:
+        try:
+            marker = os.read(descriptor, 1)
+        except OSError:
+            marker = b""
+        # The controller never writes to this pipe. EOF, input, or a read
+        # failure all mean that ownership can no longer be proven. Hard exit
+        # prevents further Provider calls and relies on SQLite atomic recovery
+        # if the process was between BEGIN and COMMIT.
+        del marker
+        os._exit(70)
+
+    threading.Thread(
+        target=watch_parent,
+        name="llmolympic-control-parent-watchdog",
+        daemon=True,
+    ).start()
+
+
+def _emit_control_event(event_type: str, **fields: object) -> None:
+    """Emit one authenticated, bounded frame for the local Web controller.
+
+    Normal CLI invocations have no protocol token and therefore emit nothing.
+    The controller drains all ordinary Rich output without logging it; only a
+    frame carrying its unpredictable per-process token is accepted.
+    """
+
+    token = os.environ.get("LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN")
+    if token is None:
+        return
+    _start_control_parent_watchdog()
+    job_id = os.environ.get("LLMOLYMPIC_CONTROL_JOB_ID")
+    if (
+        _CONTROL_PROTOCOL_TOKEN_RE.fullmatch(token) is None
+        or job_id is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job_id) is None
+        or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", event_type) is None
+        or "type" in fields
+        or "job_id" in fields
+    ):
+        raise RuntimeError("本机 Web 控制通道不可用")
+    payload = {"type": event_type, "job_id": job_id, **fields}
+    try:
+        encoded_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("本机 Web 控制通道不可用") from exc
+    if len(encoded_json) > 16_384:
+        raise RuntimeError("本机 Web 控制通道不可用")
+    encoded = base64.urlsafe_b64encode(encoded_json).rstrip(b"=").decode("ascii")
+    try:
+        sys.__stdout__.write(f"{_CONTROL_PROTOCOL_PREFIX}:{token}:{encoded}\n")
+        sys.__stdout__.flush()
+    except (OSError, UnicodeError) as exc:
+        # A managed child must not continue toward Provider calls or a formal
+        # archive commit after its controller disappears.
+        raise RuntimeError("本机 Web 控制通道不可用") from exc
+
+
+def _validate_control_profile_snapshot() -> None:
+    """Bind a managed child to the credential-free Profiles confirmed in Web."""
+
+    raw_snapshot = os.environ.get(_CONTROL_PROFILE_SNAPSHOT_ENV)
+    if raw_snapshot is None:
+        return
+    if len(raw_snapshot.encode("utf-8")) > 4096:
+        raise RuntimeError("本机 Web Profile 快照无效")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate Profile snapshot key")
+            result[key] = value
+        return result
+
+    try:
+        snapshot = json.loads(raw_snapshot, object_pairs_hook=unique_object)
+        if not isinstance(snapshot, dict):
+            raise TypeError("Profile snapshot must be an object")
+        if any(
+            not isinstance(profile_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", profile_id) is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for profile_id, digest in snapshot.items()
+        ):
+            raise ValueError("Profile snapshot entry is invalid")
+        if not snapshot:
+            return
+        from llmolympic.control import profile_configuration_digest
+
+        profiles = load_profiles()
+        for profile_id, expected_digest in snapshot.items():
+            profile = profiles.get(profile_id)
+            if profile is None or not secrets.compare_digest(
+                profile_configuration_digest(profile),
+                expected_digest,
+            ):
+                raise ValueError("Profile changed after preparation")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("本机 Web Profile 快照无效") from exc
+
+
+def _write_private_control_token(path: Path, token: str) -> Path:
+    """Atomically publish one admin token without following a symlink."""
+
+    target = path.expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (not stat.S_ISREG(info.st_mode) or target.is_symlink()):
+        raise OSError("管理凭证路径必须是普通文件，且不能是符号链接")
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(f"{token}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        temporary.replace(target)
+        target.chmod(0o600)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +622,8 @@ class _LiveRun:
                     return
                 self._live_id = publisher.start_session(event, context=context)
                 success = self._live_id is not None
+                if success:
+                    _emit_control_event("live_started", live_id=self._live_id)
             else:
                 success = publisher.publish(self._live_id, event, context=context)
             if not success or publisher.failed:
@@ -640,6 +809,7 @@ def _parse_players(
     ``human`` 省略名字时默认为"人类"。``profile:<id>[:model]``
     使用 ``[profiles.<id>]``，并生成与显示名分离的稳定 entrant ID。
     """
+    _validate_control_profile_snapshot()
     players: list[Player] = []
     for token in _split_player_specs(spec, param_hint=param_hint):
         kind, _, ident = token.partition(":")
@@ -1256,6 +1426,7 @@ async def _run(
     saved = False
 
     def on_event(event: MatchEvent) -> None:
+        _emit_control_event("progress")
         for browser_human in browser_humans:
             browser_human.observe_event(event)
         guarded_render(event)
@@ -1268,6 +1439,12 @@ async def _run(
             seed=seed,
             on_event=on_event,
             judge_panel=judge_panel,
+        )
+        _emit_control_event(
+            "finalizing",
+            final_kind="match",
+            final_id=archive.match_id,
+            final_match_ids=[archive.match_id],
         )
         result = store.save_match(archive, rating_source="engine")
         saved = True
@@ -1282,6 +1459,12 @@ async def _run(
             final_kind="match",
             final_id=archive.match_id,
             final_match_ids=(archive.match_id,),
+        )
+        _emit_control_event(
+            "completed",
+            final_kind="match",
+            final_id=archive.match_id,
+            final_match_ids=[archive.match_id],
         )
         _best_effort_render(_render_saved, archive, store, result)
     finally:
@@ -1380,6 +1563,7 @@ async def _run_series(
     guarded_render_leg = _guard_renderer(render_leg)
 
     def on_event(leg_number: int, event: MatchEvent) -> None:
+        _emit_control_event("progress")
         guarded_render_leg(leg_number, event)
         live.observe(event, context={"leg_number": leg_number})
 
@@ -1391,12 +1575,25 @@ async def _run_series(
             on_event=on_event,
             judge_panel=judge_panel,
         )
+        series_match_ids = [leg.match_id for leg in series_archive.legs]
+        _emit_control_event(
+            "finalizing",
+            final_kind="series",
+            final_id=series_archive.series_id,
+            final_match_ids=series_match_ids,
+        )
         result = store.save_series(series_archive, rating_source="engine")
         saved = True
         live.complete(
             final_kind="series",
             final_id=series_archive.series_id,
-            final_match_ids=tuple(leg.match_id for leg in series_archive.legs),
+            final_match_ids=tuple(series_match_ids),
+        )
+        _emit_control_event(
+            "completed",
+            final_kind="series",
+            final_id=series_archive.series_id,
+            final_match_ids=series_match_ids,
         )
         _best_effort_render(_render_series_summary, series_archive)
         _best_effort_render(_render_series_saved, series_archive, store, result)
@@ -1640,6 +1837,7 @@ async def _run_round_robin(
     finalized = False
 
     def on_event(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
+        _emit_control_event("progress")
         guarded_render_pairing(pairing_number, leg_number, event)
         live.observe(
             event,
@@ -1684,6 +1882,17 @@ async def _run_round_robin(
             await asyncio.gather(tournament_task, heartbeat_task, return_exceptions=True)
 
         renewed_lease = store.renew_tournament_runner(lease)
+        tournament_match_ids = [
+            leg.match_id
+            for pairing in tournament.pairings
+            for leg in pairing.series.legs
+        ]
+        _emit_control_event(
+            "finalizing",
+            final_kind="tournament",
+            final_id=tournament.tournament_id,
+            final_match_ids=tournament_match_ids,
+        )
         result = store.finalize_tournament_checkpoint(
             checkpoint.tournament_id,
             lease=renewed_lease,
@@ -1692,11 +1901,13 @@ async def _run_round_robin(
         live.complete(
             final_kind="tournament",
             final_id=tournament.tournament_id,
-            final_match_ids=tuple(
-                leg.match_id
-                for pairing in tournament.pairings
-                for leg in pairing.series.legs
-            ),
+            final_match_ids=tuple(tournament_match_ids),
+        )
+        _emit_control_event(
+            "completed",
+            final_kind="tournament",
+            final_id=tournament.tournament_id,
+            final_match_ids=tournament_match_ids,
         )
         _best_effort_render(_render_tournament_summary, tournament)
         _best_effort_render(_render_tournament_saved, tournament, store, result)
@@ -1871,20 +2082,27 @@ def play(
                 style="green",
             )
             for index, browser_human in enumerate(browser_humans, start=1):
+                participation_url = browser_human.participation_url(web_url)
                 participation.append(f"\n\n席位 {index} · ")
                 participation.append(literal_text(browser_human.name, style="bold"))
                 participation.append("\n")
                 participation.append(
                     literal_text(
-                        browser_human.participation_url(web_url),
+                        participation_url,
                         style="bold underline",
                     ),
+                )
+                _emit_control_event(
+                    "participation",
+                    player_name=browser_human.name,
+                    url=participation_url,
                 )
             participation.append(
                 "\n\n先启动 llmolympic web，再把每条一次性链接分别交给对应的本机浏览器席位。",
                 style="dim",
             )
             console.print(Panel(participation, title=Text("Web 参与链接（请勿混用）")))
+        _emit_control_event("running")
         if judge_panel is None:
             asyncio.run(_run(selected_game, selected_players, seed, store))
         else:
@@ -2059,6 +2277,7 @@ def series(
     )
     store = _open_store(database)
     try:
+        _emit_control_event("running")
         asyncio.run(
             _run_series(
                 selected_game,
@@ -2187,6 +2406,10 @@ def round_robin(
 ) -> None:
     """新建或恢复 3–16 名非人类选手的交换顺序循环赛。"""
 
+    # Managed Web resumes must reject a changed Profile before claiming the
+    # durable runner lease or touching the usage ledger.  _parse_players
+    # repeats this check immediately before Provider construction.
+    _validate_control_profile_snapshot()
     resumed = resume is not None
     resolved_budget: ResolvedProviderBudget | None = None
     runtime_budget: _RuntimeBudget | None = None
@@ -2341,6 +2564,16 @@ def round_robin(
                 raise StorageError("循环赛 checkpoint 已封存，但正式档案无法读取")
             _best_effort_render(_render_tournament_summary, tournament)
             _best_effort_render(_render_tournament_saved, tournament, store, result)
+            _emit_control_event(
+                "completed",
+                final_kind="tournament",
+                final_id=tournament.tournament_id,
+                final_match_ids=[
+                    leg.match_id
+                    for pairing in tournament.pairings
+                    for leg in pairing.series.legs
+                ],
+            )
             return
         if resumed:
             try:
@@ -2364,6 +2597,7 @@ def round_robin(
                 runtime_budget.resolved,
                 runtime_budget.ledger,
             )
+        _emit_control_event("running", tournament_id=checkpoint.tournament_id)
         asyncio.run(
             _run_round_robin(
                 selected_game,
@@ -2439,8 +2673,15 @@ def serve_web(
         int,
         typer.Option("--port", min=1, max=65_535, help="监听端口"),
     ] = 8000,
+    control_token_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--control-token-file",
+            help="将本机管理 capability 原子写入权限 0600 的文件；不会打印凭证",
+        ),
+    ] = None,
 ) -> None:
-    """启动本机 Web 参与页、只读观战与对局回放。"""
+    """启动本机 Web 比赛控制、参与、观战与对局回放。"""
 
     normalized_host = host.strip().casefold()
     if normalized_host not in LOCAL_WEB_HOSTS:
@@ -2452,27 +2693,60 @@ def serve_web(
 
     uvicorn, create_app = _load_web_runtime()
     resolved_database = database_path(database)
-    web_app = create_app(resolved_database)
-    display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
-    console.print(f"本机 Web 页面：http://{display_host}:{port}/")
-    console.print(f"Web API（健康检查）：http://{display_host}:{port}/api/v1/health")
-    console.print(
-        "可观看公开事件与存档；持参与链接的本机浏览器可提交人类走法。按 Ctrl-C 停止。"
-    )
-    uvicorn.run(
-        web_app,
-        host=normalized_host,
-        port=port,
-        access_log=False,
-        proxy_headers=False,
-        forwarded_allow_ips="",
-        server_header=False,
-        date_header=False,
-        ws_max_size=65_536,
-        ws_max_queue=16,
-        limit_concurrency=64,
-        timeout_keep_alive=5,
-    )
+    if control_token_file is None and not sys.stdout.isatty():
+        raise typer.BadParameter(
+            "非交互输出不会打印管理凭证；请使用 --control-token-file 指定权限 0600 的文件",
+            param_hint="--control-token-file",
+        )
+    control_token = secrets.token_urlsafe(32)
+    published_token_file: Path | None = None
+    if control_token_file is not None:
+        try:
+            published_token_file = _write_private_control_token(
+                control_token_file,
+                control_token,
+            )
+        except OSError as exc:
+            raise typer.BadParameter(
+                f"无法安全写入管理凭证文件: {exc}",
+                param_hint="--control-token-file",
+            ) from exc
+    try:
+        web_app = create_app(resolved_database, control_token=control_token)
+        display_host = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+        console.print(f"本机 Web 页面：http://{display_host}:{port}/")
+        console.print(f"Web API（健康检查）：http://{display_host}:{port}/api/v1/health")
+        if published_token_file is None:
+            console.print(
+                "本机 Web 管理链接："
+                f"http://{display_host}:{port}/#admin={control_token}"
+            )
+        else:
+            console.print("本机管理凭证已写入受保护文件；不会出现在服务日志中。")
+        console.print(
+            "可创建与控制比赛、观看公开事件与存档；持参与链接的浏览器可提交人类走法。"
+            "按 Ctrl-C 停止。"
+        )
+        uvicorn.run(
+            web_app,
+            host=normalized_host,
+            port=port,
+            access_log=False,
+            proxy_headers=False,
+            forwarded_allow_ips="",
+            server_header=False,
+            date_header=False,
+            ws_max_size=65_536,
+            ws_max_queue=16,
+            limit_concurrency=64,
+            timeout_keep_alive=5,
+        )
+    finally:
+        if published_token_file is not None:
+            try:
+                published_token_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @app.command(name="games")
