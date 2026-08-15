@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-15
+
 - 完成阶段四 4.5b 的本机全 Web 控制台：持启动时生成的管理链接可在浏览器中准备、确认启动、
   查看与停止 `play`、`series` 和 `round-robin`；中断的循环赛可从既有 checkpoint 显式准备
   恢复。Web 只接受全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结
