@@ -1,5 +1,5 @@
 #!/bin/bash
-# LLM Olympics 本机 Web 观战页关闭器（macOS 双击运行）。
+# LLM Olympics 本机 Web 控制台关闭器（macOS 双击运行）。
 
 set -u
 
@@ -28,8 +28,13 @@ SERVICE_TARGET="gui/$(/usr/bin/id -u)/$LABEL"
 TEMP_ROOT="${TMPDIR:-/tmp}"
 STATE_DIR="${TEMP_ROOT%/}/llmolympic-web-$PROJECT_HASH"
 STDERR_LOG="$STATE_DIR/web.stderr.log"
+ADMIN_TOKEN_FILE="$STATE_DIR/admin.token"
 
 if ! /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
+    if [ -f "$ADMIN_TOKEN_FILE" ]; then
+        /bin/rm -f "$ADMIN_TOKEN_FILE" \
+            || fail "服务已停止，但无法删除过期的本机管理凭证：$ADMIN_TOKEN_FILE"
+    fi
     echo "LLM Olympics Web 服务已经停止（未发现由 start_web.command 管理的实例）。"
     if /usr/sbin/lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
         echo "注意：端口 8000 仍被其他进程占用，本关闭器不会停止它。"
@@ -48,6 +53,11 @@ while /bin/launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; do
     /bin/sleep 0.1
     attempts=$((attempts + 1))
 done
+
+if [ -f "$ADMIN_TOKEN_FILE" ]; then
+    /bin/rm -f "$ADMIN_TOKEN_FILE" \
+        || fail "服务已停止，但无法删除本机管理凭证：$ADMIN_TOKEN_FILE"
+fi
 
 echo "LLM Olympics Web 服务已关闭。"
 echo "日志保留在：$STATE_DIR"

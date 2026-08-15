@@ -23,6 +23,8 @@ WEB_ASSET_PATHS = (
     "llmolympic/web/static/assets/app.js",
 )
 RUNTIME_PACKAGE_PATHS = (
+    "llmolympic/control.py",
+    "llmolympic/control_runner.py",
     "llmolympic/human_input.py",
 )
 LEGACY_REACT_ASSET_PATHS = (

@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+- 完成阶段四 4.5b 的本机全 Web 控制台：持启动时生成的管理链接可在浏览器中准备、确认启动、
+  查看与停止 `play`、`series` 和 `round-robin`；中断的循环赛可从既有 checkpoint 显式准备
+  恢复。Web 只接受全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结
+  Provider 预算的 checkpoint；旧式直接 Provider checkpoint 仍可从 CLI 恢复，但不会进入
+  Web 控制面。未过期的 runner lease 仍在活动时不会报告为可恢复。普通根页面仍可不带
+  管理凭证只读观战，比赛引擎、正式存档和 ELO 事务继续由独立受控 worker 执行。
+- 新增与正式档案分离、权限为 `0600` 的 jobs sidecar，以及 `prepare → start` 两阶段、请求
+  幂等、单活动任务和合作式停止边界。jobs sidecar 保存任务状态；独立的 `0600`
+  manager lock 文件保证同一数据库只有一个控制器，它不是 jobs 租约。浏览器只能选择内置
+  Human/mock 或已配置的 Provider Profile，不能提交命令、路径、环境变量、API Key、
+  Provider endpoint 或任意模型。prepare 会冻结无凭据的 Profile 安全投影并绑定配置摘要；
+  控制器和 child 在构造 Provider 前都会复核，配置变化将安全失败。Profile 还必须在启动前
+  通过凭据就绪与硬预算校验。
+- Web 管理端使用独立的高熵 admin capability、精确同源 JSON 请求与严格 DTO；管理凭证仅由
+  本机启动器通过 URL fragment 交付并立即从地址栏清除，不写 jobs DB、比赛档案或日志。
+  macOS 启动器将凭证保存在项目专属 `0700` 状态目录中的 `0600` 临时文件，关闭服务时删除。
+  本功能仍只允许回环地址和可信本机操作者，不提供远程身份认证、授权或 TLS。
 - 完成建议编号阶段四 4.5a：`play --human-input web` 现在可为同一场比赛中的每一名
   `HumanPlayer` 创建独立的本机浏览器席位；比赛仍需至少 2 名选手，并继续服从具体 Game
   与平台最多 16 名选手的既有人数约束。CLI 会按选手分别打印一次性参与链接，非人类席位

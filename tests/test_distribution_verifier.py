@@ -48,9 +48,10 @@ def _write_distributions(
             archive.writestr(f"{dist_info}/licenses/{filename}", (root / filename).read_bytes())
         for filename in verifier.WEB_ASSET_PATHS:
             archive.writestr(filename, (root / filename).read_bytes())
-        if wheel_human_input:
-            for filename in verifier.RUNTIME_PACKAGE_PATHS:
-                archive.writestr(filename, (root / filename).read_bytes())
+        for filename in verifier.RUNTIME_PACKAGE_PATHS:
+            if filename == "llmolympic/human_input.py" and not wheel_human_input:
+                continue
+            archive.writestr(filename, (root / filename).read_bytes())
 
     sdist = dist_dir / f"llmolympic-{version}.tar.gz"
     sdist_root = f"llmolympic-{version}"
@@ -62,9 +63,10 @@ def _write_distributions(
             _tar_member(archive, f"{sdist_root}/{filename}", (root / filename).read_bytes())
         for filename in verifier.WEB_BUILD_INPUT_PATHS:
             _tar_member(archive, f"{sdist_root}/{filename}", (root / filename).read_bytes())
-        if sdist_human_input:
-            for filename in verifier.RUNTIME_PACKAGE_PATHS:
-                _tar_member(archive, f"{sdist_root}/{filename}", (root / filename).read_bytes())
+        for filename in verifier.RUNTIME_PACKAGE_PATHS:
+            if filename == "llmolympic/human_input.py" and not sdist_human_input:
+                continue
+            _tar_member(archive, f"{sdist_root}/{filename}", (root / filename).read_bytes())
 
 
 def test_distribution_verifier_accepts_human_input_in_wheel_and_sdist(tmp_path: Path) -> None:

@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import secrets
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request, WebSocket
@@ -17,6 +19,18 @@ from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
 from llmolympic import __version__
+from llmolympic.control import (
+    MAX_CONTROL_BODY_BYTES,
+    ControlCatalogResponse,
+    ControlError,
+    ControlJob,
+    ControlJobListResponse,
+    ControlJobResponse,
+    ControlJobSpec,
+    JobStore,
+    control_catalog,
+    validate_job_spec,
+)
 from llmolympic.games import GAME_REGISTRY
 from llmolympic.human_input import HumanInputError, WebSubmissionStore
 from llmolympic.web.live_reader import LiveReadError, LiveSQLiteReader
@@ -51,6 +65,7 @@ LIVE_POLL_SECONDS = 0.2
 LIVE_PAGE_LIMIT = 256
 MAX_CONCURRENT_INPUT_REQUESTS = 8
 MAX_INPUT_BODY_BYTES = 32 * 1024
+MAX_CONCURRENT_CONTROL_REQUESTS = 4
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 _SAFE_PATH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -120,6 +135,17 @@ _PARTICIPATION_ERROR_RESPONSES = {
     503: {"model": ErrorResponse, "description": "Participation input unavailable"},
 }
 
+_CONTROL_ERROR_RESPONSES = {
+    400: {"model": ErrorResponse, "description": "Invalid control request"},
+    401: {"model": ErrorResponse, "description": "Admin capability required"},
+    403: {"model": ErrorResponse, "description": "Same-origin request required"},
+    404: {"model": ErrorResponse, "description": "Job not found"},
+    409: {"model": ErrorResponse, "description": "Job state conflict"},
+    413: {"model": ErrorResponse, "description": "Control body too large"},
+    429: {"model": ErrorResponse, "description": "Control plane overloaded"},
+    503: {"model": ErrorResponse, "description": "Control plane unavailable"},
+}
+
 
 def _error(code: str, status_code: int) -> JSONResponse:
     payload = ErrorResponse(error={"code": code})
@@ -175,6 +201,115 @@ def _public_input_error(exc: HumanInputError) -> tuple[str, int]:
     if exc.code == "input_overloaded":
         return "overloaded", 429
     return "participation_unavailable", 503
+
+
+def _public_control_error(exc: ControlError) -> tuple[str, int]:
+    if exc.code in {
+        "invalid_request",
+        "large_tournament_confirmation_required",
+        "profile_unavailable",
+    }:
+        return exc.code, 400
+    if exc.code == "control_unauthorized":
+        return exc.code, 401
+    if exc.code == "cross_origin_forbidden":
+        return exc.code, 403
+    if exc.code == "job_not_found":
+        return exc.code, 404
+    if exc.code in {
+        "budget_required",
+        "idempotency_conflict",
+        "job_conflict",
+        "job_not_stoppable",
+        "job_capacity",
+        "resume_unavailable",
+    }:
+        public_code = (
+            "job_state_conflict"
+            if exc.code in {"job_conflict", "job_not_stoppable"}
+            else exc.code
+        )
+        return public_code, 409
+    if exc.code == "control_body_too_large":
+        return "request_too_large", 413
+    if exc.code in {"control_overloaded", "job_queue_full"}:
+        return exc.code, 429
+    return "control_unavailable", 503
+
+
+class _ControlManager(Protocol):
+    def public_job(self, job: ControlJob) -> ControlJob: ...
+
+    async def start(
+        self,
+        job_id: str,
+        *,
+        idempotency_key: str,
+        web_base_url: str,
+    ) -> ControlJob: ...
+
+    async def cancel(
+        self,
+        job_id: str,
+        *,
+        idempotency_key: str,
+    ) -> ControlJob: ...
+
+    async def shutdown(self) -> None: ...
+
+
+def _admin_capability(request: Request, expected: str | None) -> None:
+    value = request.headers.get("authorization")
+    if (
+        expected is None
+        or value is None
+        or len(value) > 512
+        or not value.startswith("Bearer ")
+    ):
+        raise ControlError("control_unauthorized")
+    supplied = value.removeprefix("Bearer ")
+    if (
+        re.fullmatch(r"[A-Za-z0-9_-]{32,256}", supplied) is None
+        or not secrets.compare_digest(supplied, expected)
+    ):
+        raise ControlError("control_unauthorized")
+
+
+def _control_idempotency_key(request: Request) -> str:
+    value = request.headers.get("idempotency-key")
+    if value is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+        raise ControlError("invalid_request")
+    return value
+
+
+def _require_control_write_context(request: Request) -> None:
+    origin = request.headers.get("origin")
+    fetch_site = request.headers.get("sec-fetch-site")
+    if not _same_loopback_origin(origin, request.headers.get("host"), request.url.scheme) or (
+        fetch_site is not None and fetch_site.casefold() != "same-origin"
+    ):
+        raise ControlError("cross_origin_forbidden")
+
+
+async def _bounded_control_body(request: Request) -> object:
+    content_type = request.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().casefold() != "application/json":
+        raise ControlError("invalid_request")
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        if not content_length.isascii() or not content_length.isdigit():
+            raise ControlError("invalid_request")
+        if int(content_length) > MAX_CONTROL_BODY_BYTES:
+            raise ControlError("control_body_too_large")
+    payload = bytearray()
+    async for chunk in request.stream():
+        payload.extend(chunk)
+        if len(payload) > MAX_CONTROL_BODY_BYTES:
+            raise ControlError("control_body_too_large")
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControlError("invalid_request") from exc
 
 
 def _bearer_capability(request: Request) -> str:
@@ -264,16 +399,31 @@ async def _send_json(websocket: WebSocket, payload: object) -> None:
     )
 
 
-def create_app(database: str | Path) -> FastAPI:
+def create_app(
+    database: str | Path,
+    *,
+    control_token: str | None = None,
+    control_manager: _ControlManager | None = None,
+) -> FastAPI:
     """Build the local Web app without opening any database at import time."""
 
+    if control_token is not None and re.fullmatch(
+        r"[A-Za-z0-9_-]{32,256}", control_token
+    ) is None:
+        raise ValueError("control_token must be a 32-256 character URL-safe capability")
     reader = WebSQLiteReader(database)
     live_reader = LiveSQLiteReader(database)
     input_store = WebSubmissionStore(database)
+    job_store = JobStore(database) if control_token is not None else None
+    if job_store is not None and control_manager is None:
+        from llmolympic.control_runner import ControlJobManager
+
+        control_manager = ControlJobManager(job_store)
     read_slots = asyncio.Semaphore(MAX_CONCURRENT_READS)
     replay_slots = asyncio.Semaphore(MAX_CONCURRENT_REPLAYS)
     live_slots = asyncio.Semaphore(MAX_CONCURRENT_LIVE_STREAMS)
     input_slots = asyncio.Semaphore(MAX_CONCURRENT_INPUT_REQUESTS)
+    control_slots = asyncio.Semaphore(MAX_CONCURRENT_CONTROL_REQUESTS)
     static_root = Path(__file__).with_name("static")
     index_path = static_root / "index.html"
     assets_path = static_root / "assets"
@@ -357,6 +507,12 @@ def create_app(database: str | Path) -> FastAPI:
         code, status = _public_input_error(exc)
         return _error(code, status)
 
+    @app.exception_handler(ControlError)
+    async def control_error_handler(request: Request, exc: ControlError) -> JSONResponse:
+        del request
+        code, status = _public_control_error(exc)
+        return _error(code, status)
+
     async def read(callable_: Callable[[], object]) -> object:
         async with read_slots:
             return await run_in_threadpool(callable_)
@@ -370,6 +526,28 @@ def create_app(database: str | Path) -> FastAPI:
             return await run_in_threadpool(callable_)
         finally:
             input_slots.release()
+
+    async def control_call(callable_: Callable[[], object]) -> object:
+        try:
+            await asyncio.wait_for(control_slots.acquire(), timeout=0.05)
+        except TimeoutError as exc:
+            raise ControlError("control_overloaded") from exc
+        try:
+            return await run_in_threadpool(callable_)
+        finally:
+            control_slots.release()
+
+    def require_control(request: Request) -> JobStore:
+        _admin_capability(request, control_token)
+        if job_store is None:
+            raise ControlError("control_unavailable")
+        return job_store
+
+    def public_job(job: ControlJob) -> ControlJob:
+        return control_manager.public_job(job) if control_manager is not None else job
+
+    if control_manager is not None:
+        app.router.add_event_handler("shutdown", control_manager.shutdown)
 
     app.mount("/assets", StaticFiles(directory=assets_path), name="observer-assets")
 
@@ -386,6 +564,16 @@ def create_app(database: str | Path) -> FastAPI:
     @app.get("/live/{live_id}", include_in_schema=False, response_class=FileResponse)
     async def observer_live(live_id: str) -> Response:
         if _SAFE_PATH_ID_RE.fullmatch(live_id) is None:
+            return Response(status_code=404)
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get("/new", include_in_schema=False, response_class=FileResponse)
+    async def control_new_page() -> FileResponse:
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
+
+    @app.get("/jobs/{job_id}", include_in_schema=False, response_class=FileResponse)
+    async def control_job_page(job_id: str) -> Response:
+        if _SAFE_PATH_ID_RE.fullmatch(job_id) is None:
             return Response(status_code=404)
         return FileResponse(index_path, media_type="text/html; charset=utf-8")
 
@@ -480,6 +668,106 @@ def create_app(database: str | Path) -> FastAPI:
             content=payload.model_dump(mode="json"),
             headers=_security_headers(),
         )
+
+    @app.get(
+        "/api/v1/control/catalog",
+        response_model=ControlCatalogResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_catalog_endpoint(request: Request) -> ControlCatalogResponse:
+        require_control(request)
+        return await control_call(control_catalog)
+
+    @app.get(
+        "/api/v1/control/jobs",
+        response_model=ControlJobListResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_jobs(
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=100),
+    ) -> ControlJobListResponse:
+        store = require_control(request)
+        jobs = await control_call(lambda: store.list(limit=limit))
+        return ControlJobListResponse(jobs=tuple(public_job(job) for job in jobs))
+
+    @app.post(
+        "/api/v1/control/jobs",
+        response_model=ControlJobResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+        status_code=201,
+    )
+    async def control_prepare_job(request: Request) -> ControlJobResponse:
+        store = require_control(request)
+        _require_control_write_context(request)
+        idempotency_key = _control_idempotency_key(request)
+        raw_payload = await _bounded_control_body(request)
+        try:
+            spec = ControlJobSpec.model_validate(raw_payload)
+        except (TypeError, ValueError) as exc:
+            raise ControlError("invalid_request") from exc
+        preview = await control_call(
+            lambda: validate_job_spec(
+                spec,
+                archive_database=store.archive_database,
+            )
+        )
+        job = await control_call(
+            lambda: store.prepare(
+                spec,
+                preview,
+                idempotency_key=idempotency_key,
+            )
+        )
+        return ControlJobResponse(job=public_job(job))
+
+    @app.get(
+        "/api/v1/control/jobs/{job_id}",
+        response_model=ControlJobResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_job(request: Request, job_id: str) -> ControlJobResponse:
+        store = require_control(request)
+        job = await control_call(lambda: store.get(job_id))
+        return ControlJobResponse(job=public_job(job))
+
+    @app.post(
+        "/api/v1/control/jobs/{job_id}/start",
+        response_model=ControlJobResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_start_job(request: Request, job_id: str) -> ControlJobResponse:
+        require_control(request)
+        _require_control_write_context(request)
+        idempotency_key = _control_idempotency_key(request)
+        raw_payload = await _bounded_control_body(request)
+        if raw_payload != {}:
+            raise ControlError("invalid_request")
+        if control_manager is None:
+            raise ControlError("control_unavailable")
+        job = await control_manager.start(
+            job_id,
+            idempotency_key=idempotency_key,
+            web_base_url=str(request.base_url).rstrip("/"),
+        )
+        return ControlJobResponse(job=public_job(job))
+
+    @app.post(
+        "/api/v1/control/jobs/{job_id}/cancel",
+        response_model=ControlJobResponse,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_cancel_job(request: Request, job_id: str) -> ControlJobResponse:
+        require_control(request)
+        _require_control_write_context(request)
+        idempotency_key = _control_idempotency_key(request)
+        raw_payload = await _bounded_control_body(request)
+        if raw_payload != {}:
+            raise ControlError("invalid_request")
+        if control_manager is None:
+            raise ControlError("control_unavailable")
+        job = await control_manager.cancel(job_id, idempotency_key=idempotency_key)
+        return ControlJobResponse(job=public_job(job))
 
     @app.get("/api/v1/health", response_model=HealthResponse)
     async def health() -> HealthResponse:

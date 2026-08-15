@@ -314,5 +314,17 @@ CLI                  Web / WebSocket
    约束。capability 只隔离每席位的 request 读取与
    提交，公开题面和动作事件仍可由同机观战页看到。4.5a 仍只信任运行 CLI 的本机操作者并限制在
    loopback；终端持有全部席位链接，因此它不是同一操作系统账户内的身份或保密边界，也不把
-   浏览器输入扩展到 `series`、`round-robin`。后续切片再加入正式认证、席位授权与 TLS 的远程
-   多席位输入和锦标赛模式；之后新增项目继续保持纯插件接入。
+   浏览器输入扩展到 `series`、`round-robin`。4.5b 以独立 `0600` jobs sidecar、启动时 admin
+   capability、不可变 prepare/start 两阶段和固定参数 worker 提供本机全 Web 控制台 ✅：浏览器
+   可准备、确认启动、停止现有 `play`、`series`、`round-robin`，并显式恢复循环赛 checkpoint；
+   prepare 冻结受信 Profile 的无凭据安全投影并把配置摘要绑定到任务，控制器与 child 都在
+   Provider 构造前复核摘要，避免 prepare/start 之间的 Profile 配置漂移。jobs sidecar 保存状态；
+   同路径的独立 `0600` manager lock 文件用于单控制器互斥，不把 jobs 状态伪装成租约。循环赛
+   恢复仍依赖主库 checkpoint 中的 runner lease：活动租约未过期时不可恢复；Web 只恢复
+   全 Mock 无预算 checkpoint，或只含命名 Profile 且已有冻结硬预算的 checkpoint，旧式直接
+   Provider checkpoint 仍走 CLI。正式存档/ELO 仍仅由
+   比赛 worker 经既有事务写入，网页不能提交命令、路径、凭据、endpoint 或任意模型配置。
+   该控制面仍只信任回环地址上的本机操作者，同一数据库最多一个活动 Web 任务，
+   play/series 中断后不自动重跑。
+   后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及独立的单场多题总分制
+   锦标赛模式；之后新增项目继续保持纯插件接入。

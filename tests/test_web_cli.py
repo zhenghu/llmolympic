@@ -39,11 +39,11 @@ def test_web_starts_hardened_local_server(
     display_host: str,
 ) -> None:
     calls: list[tuple[object, dict[str, object]]] = []
-    created_for: list[Path] = []
+    created_for: list[tuple[Path, str]] = []
     sentinel_app = object()
 
-    def create_app(path: Path) -> object:
-        created_for.append(path)
+    def create_app(path: Path, *, control_token: str) -> object:
+        created_for.append((path, control_token))
         return sentinel_app
 
     def run(app: object, **kwargs: object) -> None:
@@ -55,14 +55,28 @@ def test_web_starts_hardened_local_server(
         lambda: (SimpleNamespace(run=run), create_app),
     )
     database = tmp_path / "archive.db"
+    token_file = tmp_path / "admin.token"
 
     result = runner.invoke(
         main.app,
-        ["web", "--db", str(database), "--host", host, "--port", "8765"],
+        [
+            "web",
+            "--db",
+            str(database),
+            "--host",
+            host,
+            "--port",
+            "8765",
+            "--control-token-file",
+            str(token_file),
+        ],
     )
 
     assert result.exit_code == 0, result.output
-    assert created_for == [database.resolve()]
+    assert len(created_for) == 1
+    assert created_for[0][0] == database.resolve()
+    assert len(created_for[0][1]) == 43
+    assert not token_file.exists()
     assert calls == [
         (
             sentinel_app,
@@ -84,6 +98,7 @@ def test_web_starts_hardened_local_server(
     output = _plain(result.output)
     assert f"本机 Web 页面：http://{display_host}:8765/" in output
     assert f"Web API（健康检查）：http://{display_host}:8765/api/v1/health" in output
+    assert created_for[0][1] not in output
 
 
 def test_web_help_does_not_load_optional_runtime(monkeypatch) -> None:
@@ -95,4 +110,4 @@ def test_web_help_does_not_load_optional_runtime(monkeypatch) -> None:
     result = runner.invoke(main.app, ["web", "--help"])
 
     assert result.exit_code == 0
-    assert "Web 参与页、只读观战" in _plain(result.output)
+    assert "本机 Web 比赛控制" in _plain(result.output)

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 import typer
@@ -14,13 +18,16 @@ from typer.testing import CliRunner
 
 from llmolympic import config
 from llmolympic.cli.main import (
+    _emit_control_event,
     _prepare_round_robin,
     _restore_round_robin,
     _run_round_robin,
     _runner_lease_heartbeat,
+    _validate_control_profile_snapshot,
     _validate_tournament_workload,
     app,
 )
+from llmolympic.control import profile_configuration_digest
 from llmolympic.core.events import EventType
 from llmolympic.core.player import HumanPlayer
 from llmolympic.core.storage import (
@@ -41,6 +48,194 @@ from llmolympic.providers.mock import MockProvider
 from llmolympic.web.live_reader import LiveSQLiteReader
 
 runner = CliRunner()
+
+
+def test_control_protocol_is_inert_without_managed_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RejectWrites:
+        def write(self, _value: str) -> int:
+            raise AssertionError("ordinary CLI execution must not use the control channel")
+
+        def flush(self) -> None:
+            raise AssertionError("ordinary CLI execution must not use the control channel")
+
+    monkeypatch.delenv("LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN", raising=False)
+    monkeypatch.delenv("LLMOLYMPIC_CONTROL_JOB_ID", raising=False)
+    monkeypatch.setattr(sys, "__stdout__", RejectWrites())
+
+    _emit_control_event("progress")
+
+
+def test_managed_control_channel_failure_aborts_before_archive_and_elo(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    protocol_token = "p" * 43
+    job_id = "job-control-channel-failure"
+    frames: list[dict[str, object]] = []
+
+    class FailFirstProgress:
+        def write(self, value: str) -> int:
+            prefix = f"@@LLMOLYMPIC_CONTROL_V1:{protocol_token}:"
+            assert value.startswith(prefix)
+            encoded = value[len(prefix) :].strip()
+            padding = "=" * (-len(encoded) % 4)
+            payload = json.loads(
+                base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            )
+            frames.append(payload)
+            if payload["type"] == "progress":
+                raise BrokenPipeError("controller pipe closed")
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+    path = tmp_path / "managed-pipe-failure.db"
+    monkeypatch.setattr(sys, "__stdout__", FailFirstProgress())
+    result = runner.invoke(
+        app,
+        [
+            "play",
+            "--game",
+            "math_quiz",
+            "--players",
+            "mock:random,mock:fixed",
+            "--rounds",
+            "1",
+            "--seed",
+            "3",
+            "--db",
+            str(path),
+        ],
+        env={
+            "LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN": protocol_token,
+            "LLMOLYMPIC_CONTROL_JOB_ID": job_id,
+        },
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "本机 Web 控制通道不可用"
+    assert [frame["type"] for frame in frames] == ["running", "progress"]
+    assert all(frame["job_id"] == job_id for frame in frames)
+    store = SQLiteStore(path)
+    assert store.list_matches() == []
+    assert store.leaderboard() == []
+
+
+def test_managed_worker_exits_when_controller_lifetime_pipe_closes() -> None:
+    token = "w" * 43
+    environment = {
+        **os.environ,
+        "LLMOLYMPIC_CONTROL_JOB_ID": "watchdog-job",
+        "LLMOLYMPIC_CONTROL_PARENT_WATCHDOG": "1",
+        "LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN": token,
+    }
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "from llmolympic.cli.main import _emit_control_event; "
+                "_emit_control_event('running'); time.sleep(30)"
+            ),
+        ],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        frame = process.stdout.readline()
+        assert frame.startswith(
+            f"@@LLMOLYMPIC_CONTROL_V1:{token}:".encode("ascii")
+        )
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=5) == 70
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_managed_profile_snapshot_is_rechecked_before_provider_construction(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_profiles(
+        monkeypatch,
+        tmp_path,
+        """
+[profiles.safe]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+default_model = "confirmed-model"
+display_name = "Safe local profile"
+""".strip(),
+    )
+    profile = config.load_profiles()["safe"]
+    snapshot = json.dumps(
+        {"safe": profile_configuration_digest(profile)},
+        separators=(",", ":"),
+    )
+    monkeypatch.setenv("LLMOLYMPIC_CONTROL_PROFILE_SNAPSHOT", snapshot)
+
+    _validate_control_profile_snapshot()
+
+    config_path = tmp_path / "profiles.toml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "confirmed-model",
+            "changed-after-confirmation",
+        ),
+        encoding="utf-8",
+    )
+    config.load_config.cache_clear()
+    with pytest.raises(RuntimeError, match="本机 Web Profile 快照无效"):
+        _validate_control_profile_snapshot()
+    config.load_config.cache_clear()
+
+
+def test_empty_managed_profile_snapshot_does_not_load_unrelated_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLMOLYMPIC_CONTROL_PROFILE_SNAPSHOT", "{}")
+    monkeypatch.setattr(
+        "llmolympic.cli.main.load_profiles",
+        lambda: (_ for _ in ()).throw(AssertionError("profiles must not be loaded")),
+    )
+
+    _validate_control_profile_snapshot()
+
+
+def test_managed_round_robin_rechecks_profile_before_claiming_runner_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "llmolympic.cli.main._open_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("archive must not open before Profile verification")
+        ),
+    )
+    result = runner.invoke(
+        app,
+        ["round-robin", "--resume", "safe-tournament"],
+        env={
+            "LLMOLYMPIC_CONTROL_PROFILE_SNAPSHOT": json.dumps(
+                {"missing-profile": "0" * 64},
+                separators=(",", ":"),
+            )
+        },
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, RuntimeError)
+    assert str(result.exception) == "本机 Web Profile 快照无效"
 
 
 def _configure_profiles(monkeypatch, tmp_path, content: str) -> None:

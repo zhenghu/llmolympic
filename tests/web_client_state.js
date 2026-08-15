@@ -4,10 +4,62 @@
   globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__ = true;
   globalThis.__LLMOLYMPIC_SKIP_BOOTSTRAP__ = true;
 
+  if (typeof URLSearchParams === "undefined") {
+    globalThis.URLSearchParams = class URLSearchParamsForTest {
+      constructor(source = "") {
+        this.entries = String(source).split("&").filter(Boolean).map((entry) => {
+          const separator = entry.indexOf("=");
+          const key = separator < 0 ? entry : entry.slice(0, separator);
+          const value = separator < 0 ? "" : entry.slice(separator + 1);
+          return [decodeURIComponent(key.replace(/\+/g, " ")), decodeURIComponent(value.replace(/\+/g, " "))];
+        });
+      }
+
+      get(key) {
+        const entry = this.entries.find(([candidate]) => candidate === key);
+        return entry ? entry[1] : null;
+      }
+
+      getAll(key) {
+        return this.entries.filter(([candidate]) => candidate === key).map((entry) => entry[1]);
+      }
+
+      has(key) {
+        return this.entries.some(([candidate]) => candidate === key);
+      }
+
+      keys() {
+        return this.entries.map(([key]) => key)[Symbol.iterator]();
+      }
+    };
+  }
+
+  if (typeof URL === "undefined") {
+    globalThis.URL = class URLForTest {
+      constructor(source, base) {
+        const input = String(source);
+        const baseMatch = String(base || "").match(/^(https?):\/\/([^/?#]+)/);
+        const absolute = input.match(/^(https?):\/\/([^/?#]+)([^?#]*)(\?[^#]*)?(#.*)?$/);
+        const relative = input.match(/^(\/[^?#]*)(\?[^#]*)?(#.*)?$/);
+        const match = absolute || (relative && baseMatch
+          ? [input, baseMatch[1], baseMatch[2], relative[1], relative[2], relative[3]]
+          : null);
+        if (!match) throw new TypeError("invalid URL");
+        this.origin = `${match[1]}://${match[2]}`;
+        this.pathname = match[3] || "/";
+        this.search = match[4] || "";
+        this.hash = match[5] || "";
+      }
+    };
+  }
+
+  const clientAsset = globalThis.__LLMOLYMPIC_TEST_CLIENT_ASSET__
+    || "llmolympic/web/static/assets/app.js";
   if (typeof require === "function") {
-    require("../llmolympic/web/static/assets/app.js");
+    require(globalThis.__LLMOLYMPIC_TEST_CLIENT_ASSET__
+      || "../llmolympic/web/static/assets/app.js");
   } else {
-    load("llmolympic/web/static/assets/app.js");
+    load(clientAsset);
   }
 
   const observer = globalThis.__LLMOLYMPIC_OBSERVER_TEST__;
@@ -16,6 +68,15 @@
   };
   const equal = (actual, expected, message) => {
     assert(JSON.stringify(actual) === JSON.stringify(expected), `${message}: ${JSON.stringify(actual)}`);
+  };
+  const throwsCode = (operation, expected, message) => {
+    let caught = null;
+    try {
+      operation();
+    } catch (error) {
+      caught = error;
+    }
+    assert(caught && caught.code === expected, `${message}: ${caught && caught.code}`);
   };
 
   equal(
@@ -351,6 +412,557 @@
     observer.remainingCopy("2026-08-14T12:00:30.000Z", Date.parse("2026-08-14T12:00:00.000Z")),
     "剩余 30 秒",
     "the visible request deadline is deterministic",
+  );
+
+  const storageValues = new Map();
+  const replacedLocations = [];
+  globalThis.window = {
+    history: {
+      replaceState(_state, _title, location) {
+        replacedLocations.push(location);
+        globalThis.window.location.hash = "";
+      },
+      state: null,
+    },
+    location: {
+      hash: "",
+      origin: "http://localhost:8000",
+      pathname: "/new",
+      search: "?view=control",
+    },
+    sessionStorage: {
+      getItem(key) {
+        return storageValues.has(key) ? storageValues.get(key) : null;
+      },
+      removeItem(key) {
+        storageValues.delete(key);
+      },
+      setItem(key, value) {
+        storageValues.set(key, value);
+      },
+    },
+  };
+
+  const adminToken = "a".repeat(43);
+  window.location.hash = `#admin=${adminToken}`;
+  equal(observer.captureAdminToken(), adminToken, "a valid admin fragment is captured once");
+  equal(replacedLocations, ["/new?view=control"], "the admin fragment is removed from browser history");
+  equal(
+    storageValues.get("llmolympic.control.admin"),
+    adminToken,
+    "the admin token is scoped to session storage",
+  );
+  observer.clearAdminToken();
+  assert(!storageValues.has("llmolympic.control.admin"), "authentication loss clears stored admin state");
+  equal(observer.captureAdminToken(), null, "cleared admin state is not recoverable from memory");
+
+  storageValues.set("llmolympic.control.admin", adminToken);
+  window.location.hash = "#admin=invalid";
+  equal(observer.captureAdminToken(), null, "an invalid admin fragment fails closed");
+  assert(!storageValues.has("llmolympic.control.admin"), "an invalid fragment clears stale admin state");
+  window.location.hash = `#admin=${adminToken}&admin=${"b".repeat(43)}`;
+  equal(observer.captureAdminToken(), null, "duplicate admin fragments fail closed");
+  assert(!storageValues.has("llmolympic.control.admin"), "duplicate fragments leave no credential behind");
+
+  const mockStrategies = Array.from({ length: 17 }, (_value, index) => `strategy_${index}`);
+  const controlCatalogPayload = {
+    api_version: "v1",
+    games: [{
+      max_players: 16,
+      min_players: 2,
+      name: "math_quiz",
+      requires_judge_panel: false,
+      rounds_supported: true,
+      supported_modes: ["play", "series", "round_robin"],
+    }],
+    mock_judge_strategies: ["strict", "balanced", "lenient"],
+    mock_player_strategies: mockStrategies,
+    profiles: [
+      {
+        credential_ready: true,
+        default_model: "safe-model",
+        display_name: "Ready profile",
+        profile_id: "ready-profile",
+        provider: "openai",
+      },
+      {
+        credential_ready: false,
+        default_model: null,
+        display_name: "Unavailable profile",
+        profile_id: "unavailable-profile",
+        provider: "ollama",
+      },
+    ],
+  };
+  const controlCatalog = observer.normalizeControlCatalog(controlCatalogPayload);
+  assert(controlCatalog.games.length === 1, "a valid control catalog is normalized");
+  assert(controlCatalog.profiles[0].available, "credential readiness becomes only a boolean capability");
+  assert(
+    !JSON.stringify(controlCatalog).includes("credential_ready"),
+    "catalog normalization does not retain credential metadata fields",
+  );
+  throwsCode(
+    () => observer.normalizeControlCatalog({ api_version: "v1", games: [] }),
+    "protocol_error",
+    "an empty catalog fails closed",
+  );
+  throwsCode(
+    () => observer.normalizeControlCatalog({
+      api_version: "v1",
+      games: [{ ...controlCatalogPayload.games[0], name: "../command" }],
+    }),
+    "protocol_error",
+    "a catalog with only unsafe game identifiers fails closed",
+  );
+
+  const budget = {
+    maxEstimatedCostUsd: "1.250000",
+    maxInputTokens: "200000",
+    maxOutputTokensPerCall: "4096",
+    maxProviderCalls: "64",
+    maxTotalOutputTokens: "65536",
+  };
+  const makeForm = (overrides = {}) => ({
+    allowLargeTournament: false,
+    budget: { ...budget },
+    game: "math_quiz",
+    judges: [],
+    llmTimeoutSeconds: "120",
+    mode: "play",
+    players: [
+      { kind: "mock", name: "", profileId: "", strategy: "strategy_0" },
+      { kind: "mock", name: "", profileId: "", strategy: "strategy_1" },
+    ],
+    rounds: "1",
+    seed: "42",
+    timeoutSeconds: "300",
+    ...overrides,
+  });
+  const uniquePlayers = (count) => Array.from({ length: count }, (_value, index) => ({
+    kind: "mock",
+    name: "",
+    profileId: "",
+    strategy: `strategy_${index}`,
+  }));
+
+  assert(
+    observer.validateControlForm(makeForm({ players: uniquePlayers(2) }), controlCatalog).players === undefined,
+    "play accepts the minimum two players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ players: uniquePlayers(1) }), controlCatalog).players,
+    "play rejects fewer than two players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ players: uniquePlayers(16) }), controlCatalog).players === undefined,
+    "play accepts the platform maximum of sixteen players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ players: uniquePlayers(17) }), controlCatalog).players,
+    "play rejects more than sixteen players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ mode: "series", players: uniquePlayers(2) }), controlCatalog).players === undefined,
+    "series accepts exactly two players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ mode: "series", players: uniquePlayers(3) }), controlCatalog).players,
+    "series rejects a third player",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ mode: "round_robin", players: uniquePlayers(2) }), controlCatalog).players,
+    "round robin rejects fewer than three players",
+  );
+  assert(
+    observer.validateControlForm(makeForm({ mode: "round_robin", players: uniquePlayers(3) }), controlCatalog).players === undefined,
+    "round robin accepts three distinct players",
+  );
+
+  const unavailableProfileForm = makeForm({
+    players: [
+      { kind: "profile", name: "", profileId: "unavailable-profile", strategy: "" },
+      uniquePlayers(2)[1],
+    ],
+  });
+  assert(
+    observer.validateControlForm(unavailableProfileForm, controlCatalog)["player-0"],
+    "an unavailable Provider profile cannot be submitted",
+  );
+  const missingBudgetForm = makeForm({
+    budget: {
+      maxEstimatedCostUsd: "",
+      maxInputTokens: "",
+      maxOutputTokensPerCall: "",
+      maxProviderCalls: "",
+      maxTotalOutputTokens: "",
+    },
+    players: [
+      { kind: "profile", name: "", profileId: "ready-profile", strategy: "" },
+      uniquePlayers(2)[1],
+    ],
+  });
+  const missingBudgetErrors = observer.validateControlForm(missingBudgetForm, controlCatalog);
+  [
+    "maxEstimatedCostUsd",
+    "maxInputTokens",
+    "maxOutputTokensPerCall",
+    "maxProviderCalls",
+    "maxTotalOutputTokens",
+  ].forEach((key) => {
+    assert(missingBudgetErrors[`budget-${key}`], `profile use requires ${key}`);
+  });
+
+  const zeroTotalsForm = makeForm({
+    budget: {
+      maxEstimatedCostUsd: "0",
+      maxInputTokens: "0",
+      maxOutputTokensPerCall: "1",
+      maxProviderCalls: "0",
+      maxTotalOutputTokens: "0",
+    },
+  });
+  const zeroTotalsErrors = observer.validateControlForm(zeroTotalsForm, controlCatalog);
+  ["maxProviderCalls", "maxInputTokens", "maxTotalOutputTokens", "maxEstimatedCostUsd"].forEach((key) => {
+    assert(zeroTotalsErrors[`budget-${key}`] === undefined, `${key} accepts its legal zero value`);
+  });
+  assert(
+    zeroTotalsErrors["budget-maxOutputTokensPerCall"] === undefined,
+    "per-call output accepts its minimum value of one",
+  );
+  equal(
+    observer.controlRequestBody(zeroTotalsForm, controlCatalog).budget,
+    {
+      max_estimated_cost_usd: "0",
+      max_input_tokens: "0",
+      max_output_tokens_per_call: "1",
+      max_provider_calls: "0",
+      max_total_output_tokens: "0",
+    },
+    "legal zero totals remain canonical strings in the control request",
+  );
+  const zeroPerCallErrors = observer.validateControlForm(makeForm({
+    budget: { ...budget, maxOutputTokensPerCall: "0" },
+  }), controlCatalog);
+  assert(
+    zeroPerCallErrors["budget-maxOutputTokensPerCall"].includes("正整数"),
+    "per-call output still rejects zero with a precise message",
+  );
+  const negativeCallsErrors = observer.validateControlForm(makeForm({
+    budget: { ...budget, maxProviderCalls: "-1" },
+  }), controlCatalog);
+  assert(
+    negativeCallsErrors["budget-maxProviderCalls"].includes("非负整数"),
+    "total call limits reject negative values with a precise message",
+  );
+  const microCostForm = makeForm({
+    budget: { ...budget, maxEstimatedCostUsd: "0.000001" },
+  });
+  assert(
+    observer.validateControlForm(microCostForm, controlCatalog)["budget-maxEstimatedCostUsd"] === undefined,
+    "the browser accepts the backend minimum six-decimal cost precision",
+  );
+  assert(
+    observer.controlRequestBody(microCostForm, controlCatalog).budget.max_estimated_cost_usd === "0.000001",
+    "six-decimal cost precision is preserved in the control request",
+  );
+
+  const requestForm = makeForm({
+    llmTimeoutSeconds: "45.5",
+    players: [
+      { kind: "human", name: "  Alice  ", profileId: "", strategy: "" },
+      { kind: "profile", name: "", profileId: "ready-profile", strategy: "" },
+    ],
+    rounds: "2",
+    seed: "-7",
+    timeoutSeconds: "60.25",
+  });
+  equal(
+    observer.controlRequestBody(requestForm, controlCatalog),
+    {
+      allow_large_tournament: false,
+      budget: {
+        max_estimated_cost_usd: "1.250000",
+        max_input_tokens: "200000",
+        max_output_tokens_per_call: "4096",
+        max_provider_calls: "64",
+        max_total_output_tokens: "65536",
+      },
+      game: "math_quiz",
+      human_timeout_seconds: 60.25,
+      judges: [],
+      llm_timeout_seconds: 45.5,
+      mode: "play",
+      players: [
+        { kind: "human", name: "Alice" },
+        { kind: "profile", profile_id: "ready-profile" },
+      ],
+      rounds: 2,
+      seed: "-7",
+      resume_tournament_id: null,
+    },
+    "the browser emits only the canonical control request schema",
+  );
+
+  const capability = "c".repeat(43);
+  const controlJobPayload = {
+    api_version: "v1",
+    job: {
+      created_at: "2026-08-15T00:00:00.000000Z",
+      job_id: "job-7",
+      participation_links: [
+        {
+          player_name: "Alice",
+          url: `http://localhost:8000/participate/session-7/seat-1#capability=${capability}`,
+        },
+        {
+          player_name: "Mallory",
+          url: `http://evil.example/participate/session-7/seat-2#capability=${capability}`,
+        },
+      ],
+      preview: { estimated_provider_calls: 2, match_count: 1, warnings: [] },
+      spec: {
+        budget: {
+          max_estimated_cost_usd: "1.250000",
+          max_input_tokens: "200000",
+          max_output_tokens_per_call: "4096",
+          max_provider_calls: "64",
+          max_total_output_tokens: "65536",
+        },
+        game: "math_quiz",
+        mode: "play",
+        players: requestForm.players,
+      },
+      status: "running",
+      updated_at: "2026-08-15T00:00:01.000000Z",
+    },
+  };
+  const controlJob = observer.normalizeControlJob(controlJobPayload);
+  equal(
+    controlJob.participationLinks,
+    [{
+      href: `/participate/session-7/seat-1#capability=${capability}`,
+      label: "Alice",
+      seatId: "seat-1",
+    }],
+    "participation links are reduced to same-origin capability routes",
+  );
+
+  const creativeJob = observer.normalizeControlJob({
+    api_version: "v1",
+    job: {
+      created_at: "2026-08-15T01:00:00.000000Z",
+      job_id: "creative-job-1",
+      participation_links: [],
+      preview: {
+        human_count: 0,
+        match_count: 6,
+        pairing_count: 3,
+        player_count: 3,
+        rated: false,
+        requires_provider_budget: true,
+        uses_frozen_budget: false,
+        warnings: ["large_tournament"],
+      },
+      spec: {
+        allow_large_tournament: true,
+        budget: {
+          max_estimated_cost_usd: "2.500000",
+          max_input_tokens: "250000",
+          max_output_tokens_per_call: "2048",
+          max_provider_calls: "80",
+          max_total_output_tokens: "80000",
+        },
+        game: "creative_writing",
+        human_timeout_seconds: 75,
+        judges: [
+          { kind: "mock", strategy: "strict" },
+          { kind: "profile", profile_id: "judge-panel" },
+          { kind: "mock", strategy: "lenient" },
+        ],
+        llm_timeout_seconds: 33.5,
+        mode: "round_robin",
+        players: [
+          { kind: "profile", profile_id: "writer-a" },
+          { kind: "mock", strategy: "random" },
+          { kind: "profile", profile_id: "writer-b" },
+        ],
+        resume_tournament_id: null,
+        rounds: null,
+        seed: "-11",
+      },
+      status: "prepared",
+      updated_at: "2026-08-15T01:00:01.000000Z",
+    },
+  });
+  equal(
+    {
+      allowLargeTournament: creativeJob.largeTournamentAllowed,
+      budgetFromCheckpoint: creativeJob.budget.fromCheckpoint,
+      game: creativeJob.game,
+      humanTimeoutSeconds: creativeJob.humanTimeoutSeconds,
+      isResume: creativeJob.isResume,
+      judges: creativeJob.judges,
+      llmTimeoutSeconds: creativeJob.llmTimeoutSeconds,
+      players: creativeJob.players,
+      rounds: creativeJob.rounds,
+      seed: creativeJob.seed,
+      usesFrozenBudget: creativeJob.budget.usesFrozenBudget,
+    },
+    {
+      allowLargeTournament: true,
+      budgetFromCheckpoint: false,
+      game: "creative_writing",
+      humanTimeoutSeconds: 75,
+      isResume: false,
+      judges: ["Mock · strict", "Profile · judge-panel", "Mock · lenient"],
+      llmTimeoutSeconds: 33.5,
+      players: ["Profile · writer-a", "Mock · random", "Profile · writer-b"],
+      rounds: null,
+      seed: "-11",
+      usesFrozenBudget: false,
+    },
+    "new creative jobs expose only normalized configuration identities and limits",
+  );
+
+  const resumeJob = observer.normalizeControlJob({
+    api_version: "v1",
+    job: {
+      created_at: "2026-08-15T02:00:00.000000Z",
+      job_id: "resume-job-1",
+      participation_links: [],
+      preview: {
+        frozen_game: "math_quiz",
+        frozen_judges: ["Mock · checkpoint-strict", "Profile · checkpoint-judge"],
+        frozen_llm_timeout_seconds: 91.25,
+        frozen_players: ["甲", "乙", "丙"],
+        frozen_rounds: 3,
+        frozen_seed: "23",
+        human_count: 0,
+        match_count: 6,
+        pairing_count: 3,
+        player_count: 3,
+        prepared_profiles: [{
+          configuration_digest: "a".repeat(64),
+          default_model: "model-b",
+          display_name: "Local profile",
+          effective_models: ["frozen-model"],
+          profile_id: "local",
+          provider: "ollama",
+        }],
+        rated: true,
+        requires_provider_budget: true,
+        uses_frozen_budget: true,
+        warnings: ["resume_uses_frozen_configuration"],
+      },
+      spec: {
+        allow_large_tournament: false,
+        budget: {
+          max_estimated_cost_usd: null,
+          max_input_tokens: null,
+          max_output_tokens_per_call: null,
+          max_provider_calls: null,
+          max_total_output_tokens: null,
+        },
+        game: "",
+        human_timeout_seconds: 120,
+        judges: [],
+        llm_timeout_seconds: null,
+        mode: "round_robin",
+        players: [],
+        resume_tournament_id: "tournament-23",
+        rounds: null,
+        seed: "0",
+      },
+      status: "prepared",
+      updated_at: "2026-08-15T02:00:01.000000Z",
+    },
+  });
+  equal(
+    {
+      budgetFromCheckpoint: resumeJob.budget.fromCheckpoint,
+      frozenBudgetConfigured: resumeJob.budget.usesFrozenBudget,
+      game: resumeJob.game,
+      humanTimeoutSeconds: resumeJob.humanTimeoutSeconds,
+      isResume: resumeJob.isResume,
+      judges: resumeJob.judges,
+      llmTimeoutSeconds: resumeJob.llmTimeoutSeconds,
+      players: resumeJob.players,
+      preparedProfile: resumeJob.preparedProfiles[0],
+      rounds: resumeJob.rounds,
+      seed: resumeJob.seed,
+      tournamentId: resumeJob.tournamentId,
+    },
+    {
+      budgetFromCheckpoint: true,
+      frozenBudgetConfigured: true,
+      game: "math_quiz",
+      humanTimeoutSeconds: 120,
+      isResume: true,
+      judges: ["Mock · checkpoint-strict", "Profile · checkpoint-judge"],
+      llmTimeoutSeconds: 91.25,
+      players: ["甲", "乙", "丙"],
+      preparedProfile: {
+        defaultModel: "model-b",
+        displayName: "Local profile",
+        effectiveModels: ["frozen-model"],
+        label: "Local profile · ollama / 执行 frozen-model（当前默认 model-b）",
+        profileId: "local",
+        provider: "ollama",
+      },
+      rounds: 3,
+      seed: "23",
+      tournamentId: "tournament-23",
+    },
+    "resume jobs hydrate only the backend-validated frozen checkpoint summary",
+  );
+  equal(
+    resumeJob.warnings,
+    ["恢复任务会沿用 checkpoint 中冻结的项目、参赛者、裁判与随机种子；若 checkpoint 含 Provider 硬预算，也会沿用该冻结预算。"],
+    "resume warnings describe the frozen budget conditionally",
+  );
+  ["cancelled", "failed", "interrupted"].forEach((status) => {
+    assert(
+      observer.controlJobCanResume({ ...resumeJob, resumable: true, status }),
+      `${status} round-robin jobs can expose validated checkpoint recovery`,
+    );
+  });
+  assert(
+    !observer.controlJobCanResume({ ...resumeJob, resumable: true, status: "running" }),
+    "an active job never exposes checkpoint recovery",
+  );
+  throwsCode(
+    () => observer.normalizeControlJob({ job: { ...controlJobPayload.job, job_id: "../job" } }),
+    "protocol_error",
+    "an unsafe job identifier fails closed",
+  );
+  throwsCode(
+    () => observer.normalizeControlJob({ job: { ...controlJobPayload.job, status: "owned-by-attacker" } }),
+    "protocol_error",
+    "an unknown job status fails closed",
+  );
+  throwsCode(
+    () => observer.normalizeControlJob({ job: { ...controlJobPayload.job, spec: { ...controlJobPayload.job.spec, mode: "shell" } } }),
+    "protocol_error",
+    "an unknown job mode fails closed",
+  );
+  throwsCode(
+    () => observer.normalizeControlJob({
+      job: {
+        ...controlJobPayload.job,
+        preview: {
+          ...controlJobPayload.job.preview,
+          prepared_profiles: [{
+            configuration_digest: "b".repeat(64),
+            default_model: "model-b",
+            display_name: "Local profile",
+            profile_id: "local",
+            provider: "ollama",
+          }],
+        },
+      },
+    }),
+    "protocol_error",
+    "a prepared Profile without effective execution models fails closed",
   );
 
   if (typeof console !== "undefined" && console.log) {

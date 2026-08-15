@@ -65,7 +65,7 @@ jobs:
         run: python -m llmolympic games
 
   web:
-    name: Read-only Web / Python ${{ matrix.python-version }}
+    name: Local Web / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -103,7 +103,7 @@ jobs:
       - name: Test Web slice
         run: python -m pytest -q tests/test_web_*.py
 
-      - name: Execute observer client state machine
+      - name: Execute Web client state machines
         run: |
           node --check llmolympic/web/static/assets/app.js
           node tests/web_client_state.js
@@ -289,6 +289,7 @@ jobs:
             --db "${e2e_root}/observer.db" \
             --host 127.0.0.1 \
             --port 8765 \
+            --control-token-file "${e2e_root}/admin.token" \
             >"${e2e_root}/server.log" 2>&1 &
           web_pid="$!"
           cleanup() {

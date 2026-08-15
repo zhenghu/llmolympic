@@ -371,7 +371,7 @@ def test_live_websocket_capacity_is_bounded(
         publisher.close()
 
 
-def test_live_spa_routes_remain_read_only_with_narrow_participation_post(
+def test_live_spa_routes_keep_writes_inside_participation_and_control(
     tmp_path: Path,
 ) -> None:
     client = _client(tmp_path / "observer.db")
@@ -386,10 +386,15 @@ def test_live_spa_routes_remain_read_only_with_narrow_participation_post(
     assert set(openapi["paths"]["/api/v1/live"]) == {"get"}
     assert set(openapi["paths"]["/api/v1/live/{live_id}"]) == {"get"}
     assert "/live/{live_id}" not in openapi["paths"]
-    participation_path = (
-        "/api/v1/participation/{session_id}/{seat_id}/requests/"
-        "{request_id}/submissions"
-    )
+    allowed_write_paths = {
+        "/api/v1/control/jobs",
+        "/api/v1/control/jobs/{job_id}/cancel",
+        "/api/v1/control/jobs/{job_id}/start",
+        (
+            "/api/v1/participation/{session_id}/{seat_id}/requests/"
+            "{request_id}/submissions"
+        ),
+    }
     for path, path_item in openapi["paths"].items():
         writes = {"post", "put", "patch", "delete"} & set(path_item)
-        assert writes == ({"post"} if path == participation_path else set())
+        assert writes == ({"post"} if path in allowed_write_paths else set())
