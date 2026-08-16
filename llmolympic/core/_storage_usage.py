@@ -21,7 +21,6 @@ from llmolympic.core._storage_types import (
     _checked_usage_add,
     _checked_usage_subtract,
     _sum_call_bounds,
-    _TournamentRunnerLeaseState,
     _usage_from_bounds,
     _validate_durable_budget_definition,
     _validate_usage_ledger_id,
@@ -1449,55 +1448,4 @@ class _ProviderUsageMixin:
                     connection,
                     row["budget_id"],
                 )
-
-    @staticmethod
-    def _load_tournament_runner_lease(
-        connection: sqlite3.Connection,
-        tournament_id: str,
-    ) -> _TournamentRunnerLeaseState | None:
-        row = connection.execute(
-            """
-            SELECT generation, token_digest, acquired_at_epoch,
-                   renewed_at_epoch, expires_at_epoch
-            FROM tournament_runner_leases
-            WHERE tournament_id = ?
-            """,
-            (tournament_id,),
-        ).fetchone()
-        if row is None:
-            return None
-
-        generation = row["generation"]
-        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
-            raise StorageError("循环赛 runner lease 已损坏")
-
-        raw_digest = row["token_digest"]
-        timestamps = (
-            row["acquired_at_epoch"],
-            row["renewed_at_epoch"],
-            row["expires_at_epoch"],
-        )
-        if raw_digest is None:
-            if any(value is not None for value in timestamps):
-                raise StorageError("循环赛 runner lease 已损坏")
-            digest = None
-        else:
-            if not isinstance(raw_digest, (bytes, bytearray, memoryview)):
-                raise StorageError("循环赛 runner lease 已损坏")
-            digest = bytes(raw_digest)
-            if len(digest) != 32 or any(
-                isinstance(value, bool) or not isinstance(value, int) for value in timestamps
-            ):
-                raise StorageError("循环赛 runner lease 已损坏")
-            acquired_at, renewed_at, expires_at = timestamps
-            if not acquired_at <= renewed_at < expires_at:
-                raise StorageError("循环赛 runner lease 已损坏")
-
-        return _TournamentRunnerLeaseState(
-            generation=generation,
-            token_digest=digest,
-            acquired_at_epoch=timestamps[0],
-            renewed_at_epoch=timestamps[1],
-            expires_at_epoch=timestamps[2],
-        )
 
