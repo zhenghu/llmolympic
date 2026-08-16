@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-16
+
+- 将 8454 行的 `llmolympic/core/storage.py` 重构拆分为 6 个聚焦的私有模块
+  （`_storage_types` / `_storage_schema` / `_storage_entrants` / `_storage_matches` /
+  `_storage_tournament` / `_storage_usage`），通过多重继承装配为 `SQLiteStore`。
+  对外公共 API 完全不变，方法体与装饰器逐项保持一致，全量测试与 schema manifest
+  审计覆盖不变。
+- 将 runner-lease 加载器 `_load_tournament_runner_lease` 从 Provider 预算 mixin
+  移回循环赛 mixin，与其调用方 `_require_active_tournament_runner` 同域。
+- 依赖更新：放宽 `hatchling` 上界至 `<1.33`、`openai` 上界至 `<4`；升级
+  `twine` 至 7.0.0 以支持 hatchling 1.32 生成的 Metadata-Version 2.5；更新
+  `@axe-core/playwright` 与 GitHub Actions 相关开发依赖。
+
 ## [0.7.0] - 2026-08-15
 
 - 完成阶段四 4.5b 的本机全 Web 控制台：持启动时生成的管理链接可在浏览器中准备、确认启动、
