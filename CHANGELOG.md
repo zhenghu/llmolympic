@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+- 完成路线图锦标赛模式（4.6）：新增 `llmolympic championship` 命令，提供
+  4/8/16 名非人类选手的单淘汰制锦标赛。每场对阵进行交换先后手双局赛，胜者晋级、
+  败者淘汰，逐轮直至唯一冠军；参赛人数必须是 2 的幂，每轮 seed 从赛事 seed 与
+  轮次确定性派生，双局赛总分先定胜负、平局依次按较少技术负和较小 `entrant_id`
+  确定性打破。
+- 新增 `championship` schema v1 档案（`format=single_elimination_two_leg`）与
+  SQLite v9 的 `championship_archives` / `championship_entrants` /
+  `championship_pairings` 关系表，通过 additive migration 从 v8 升级。锦标赛及
+  其子双局赛只存档、不更新 ELO；`archive` 命令可输出完整锦标赛 JSON。
+- 当前锦标赛串行执行、无 checkpoint，暂未接入本机 Web 控制面与实时直播 sidecar。
+
 ## [0.8.0] - 2026-08-16
 
 - 将 8454 行的 `llmolympic/core/storage.py` 重构拆分为 6 个聚焦的私有模块

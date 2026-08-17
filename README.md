@@ -289,6 +289,10 @@ llmolympic round-robin --resume <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
 llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db
 llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db --json
 
+# 4/8/16 名非人类选手单淘汰制锦标赛：每场交换先后手双局赛，胜者晋级
+llmolympic championship --game knowledge_quiz \
+  --players mock:random,mock:fixed,mock:illegal,mock:balanced --rounds 5 --seed 42
+
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
 llmolympic play --game chess --players human:我,mock:random
 
@@ -304,7 +308,7 @@ llmolympic leaderboard --game math_quiz
 
 # 查看对局历史与完整档案
 llmolympic history
-llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_ID>
+llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_OR_CHAMPIONSHIP_ID>
 ```
 
 ### 本机 React 比赛控制、参与与观战页（阶段四 4.4 / 4.5a / 4.5b）

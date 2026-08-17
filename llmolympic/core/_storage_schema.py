@@ -14,6 +14,7 @@ from llmolympic.core._storage_types import (
     _V4_REQUIRED_COLUMNS,
     _V5_REQUIRED_COLUMNS,
     _V6_REQUIRED_COLUMNS,
+    _V9_REQUIRED_COLUMNS,
     SQLITE_INT_MAX,
     RatingSource,
     StorageError,
@@ -377,6 +378,102 @@ class _SchemaMixin:
                     ON DELETE RESTRICT,
                 FOREIGN KEY (tournament_id, opponent_entrant_id)
                     REFERENCES tournament_entrants(tournament_id, entrant_id)
+                    ON DELETE RESTRICT
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_championship_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_archives (
+                championship_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                format TEXT NOT NULL CHECK (format = 'single_elimination_two_leg'),
+                pairing_policy TEXT NOT NULL,
+                seed_policy TEXT NOT NULL,
+                tiebreak_policy TEXT NOT NULL,
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                champion TEXT NOT NULL,
+                pairing_count INTEGER NOT NULL CHECK (pairing_count >= 1),
+                rating_policy TEXT NOT NULL
+                    CHECK (rating_policy IN ('unrated', 'elo_championship_batch_v1')),
+                k_factor REAL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                archive_source TEXT NOT NULL
+                    CHECK (archive_source IN ('local_engine', 'external')),
+                rating_source TEXT NOT NULL
+                    CHECK (rating_source IN ('engine', 'imported')),
+                rated INTEGER NOT NULL CHECK (rated IN (0, 1)),
+                championship_json TEXT NOT NULL,
+                CHECK (
+                    (rated = 0 AND rating_policy = 'unrated' AND k_factor IS NULL)
+                    OR
+                    (rated = 1 AND rating_policy = 'elo_championship_batch_v1'
+                     AND k_factor IS NOT NULL AND k_factor > 0)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS championship_archives_finished_at_idx
+            ON championship_archives(finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS championship_archives_game_finished_at_idx
+            ON championship_archives(game, finished_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_entrants (
+                championship_id TEXT NOT NULL
+                    REFERENCES championship_archives(championship_id) ON DELETE RESTRICT,
+                position INTEGER NOT NULL CHECK (position >= 0),
+                entrant_id TEXT NOT NULL REFERENCES entrants(entrant_id) ON DELETE RESTRICT,
+                display_name TEXT NOT NULL,
+                descriptor_json TEXT NOT NULL,
+                rank INTEGER NOT NULL CHECK (rank >= 1),
+                series_played INTEGER NOT NULL CHECK (series_played >= 0),
+                series_wins INTEGER NOT NULL CHECK (series_wins >= 0),
+                series_draws INTEGER NOT NULL CHECK (series_draws >= 0),
+                series_losses INTEGER NOT NULL CHECK (series_losses >= 0),
+                games_played INTEGER NOT NULL CHECK (games_played >= 0),
+                wins INTEGER NOT NULL CHECK (wins >= 0),
+                draws INTEGER NOT NULL CHECK (draws >= 0),
+                losses INTEGER NOT NULL CHECK (losses >= 0),
+                technical_losses INTEGER NOT NULL CHECK (technical_losses >= 0),
+                PRIMARY KEY (championship_id, position),
+                UNIQUE (championship_id, entrant_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_pairings (
+                championship_id TEXT NOT NULL
+                    REFERENCES championship_archives(championship_id) ON DELETE RESTRICT,
+                round_number INTEGER NOT NULL CHECK (round_number >= 1),
+                pairing_number INTEGER NOT NULL CHECK (pairing_number >= 1),
+                series_id TEXT NOT NULL UNIQUE
+                    REFERENCES series_archives(series_id) ON DELETE RESTRICT,
+                entrant_a_id TEXT NOT NULL,
+                entrant_b_id TEXT NOT NULL,
+                PRIMARY KEY (championship_id, pairing_number),
+                UNIQUE (championship_id, entrant_a_id, entrant_b_id),
+                CHECK (entrant_a_id <> entrant_b_id),
+                FOREIGN KEY (championship_id, entrant_a_id)
+                    REFERENCES championship_entrants(championship_id, entrant_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY (championship_id, entrant_b_id)
+                    REFERENCES championship_entrants(championship_id, entrant_id)
                     ON DELETE RESTRICT
             )
             """
@@ -1350,6 +1447,10 @@ class _SchemaMixin:
         _SchemaMixin._verify_runner_lease_schema(connection)
 
     @staticmethod
+    def _verify_v9_schema(connection: sqlite3.Connection) -> None:
+        _SchemaMixin._verify_required_columns(connection, _V9_REQUIRED_COLUMNS)
+
+    @staticmethod
     def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
         table_info = connection.execute("PRAGMA table_info(tournament_runner_leases)").fetchall()
         primary_key = [row["name"] for row in table_info if row["pk"]]
@@ -1414,6 +1515,7 @@ class _SchemaMixin:
             _SchemaMixin._create_runner_lease_schema(reference)
             _SchemaMixin._create_rating_operation_schema(reference)
             _SchemaMixin._create_provider_usage_schema(reference)
+            _SchemaMixin._create_championship_schema(reference)
             return introspect_schema(reference)
 
     @staticmethod
@@ -1424,11 +1526,33 @@ class _SchemaMixin:
             raise StorageError(f"SQLite 数据库结构与 v7 manifest 不一致：{exc}") from exc
 
     @staticmethod
+    @lru_cache(maxsize=1)
+    def _expected_v8_schema_manifest() -> SchemaManifest:
+        """Build the canonical pre-championship v8 manifest for migration validation."""
+
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
+            _SchemaMixin._create_base_schema(reference)
+            _SchemaMixin._create_series_schema(reference)
+            _SchemaMixin._create_tournament_schema(reference)
+            _SchemaMixin._create_checkpoint_schema(reference)
+            _SchemaMixin._create_runner_lease_schema(reference)
+            _SchemaMixin._create_rating_operation_schema(reference)
+            _SchemaMixin._create_provider_usage_schema(reference)
+            return introspect_schema(reference)
+
+    @staticmethod
+    def _verify_v8_schema(connection: sqlite3.Connection) -> None:
+        try:
+            verify_schema_manifest(connection, _SchemaMixin._expected_v8_schema_manifest())
+        except SchemaManifestError as exc:
+            raise StorageError(f"SQLite 数据库结构与 v8 manifest 不一致：{exc}") from exc
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         try:
             verify_schema_manifest(connection, _SchemaMixin._expected_schema_manifest())
         except SchemaManifestError as exc:
-            raise StorageError(f"SQLite 数据库结构与 v8 manifest 不一致：{exc}") from exc
+            raise StorageError(f"SQLite 数据库结构与 v9 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:
