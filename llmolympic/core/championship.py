@@ -277,7 +277,6 @@ def _series_winner_indices(
 
 def _resolved_bracket_indices(
     players: Sequence[dict],
-    seed: int,
     series_archives: Sequence[SeriesArchive],
 ) -> tuple[tuple[int, int], ...]:
     """Replay the bracket to recover every pairing's entrant indices.
@@ -318,15 +317,18 @@ def _resolved_bracket_indices(
 
 def _champion_index(
     players: Sequence[dict],
-    seed: int,
     series_archives: Sequence[SeriesArchive],
 ) -> int:
-    indices = _resolved_bracket_indices(players, seed, series_archives)
+    indices = _resolved_bracket_indices(players, series_archives)
     first, second = indices[-1]
     return _series_winner_indices(players, series_archives[-1], first, second)[0]
 
 
 def _series_game_config(series: SeriesArchive) -> dict:
+    if not series.legs:
+        raise ValueError("锦标赛双局赛必须包含两局档案")
+    if not series.legs[0].events:
+        raise ValueError("锦标赛双局赛的对局必须包含事件流")
     first_event = series.legs[0].events[0]
     if first_event.type != EventType.MATCH_STARTED:
         raise ValueError("锦标赛双局赛必须以 match_started 事件开始")
@@ -482,7 +484,7 @@ class ChampionshipArchive(BaseModel):
                 raise ValueError("锦标赛首轮配对与种子顺序不一致")
 
         series_archives = tuple(pairing.series for pairing in self.pairings)
-        resolved_indices = _resolved_bracket_indices(players, self.seed, series_archives)
+        resolved_indices = _resolved_bracket_indices(players, series_archives)
         if tuple(
             (pairing.first_index, pairing.second_index) for pairing in self.pairings
         ) != resolved_indices:
@@ -497,7 +499,7 @@ class ChampionshipArchive(BaseModel):
             judge_panel=self.judge_panel,
         )
 
-        champion_index = _champion_index(players, self.seed, series_archives)
+        champion_index = _champion_index(players, series_archives)
         if self.champion != players[champion_index]["name"]:
             raise ValueError("锦标赛 champion 与淘汰结果不一致")
 
@@ -560,6 +562,8 @@ class ChampionshipArchive(BaseModel):
                 loser_name = players[loser_index]["name"]
                 aggregates[loser_name]["rank"] = (count >> round_number) + 1
                 round_winners.append(winner_index)
+                if len(series.legs) != 2:
+                    raise ValueError("锦标赛双局赛必须恰好包含两局")
                 for name, opponent in (
                     (first_name, second_name),
                     (second_name, first_name),
@@ -567,7 +571,7 @@ class ChampionshipArchive(BaseModel):
                     standing = series.standings[name]
                     agg = aggregates[name]
                     agg["series_played"] += 1
-                    agg["games_played"] += 2
+                    agg["games_played"] += len(series.legs)
                     agg["wins"] += standing.wins
                     agg["draws"] += standing.draws
                     agg["losses"] += standing.losses
@@ -609,7 +613,7 @@ def championship_from_series(
     normalized_players = _normalized_championship_players(copy.deepcopy(tuple(players)))
     series_archives = tuple(series)
 
-    indices = _resolved_bracket_indices(normalized_players, seed, series_archives)
+    indices = _resolved_bracket_indices(normalized_players, series_archives)
     static_schedule = _static_schedule(normalized_players, seed)
 
     pairings = tuple(

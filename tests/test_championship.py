@@ -139,3 +139,39 @@ def test_championship_archive_rejects_wrong_champion() -> None:
             seed=archive.seed,
             champion=wrong,
         )
+
+
+def test_malformed_series_without_legs_reports_validation_error() -> None:
+    game = create_game("knowledge_quiz", rounds=1)
+    players = _players(4)
+    archive = asyncio.run(play_championship(game, players, seed=11))
+    series = [pairing.series for pairing in archive.pairings]
+
+    empty_legs = series[0].model_copy(deep=True)
+    empty_legs.legs = ()
+
+    with pytest.raises(ValueError):
+        championship_from_series(
+            archive.players,
+            [empty_legs, *series[1:]],
+            seed=archive.seed,
+            champion=archive.champion,
+        )
+
+
+def test_malformed_leg_without_events_reports_validation_error() -> None:
+    game = create_game("knowledge_quiz", rounds=1)
+    players = _players(4)
+    archive = asyncio.run(play_championship(game, players, seed=13))
+    series = [pairing.series for pairing in archive.pairings]
+
+    empty_events = series[0].model_copy(deep=True)
+    empty_events.legs[0].events = []
+
+    with pytest.raises(ValueError):
+        championship_from_series(
+            archive.players,
+            [empty_events, *series[1:]],
+            seed=archive.seed,
+            champion=archive.champion,
+        )
