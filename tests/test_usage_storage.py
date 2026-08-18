@@ -80,7 +80,7 @@ def test_fresh_v8_usage_schema_is_strict_and_credential_free(tmp_path: Path) -> 
     SQLiteStore(path)
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         table_flags = {
             row[1]: row[5]
             for row in connection.execute("PRAGMA table_list")
@@ -532,6 +532,9 @@ def test_v7_to_v8_migration_is_additive_and_inspect_is_read_only(tmp_path: Path)
             """
             DROP TABLE provider_call_attempts;
             DROP TABLE provider_budgets;
+            DROP TABLE championship_pairings;
+            DROP TABLE championship_entrants;
+            DROP TABLE championship_archives;
             PRAGMA user_version = 7;
             """
         )
@@ -573,6 +576,9 @@ def test_failed_v7_to_v8_migration_rolls_back_schema_and_version(
             """
             DROP TABLE provider_call_attempts;
             DROP TABLE provider_budgets;
+            DROP TABLE championship_pairings;
+            DROP TABLE championship_entrants;
+            DROP TABLE championship_archives;
             PRAGMA user_version = 7;
             """
         )

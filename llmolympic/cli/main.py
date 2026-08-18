@@ -50,6 +50,11 @@ from llmolympic.config import (
 )
 from llmolympic.core.archive import MatchArchive
 from llmolympic.core.budget_config import ResolvedProviderBudget, resolve_provider_budget
+from llmolympic.core.championship import (
+    ChampionshipArchive,
+    play_championship,
+    validate_championship_player_count,
+)
 from llmolympic.core.events import EventType, MatchEvent
 from llmolympic.core.game import (
     MAX_PLAYER_NAME_CHARS,
@@ -1229,6 +1234,63 @@ def _prepare_round_robin(
             )
         for first, second in combinations(selected_players, 2):
             validate_players(selected_game, [first.name, second.name])
+    except typer.BadParameter:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--players") from exc
+    return selected_game, selected_players
+
+
+def _prepare_championship(
+    *,
+    game_name: str,
+    player_spec: str,
+    rounds: int | None,
+    llm_timeout: float | None,
+    no_llm_timeout: bool,
+) -> tuple[Game, list[Player]]:
+    """校验淘汰制锦标赛名单，并只把每个二人配对交给 Game 的人数约束。"""
+
+    try:
+        game_options = {} if rounds is None else {"rounds": rounds}
+        selected_game = create_game(game_name, mode="play", **game_options)
+    except ValueError as exc:
+        param_hint = "--rounds" if rounds is not None and game_name in list_games() else "--game"
+        raise typer.BadParameter(str(exc), param_hint=param_hint) from exc
+
+    try:
+        player_specs = _split_player_specs(player_spec)
+        player_count = len(player_specs)
+        try:
+            validate_championship_player_count(player_count)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--players") from exc
+        if any(spec.partition(":")[0] == "human" for spec in player_specs):
+            raise typer.BadParameter(
+                "锦标赛暂只支持 LLM/mock/Profile，不支持人类选手",
+                param_hint="--players",
+            )
+        effective_llm_timeout = _resolve_llm_timeout(
+            llm_timeout,
+            disabled=no_llm_timeout,
+        )
+        selected_players = _parse_players(player_spec, 60.0, effective_llm_timeout)
+        names = [player.name for player in selected_players]
+        entrant_ids = [player.entrant_id for player in selected_players]
+        if len(set(names)) != player_count:
+            raise typer.BadParameter(f"选手名字必须唯一: {names}", param_hint="--players")
+        if len(set(entrant_ids)) != player_count:
+            raise typer.BadParameter(
+                f"选手稳定身份必须唯一: {entrant_ids}",
+                param_hint="--players",
+            )
+        # Opening-round pairings are the only guaranteed two-player contests;
+        # later rounds pair winners, so their opponent sets cannot be pre-validated.
+        for index in range(0, player_count, 2):
+            validate_players(
+                selected_game,
+                [selected_players[index].name, selected_players[index + 1].name],
+            )
     except typer.BadParameter:
         raise
     except (TypeError, ValueError) as exc:
@@ -2656,6 +2718,240 @@ def round_robin(
         _best_effort_render(_render_usage_summary, runtime_budget)
 
 
+def _render_championship_summary(championship: ChampionshipArchive) -> None:
+    table = Table(title="锦标赛结果")
+    table.add_column("排名", justify="right")
+    table.add_column("选手")
+    table.add_column("系列胜-平-负", justify="right")
+    table.add_column("对局胜-平-负", justify="right")
+    table.add_column("技术负", justify="right")
+    for standing in championship.standings:
+        table.add_row(
+            Text(str(standing.rank)),
+            literal_text(standing.player, max_chars=NAME_DISPLAY_LIMIT),
+            Text(f"{standing.series_wins}-{standing.series_draws}-{standing.series_losses}"),
+            Text(f"{standing.wins}-{standing.draws}-{standing.losses}"),
+            Text(str(standing.technical_losses)),
+        )
+    console.print(table)
+
+
+def _render_championship_saved(
+    championship: ChampionshipArchive,
+    store: SQLiteStore,
+    result: SaveResult,
+) -> None:
+    if not result.inserted:
+        line = Text("锦标赛 ", style="yellow")
+        line.append(literal_text(championship.championship_id, max_chars=NAME_DISPLAY_LIMIT))
+        line.append(" 已存在，未重复更新。")
+        console.print(line)
+        return
+
+    line = Text("✓ 锦标赛已完成并原子存档", style="green")
+    line.append("  ")
+    line.append(literal_text(championship.championship_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append(f"\n  {len(championship.players)} 名选手 · {len(championship.pairings)} 个双局赛")
+    line.append("\n  冠军 ")
+    line.append(literal_text(championship.champion, style="bold", max_chars=NAME_DISPLAY_LIMIT))
+    line.append("\n  ")
+    line.append(literal_text(store.path))
+    console.print(line)
+
+
+async def _run_championship(
+    game: Game,
+    players: list[Player],
+    seed: int,
+    store: SQLiteStore,
+    judge_panel: LLMJudgePanel | None = None,
+) -> None:
+    player_count = len(players)
+    round_count = player_count.bit_length() - 1
+    intro = Text("项目 ")
+    intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(" · seed=")
+    intro.append(literal_text(seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(f"\n{player_count} 名选手 · 单淘汰制 · {round_count} 轮 · "
+                 f"{player_count - 1} 个双局赛")
+    intro.append("\n选手：")
+    for index, player in enumerate(players):
+        if index:
+            intro.append(" · ")
+        intro.append(literal_text(player.name, max_chars=NAME_DISPLAY_LIMIT))
+    _best_effort_render(console.print, Panel(intro, title=Text("锦标赛开始")))
+
+    def render_pairing(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
+        if event.type == EventType.MATCH_STARTED:
+            first, second = (descriptor["name"] for descriptor in event.data["players"])
+            title = Text(f"第 {pairing_number} 场 · 第 {leg_number}/2 局 · ")
+            title.append(literal_text(first, max_chars=NAME_DISPLAY_LIMIT))
+            title.append(" vs ")
+            title.append(literal_text(second, max_chars=NAME_DISPLAY_LIMIT))
+            console.rule(title)
+        _render(event)
+
+    guarded_render_pairing = _guard_renderer(render_pairing)
+
+    def on_event(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
+        _emit_control_event("progress")
+        guarded_render_pairing(pairing_number, leg_number, event)
+
+    championship = await play_championship(
+        game,
+        players,
+        seed=seed,
+        on_event=on_event,
+        judge_panel=judge_panel,
+    )
+    result = store.save_championship(championship, rating_source="engine")
+    _best_effort_render(_render_championship_summary, championship)
+    _best_effort_render(_render_championship_saved, championship, store, result)
+
+
+@app.command()
+def championship(
+    game: str = typer.Option(
+        "knowledge_quiz",
+        "--game",
+        "-g",
+        help=f"比赛项目: {', '.join(list_games('play'))}",
+    ),
+    players: str = typer.Option(
+        "mock:random,mock:fixed,mock:illegal,mock:balanced",
+        "--players",
+        "-p",
+        help="4、8 或 16 名非人类选手，如 profile:kimi,profile:deepseek,profile:local,...",
+    ),
+    rounds: int | None = typer.Option(
+        None,
+        "--rounds",
+        "-n",
+        min=1,
+        max=100,
+        help="题目型项目的每人题数（棋类项目不适用；默认 5）",
+    ),
+    seed: int = typer.Option(
+        0,
+        "--seed",
+        "-s",
+        min=SQLITE_INT_MIN,
+        max=SQLITE_INT_MAX,
+        help="赛事随机种子；每轮按稳定规则确定性派生自己的 seed",
+    ),
+    llm_timeout: float | None = typer.Option(
+        None,
+        "--llm-timeout",
+        min=0.001,
+        help=(
+            "LLM 每步限时（秒）；默认读取 LLMOLYMPIC_LLM_TIMEOUT / match.llm_timeout_seconds / 120"
+        ),
+    ),
+    no_llm_timeout: bool = typer.Option(
+        False,
+        "--no-llm-timeout",
+        help=("禁用比赛层 LLM 截止时间；Provider 自身网络超时仍可能生效，仅建议用于旧同步适配器"),
+    ),
+    judge: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--judge",
+            help="创意锦标赛的独立评委，可重复指定 3–9 次",
+        ),
+    ] = None,
+    max_provider_calls: int | None = typer.Option(
+        None,
+        "--max-provider-calls",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项锦标赛模型/算法调用总数硬上限",
+    ),
+    max_input_tokens: int | None = typer.Option(
+        None,
+        "--max-input-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项锦标赛累计输入 Token 硬上限",
+    ),
+    max_output_tokens_per_call: int | None = typer.Option(
+        None,
+        "--max-output-tokens-per-call",
+        min=1,
+        max=SQLITE_INT_MAX,
+        help="每次模型请求的输出 Token 上限（默认 1024）",
+    ),
+    max_total_output_tokens: int | None = typer.Option(
+        None,
+        "--max-total-output-tokens",
+        min=0,
+        max=SQLITE_INT_MAX,
+        help="整项锦标赛累计输出 Token 硬上限",
+    ),
+    max_estimated_cost_usd: str | None = typer.Option(
+        None,
+        "--max-estimated-cost-usd",
+        help="整项锦标赛按本地冻结价格计算的美元费用硬上限",
+    ),
+    database: Annotated[
+        Path | None,
+        typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
+    ] = None,
+) -> None:
+    """4/8/16 名非人类选手的单淘汰制锦标赛，每场交换先后手双局赛。"""
+
+    _validate_control_profile_snapshot()
+    selected_game, selected_players = _prepare_championship(
+        game_name=game,
+        player_spec=players,
+        rounds=rounds,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+    )
+    judge_panel = _prepare_judge_panel(
+        selected_game,
+        selected_players,
+        judge,
+        llm_timeout=llm_timeout,
+        no_llm_timeout=no_llm_timeout,
+    )
+    runtime_budget = _prepare_in_memory_budget(
+        selected_players,
+        judge_panel,
+        max_provider_calls=max_provider_calls,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens_per_call=max_output_tokens_per_call,
+        max_total_output_tokens=max_total_output_tokens,
+        max_estimated_cost_usd=max_estimated_cost_usd,
+    )
+    store = _open_store(database)
+    try:
+        _emit_control_event("running")
+        asyncio.run(
+            _run_championship(
+                selected_game,
+                selected_players,
+                seed,
+                store,
+                judge_panel=judge_panel,
+            )
+        )
+    except UsageError as exc:
+        _render_usage_error(exc)
+        raise typer.Exit(code=1) from exc
+    except JudgePanelError as exc:
+        line = Text("评审失败，锦标赛未存档且未更新 ELO：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+    except (OSError, sqlite3.Error, StorageError) as exc:
+        line = Text("锦标赛已完成，但 SQLite 原子存档失败：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+    finally:
+        _best_effort_render(_render_usage_summary, runtime_budget)
+
+
 @app.command(name="web")
 def serve_web(
     database: Annotated[
@@ -2848,7 +3144,7 @@ def show_archive(
     match_id: str = typer.Argument(..., help="对局、系列赛或循环赛 ID"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
-    """输出一场对局、一个双局赛或一个循环赛的完整 JSON 档案。"""
+    """输出一场对局、一个双局赛、一个循环赛或一个锦标赛的完整 JSON 档案。"""
     try:
         store = _open_store(database, create=False)
         archive = store.get_match(match_id)
@@ -2856,13 +3152,15 @@ def show_archive(
             archive = store.get_series(match_id)
         if archive is None:
             archive = store.get_tournament(match_id)
+        if archive is None:
+            archive = store.get_championship(match_id)
     except (OSError, sqlite3.Error, StorageError, ValueError) as exc:
         line = Text("无法读取 SQLite 档案：", style="red")
         line.append(literal_text(exc))
         console.print(line)
         raise typer.Exit(code=1) from exc
     if archive is None:
-        line = Text("未找到对局、系列赛或循环赛 ", style="red")
+        line = Text("未找到对局、系列赛、循环赛或锦标赛 ", style="red")
         line.append(literal_text(repr(match_id), max_chars=NAME_DISPLAY_LIMIT))
         line.append("。")
         console.print(line)

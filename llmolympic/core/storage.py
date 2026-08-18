@@ -15,6 +15,7 @@ import warnings
 from contextlib import closing
 from pathlib import Path
 
+from llmolympic.core._storage_championship import _ChampionshipMixin
 from llmolympic.core._storage_entrants import _EntrantsMixin
 from llmolympic.core._storage_matches import _MatchesMixin
 from llmolympic.core._storage_schema import _SchemaMixin
@@ -60,6 +61,7 @@ class SQLiteStore(
     _EntrantsMixin,
     _MatchesMixin,
     _TournamentMixin,
+    _ChampionshipMixin,
     _ProviderUsageMixin,
 ):
     """Persistent match archive and ELO repository backed by SQLite.
@@ -167,6 +169,8 @@ class SQLiteStore(
                     self._verify_v6_schema(connection)
                 elif locked_version == 7:
                     self._verify_v7_schema(connection)
+                elif locked_version == 8:
+                    self._verify_v8_schema(connection)
                 if locked_version < 4:
                     self._create_tournament_schema(connection)
                 if locked_version < 5:
@@ -180,6 +184,8 @@ class SQLiteStore(
                     self._backfill_rating_operations(connection)
                 if locked_version < 8:
                     self._create_provider_usage_schema(connection)
+                if locked_version < 9:
+                    self._create_championship_schema(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
                 if 0 < locked_version < 7:

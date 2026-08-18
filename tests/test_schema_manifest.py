@@ -290,7 +290,7 @@ def test_fresh_v8_database_passes_the_complete_manifest(tmp_path: Path) -> None:
     SQLiteStore(database, create=False)
     inspection = inspect_database(database)
 
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert inspection.schema_version == SCHEMA_VERSION
     assert not inspection.migration_required
     with pytest.raises(TournamentAuditError) as caught:

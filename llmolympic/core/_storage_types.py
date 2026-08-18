@@ -29,7 +29,7 @@ from llmolympic.core.usage import (
 if TYPE_CHECKING:
     from llmolympic.core.storage import SQLiteStore
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 RatingSource = Literal["engine", "imported"]
 
@@ -333,6 +333,56 @@ _REQUIRED_COLUMNS = {
         "match_id",
         "series_id",
         "tournament_id",
+    },
+}
+
+_V9_REQUIRED_COLUMNS = {
+    **_REQUIRED_COLUMNS,
+    "championship_archives": {
+        "championship_id",
+        "schema_version",
+        "format",
+        "pairing_policy",
+        "seed_policy",
+        "tiebreak_policy",
+        "game",
+        "seed",
+        "players_json",
+        "champion",
+        "pairing_count",
+        "rating_policy",
+        "k_factor",
+        "started_at",
+        "finished_at",
+        "archive_source",
+        "rating_source",
+        "rated",
+        "championship_json",
+    },
+    "championship_entrants": {
+        "championship_id",
+        "position",
+        "entrant_id",
+        "display_name",
+        "descriptor_json",
+        "rank",
+        "series_played",
+        "series_wins",
+        "series_draws",
+        "series_losses",
+        "games_played",
+        "wins",
+        "draws",
+        "losses",
+        "technical_losses",
+    },
+    "championship_pairings": {
+        "championship_id",
+        "round_number",
+        "pairing_number",
+        "series_id",
+        "entrant_a_id",
+        "entrant_b_id",
     },
 }
 

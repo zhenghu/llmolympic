@@ -38,15 +38,17 @@
 ### 1.2 档案来源、兼容迁移与计分信任边界
 
 - 新对局与双局赛分别使用 archive/series schema v2，循环赛使用 tournament
-  schema v1；三者的新档案均记录 `source`：引擎生成为 `local_engine`，外部构造
-  为 `external`。只有旧 match/series schema v1（包括历史上省略版本号的 JSON）
-  读入时标为 `legacy`；tournament schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 8`，以 `entrants`、`entrant_id` 和展示名快照
+  schema v1，锦标赛使用 championship schema v1；四者的新档案均记录 `source`：
+  引擎生成为 `local_engine`，外部构造为 `external`。只有旧 match/series schema v1
+  （包括历史上省略版本号的 JSON）读入时标为 `legacy`；tournament/championship
+  schema v1 不使用 legacy 来源。
+- SQLite 使用 `PRAGMA user_version = 9`，以 `entrants`、`entrant_id` 和展示名快照
   持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v6
   数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表，v1–v6→v7 会按既有
   `rating_history` 写入顺序回填全局评分操作，并把历史 `matches` / `series_archives`
   规范化为当前表结构且原样保留归档 JSON；v7→v8 以 additive migration 新增 Provider
-  预算及无内容调用尝试账本。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
+  预算及无内容调用尝试账本；v8→v9 以 additive migration 新增锦标赛档案、参赛者与
+  对阵关系表。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
   不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
@@ -54,8 +56,9 @@
 - 迁移只补齐关系表、来源和身份索引，已有 `archive_json` / `series_json` 原样保留；
   兼容字段只在读取时于内存中补齐。历史对局是否已计分由现有
   `rating_history` 反推，不能重算或重复计分。
-- `SQLiteStore.save_match()` / `save_series()` / `save_tournament()` 默认
-  `rating_source="imported"`，只存档、不计 ELO。`rating_source="engine"` 仅供
+- `SQLiteStore.save_match()` / `save_series()` / `save_tournament()` /
+  `save_championship()` 默认 `rating_source="imported"`，只存档、不计 ELO。
+  `rating_source="engine"` 仅供
   本进程完成对局后的可信调用路径，
   双人对局才计分；它是调用方信任声明，不是认证、签名或对来源的密码学证明。
   同一 match/series/tournament ID 也不能通过重新保存从 imported 升级为 engine。
@@ -271,7 +274,14 @@ CLI                  Web / WebSocket
   （已实现）。当前串行执行，每完成一组双局对阵就保存检查点；`--resume`
   跳过已完成 prefix，全部完成时才封存正式档案并更新一次 ELO。超过默认对局/
   调用规模阈值需显式使用 `--allow-large-tournament`；该确认不绕过 Provider 硬预算。
-- **锦标赛**：单场多题总分制（阶段四）。
+- **锦标赛**：4/8/16 名非人类选手的单淘汰制（single-elimination），每场对阵进行
+  交换先后手双局赛，胜者晋级、败者淘汰，逐轮直至产生唯一冠军（已实现）。参赛人数
+  必须是 2 的幂；每轮 seed 从赛事 seed 与轮次确定性派生。双局赛总分先定胜负，平局时
+  依次按较少技术负、较小 `entrant_id` 确定性打破，保证永不僵持。锦标赛及子双局赛
+  只存档、不更新 ELO——淘汰赛名次不是独立的二人对局序列；`llmolympic championship`
+  命令入口与 `championship_archives` / `championship_entrants` /
+  `championship_pairings` SQLite v9 表随本次实现。当前锦标赛串行执行、无 checkpoint，
+  且暂不接入 Web 控制面或实时直播 sidecar。
 
 ## 7. 技术栈
 
@@ -326,5 +336,8 @@ CLI                  Web / WebSocket
    比赛 worker 经既有事务写入，网页不能提交命令、路径、凭据、endpoint 或任意模型配置。
    该控制面仍只信任回环地址上的本机操作者，同一数据库最多一个活动 Web 任务，
    play/series 中断后不自动重跑。
-   后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及独立的单场多题总分制
-   锦标赛模式；之后新增项目继续保持纯插件接入。
+   4.6 以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
+   先后手双局赛、确定性平局打破、SQLite v9 只存档不计分的锦标赛档案；串行执行、
+   无 checkpoint，尚未接入 Web 控制面与实时直播。
+   后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及锦标赛的
+   checkpoint/resume、Web 控制面与直播；之后新增项目继续保持纯插件接入。

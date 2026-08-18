@@ -674,6 +674,9 @@ def test_v7_to_v8_migration_preserves_in_progress_checkpoint_and_active_lease(
             """
             DROP TABLE provider_call_attempts;
             DROP TABLE provider_budgets;
+            DROP TABLE championship_pairings;
+            DROP TABLE championship_entrants;
+            DROP TABLE championship_archives;
             PRAGMA user_version = 7;
             """
         )
