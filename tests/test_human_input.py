@@ -107,8 +107,12 @@ async def _wait_for_request(
     session: InputSessionStore,
     *,
     previous: str | None = None,
+    timeout_seconds: float = 5.0,
 ):
-    for _ in range(100):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    delay = 0.005
+    while True:
         try:
             snapshot = _load(web, session)
         except HumanInputError as exc:
@@ -118,7 +122,11 @@ async def _wait_for_request(
             request = snapshot.request
             if request is not None and request.request_id != previous:
                 return request
-        await asyncio.sleep(0.005)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 2, 0.05)
     raise AssertionError("browser-human request did not become visible")
 
 
