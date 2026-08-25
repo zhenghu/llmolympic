@@ -1,4 +1,4 @@
-"""Complete SQLite v8 schema-manifest and fail-closed parser tests."""
+"""Complete SQLite v10 schema-manifest and fail-closed parser tests."""
 
 from __future__ import annotations
 
@@ -283,14 +283,14 @@ SCHEMA_TAMPERS: tuple[tuple[str, SchemaTamper, str], ...] = (
 )
 
 
-def test_fresh_v8_database_passes_the_complete_manifest(tmp_path: Path) -> None:
-    database = tmp_path / "fresh-v8.db"
+def test_fresh_database_passes_the_complete_manifest(tmp_path: Path) -> None:
+    database = tmp_path / "fresh.db"
 
     SQLiteStore(database)
     SQLiteStore(database, create=False)
     inspection = inspect_database(database)
 
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert inspection.schema_version == SCHEMA_VERSION
     assert not inspection.migration_required
     with pytest.raises(TournamentAuditError) as caught:

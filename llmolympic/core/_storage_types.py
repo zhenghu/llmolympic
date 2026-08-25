@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal, Self
 
 from llmolympic.config import get as cfg_get
 from llmolympic.core.archive import MatchArchive
+from llmolympic.core.championship import ChampionshipCheckpoint
 from llmolympic.core.tournament import TournamentCheckpoint
 from llmolympic.core.usage import (
     BudgetLimits,
@@ -29,7 +30,7 @@ from llmolympic.core.usage import (
 if TYPE_CHECKING:
     from llmolympic.core.storage import SQLiteStore
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 RatingSource = Literal["engine", "imported"]
 
@@ -386,6 +387,49 @@ _V9_REQUIRED_COLUMNS = {
     },
 }
 
+_V10_REQUIRED_COLUMNS = {
+    **_V9_REQUIRED_COLUMNS,
+    "championship_checkpoints": {
+        "championship_id",
+        "schema_version",
+        "source",
+        "format",
+        "pairing_policy",
+        "seed_policy",
+        "tiebreak_policy",
+        "game",
+        "seed",
+        "players_json",
+        "game_config_json",
+        "schedule_json",
+        "max_attempts",
+        "pairing_count",
+        "created_at",
+        "updated_at",
+        "status",
+        "finalized_at",
+        "final_championship_id",
+        "config_json",
+    },
+    "championship_checkpoint_series": {
+        "championship_id",
+        "pairing_number",
+        "series_id",
+        "match_1_id",
+        "match_2_id",
+        "completed_at",
+        "series_json",
+    },
+    "championship_runner_leases": {
+        "championship_id",
+        "generation",
+        "token_digest",
+        "acquired_at_epoch",
+        "renewed_at_epoch",
+        "expires_at_epoch",
+    },
+}
+
 _LEGACY_REQUIRED_COLUMNS = {
     "matches": {
         "match_id",
@@ -468,6 +512,15 @@ class TournamentIdCollisionError(StorageError):
 
 class TournamentCheckpointCollisionError(StorageError):
     """A tournament checkpoint id is attached to different configuration or progress."""
+
+class ChampionshipCheckpointCollisionError(StorageError):
+    """A championship checkpoint id is attached to different configuration or progress."""
+
+class ChampionshipRunnerLeaseBusyError(StorageError):
+    """A different runner currently owns an unexpired championship lease."""
+
+class ChampionshipRunnerLeaseLostError(StorageError):
+    """A runner no longer owns the active championship fencing generation."""
 
 class TournamentRunnerLeaseError(StorageError):
     """Base exception for runner lease coordination failures."""
@@ -575,6 +628,32 @@ class TournamentRunnerClaim:
 
     checkpoint: TournamentCheckpoint
     lease: TournamentRunnerLease
+
+@dataclass(frozen=True)
+class ChampionshipCheckpointSaveResult:
+    """Result of creating or appending one resumable championship checkpoint."""
+
+    inserted: bool
+    completed_pairing_count: int
+    pairing_count: int
+
+@dataclass(frozen=True)
+class ChampionshipRunnerLease:
+    """Opaque capability and fencing generation for one championship runner."""
+
+    championship_id: str
+    generation: int
+    token: str = field(repr=False)
+    acquired_at_epoch: int
+    renewed_at_epoch: int
+    expires_at_epoch: int
+
+@dataclass(frozen=True)
+class ChampionshipRunnerClaim:
+    """A championship checkpoint reloaded atomically with its acquired lease."""
+
+    checkpoint: ChampionshipCheckpoint
+    lease: ChampionshipRunnerLease
 
 @dataclass(frozen=True)
 class ProviderBudgetSnapshot:

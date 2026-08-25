@@ -20,7 +20,7 @@ import hashlib
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -43,6 +43,7 @@ from llmolympic.core.series import (
 )
 
 CHAMPIONSHIP_SCHEMA_VERSION = 1
+CHAMPIONSHIP_CHECKPOINT_SCHEMA_VERSION = 1
 
 MIN_CHAMPIONSHIP_PLAYERS = 4
 MAX_CHAMPIONSHIP_PLAYERS = MAX_PLATFORM_PLAYERS
@@ -53,6 +54,7 @@ _SEED_DOMAIN = b"llmolympic.championship-round-seed-v1\0"
 
 ChampionshipSource = Literal["local_engine", "external"]
 ChampionshipEventCallback = Callable[[int, int, MatchEvent], None]
+ChampionshipCheckpointCallback = Callable[["ChampionshipCheckpoint"], None]
 
 
 def _validate_signed_seed(seed: object) -> int:
@@ -312,6 +314,54 @@ def _resolved_bracket_indices(
         winners = round_winners
     if len(winners) != 1:
         raise ValueError("锦标赛未能收敛到唯一的冠军")
+    return tuple(resolved)
+
+
+def _bracket_indices_for_prefix(
+    players: Sequence[dict],
+    completed_series: Sequence[SeriesArchive],
+) -> tuple[tuple[int, int], ...]:
+    """Return the resolved entrant indices for a valid completed-series prefix.
+
+    A championship checkpoint stores completed series in the same canonical
+    execution order as a full archive.  For any prefix whose length is a
+    multiple of a whole round boundary, replaying the bracket recovers each
+    stored series' entrant indices without knowing future results.
+    """
+
+    count = len(players)
+    completed = len(completed_series)
+    if completed == 0:
+        return ()
+    expected_total = count - 1
+    if completed > expected_total:
+        raise ValueError(
+            f"锦标赛最多包含 {expected_total} 个双局赛，实际已保存 {completed} 个"
+        )
+
+    resolved: list[tuple[int, int]] = []
+    winners: list[int] = list(range(count))
+    cursor = 0
+    remaining = completed
+    for round_number in range(1, championship_round_count(count) + 1):
+        pairing_count = count >> round_number
+        round_winners: list[int] = []
+        for position in range(pairing_count):
+            first_index = winners[2 * position]
+            second_index = winners[2 * position + 1]
+            if remaining <= 0:
+                return tuple(resolved)
+            resolved.append((first_index, second_index))
+            series = completed_series[cursor]
+            cursor += 1
+            remaining -= 1
+            winner_index, _ = _series_winner_indices(
+                players, series, first_index, second_index
+            )
+            round_winners.append(winner_index)
+        winners = round_winners
+    if remaining != 0:
+        raise ValueError("锦标赛 checkpoint 的已保存双局赛数量无效")
     return tuple(resolved)
 
 
@@ -647,6 +697,136 @@ def championship_from_series(
     return ChampionshipArchive.model_validate(values)
 
 
+class ChampionshipCheckpoint(BaseModel):
+    """A validated, resumable prefix of one local knockout championship.
+
+    The completed series are stored in canonical bracket execution order, so the
+    next pairing is always ``len(completed_series)`` in the static schedule.
+    Only whole round boundaries are persisted: a checkpoint is either empty or
+    contains every series of the rounds that have fully resolved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = CHAMPIONSHIP_CHECKPOINT_SCHEMA_VERSION
+    source: Literal["local_engine"] = "local_engine"
+    championship_id: str = Field(default_factory=lambda: uuid.uuid4().hex, min_length=1)
+    format: Literal["single_elimination_two_leg"] = "single_elimination_two_leg"
+    pairing_policy: Literal["power_of_two_bracket_v1"] = "power_of_two_bracket_v1"
+    seed_policy: Literal["round_seed_sha256_v1"] = "round_seed_sha256_v1"
+    tiebreak_policy: Literal["deterministic_v1"] = "deterministic_v1"
+    game: str
+    game_config: dict
+    seed: int
+    max_attempts: int
+    players: tuple[dict, ...]
+    schedule: tuple[ChampionshipPairingSpec, ...]
+    judge_panel: JudgePanelSnapshot | None = None
+    completed_series: tuple[SeriesArchive, ...] = ()
+    created_at: datetime
+    updated_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_players(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized["players"] = _normalized_championship_players(normalized.get("players"))
+        game_config = normalized.get("game_config")
+        if not isinstance(game_config, dict):
+            raise TypeError("锦标赛 checkpoint game_config 必须是字典")
+        normalized["game_config"] = copy.deepcopy(game_config)
+        return normalized
+
+    @field_validator("game", mode="before")
+    @classmethod
+    def validate_game(cls, value: object) -> object:
+        if not isinstance(value, str) or not value:
+            raise ValueError("锦标赛 game 必须是非空字符串")
+        return value
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def validate_seed(cls, value: object) -> object:
+        return _validate_signed_seed(value)
+
+    @field_validator("max_attempts", mode="before")
+    @classmethod
+    def validate_max_attempts(cls, value: object) -> object:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= MAX_MOVE_ATTEMPTS
+        ):
+            raise ValueError(f"max_attempts 必须是 1 到 {MAX_MOVE_ATTEMPTS} 之间的整数")
+        return value
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> ChampionshipCheckpoint:
+        count = len(self.players)
+        validate_championship_player_count(count)
+        static_schedule = _static_schedule(self.players, self.seed)
+        if self.schedule != static_schedule:
+            raise ValueError("锦标赛 checkpoint 赛程与确定性赛程不一致")
+
+        completed = len(self.completed_series)
+        indices = _bracket_indices_for_prefix(self.players, self.completed_series)
+        if len(indices) != completed:
+            raise ValueError("锦标赛 checkpoint 的已保存双局赛索引无效")
+
+        requires_panel = self.game == "creative_writing"
+        if requires_panel and self.judge_panel is None:
+            raise ValueError("创意锦标赛 checkpoint 必须冻结评审团快照")
+        if not requires_panel and self.judge_panel is not None:
+            raise ValueError("客观锦标赛 checkpoint 不能包含评审团快照")
+
+        _validate_completed_series(
+            players=self.players,
+            series_archives=self.completed_series,
+            indices=indices,
+            source=self.source,
+            game=self.game,
+            judge_panel=self.judge_panel,
+        )
+
+        timestamps = (self.created_at, self.updated_at)
+        if any(timestamp.utcoffset() is None for timestamp in timestamps):
+            raise ValueError("锦标赛 checkpoint 时间必须包含时区")
+        if self.updated_at < self.created_at:
+            raise ValueError("锦标赛 checkpoint 更新时间不能早于创建时间")
+        if self.completed_series:
+            if self.created_at > self.completed_series[0].started_at:
+                raise ValueError("锦标赛 checkpoint 创建时间不能晚于首组开始时间")
+            if self.updated_at != self.completed_series[-1].finished_at:
+                raise ValueError("锦标赛 checkpoint 更新时间必须等于最后完成组的结束时间")
+        elif self.updated_at != self.created_at:
+            raise ValueError("空锦标赛 checkpoint 的创建和更新时间必须一致")
+        return self
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.completed_series) == len(self.players) - 1
+
+    @property
+    def completed_rounds(self) -> int:
+        """Return the number of fully resolved rounds in this checkpoint."""
+
+        count = len(self.players)
+        rounds = championship_round_count(count)
+        completed = len(self.completed_series)
+        for round_number in range(1, rounds + 1):
+            if completed == count - (count >> round_number):
+                return round_number
+        return 0
+
+    @property
+    def next_pairing_number(self) -> int | None:
+        if self.is_complete:
+            return None
+        return len(self.completed_series) + 1
+
+
 def _validated_championship_inputs(
     game: Game,
     players: Sequence[Player],
@@ -691,19 +871,18 @@ def _validated_championship_inputs(
     return entrants, descriptors, copy.deepcopy(game_config)
 
 
-async def play_championship(
+def prepare_championship(
     game: Game,
     players: Sequence[Player],
     seed: int = 0,
     max_attempts: int = 3,
-    on_event: ChampionshipEventCallback | None = None,
     *,
     championship_id: str | None = None,
     judge_panel: LLMJudgePanel | None = None,
-) -> ChampionshipArchive:
-    """Play one single-elimination knockout bracket of swapped-order series."""
+) -> ChampionshipCheckpoint:
+    """Preflight and freeze one championship identity, configuration, and bracket."""
 
-    entrants, descriptors, _game_config = _validated_championship_inputs(
+    entrants, descriptors, game_config = _validated_championship_inputs(
         game, players, seed, max_attempts
     )
     requires_panel = bool(getattr(game, "requires_judge_panel", False))
@@ -713,16 +892,89 @@ async def play_championship(
         raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
     if judge_panel is not None:
         judge_panel.validate_contestants(list(entrants))
+    created_at = datetime.now(UTC)
+    values: dict[str, object] = {
+        "schema_version": CHAMPIONSHIP_CHECKPOINT_SCHEMA_VERSION,
+        "source": "local_engine",
+        "game": game.name,
+        "game_config": game_config,
+        "seed": seed,
+        "max_attempts": max_attempts,
+        "players": descriptors,
+        "schedule": _static_schedule(descriptors, seed),
+        "judge_panel": None if judge_panel is None else judge_panel.snapshot(),
+        "completed_series": (),
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    if championship_id is not None:
+        values["championship_id"] = championship_id
+    return ChampionshipCheckpoint.model_validate(values)
+
+
+async def resume_championship(
+    game: Game,
+    players: Sequence[Player],
+    checkpoint: ChampionshipCheckpoint,
+    *,
+    on_event: ChampionshipEventCallback | None = None,
+    on_checkpoint: ChampionshipCheckpointCallback | None = None,
+    judge_panel: LLMJudgePanel | None = None,
+) -> ChampionshipArchive:
+    """Continue only the unfinished rounds of a validated championship checkpoint."""
+
+    entrants, descriptors, game_config = _validated_championship_inputs(
+        game,
+        players,
+        checkpoint.seed,
+        checkpoint.max_attempts,
+    )
+    if game.name != checkpoint.game:
+        raise ValueError("恢复锦标赛的 game 与 checkpoint 不一致")
+    if descriptors != checkpoint.players:
+        raise ValueError("恢复锦标赛的选手描述与 checkpoint 不一致")
+    if game_config != checkpoint.game_config:
+        raise ValueError("恢复锦标赛的项目配置与 checkpoint 不一致")
+    if _static_schedule(descriptors, checkpoint.seed) != checkpoint.schedule:
+        raise ValueError("恢复锦标赛的赛程与 checkpoint 不一致")
+    requires_panel = bool(getattr(game, "requires_judge_panel", False))
+    if requires_panel and judge_panel is None:
+        raise ValueError(f"项目 {game.name!r} 需要 LLM 评审团")
+    if not requires_panel and judge_panel is not None:
+        raise ValueError(f"项目 {game.name!r} 不接受 LLM 评审团")
+    if judge_panel is not None:
+        judge_panel.validate_contestants(list(entrants))
+    runtime_snapshot = None if judge_panel is None else judge_panel.snapshot()
+    if runtime_snapshot != checkpoint.judge_panel:
+        raise ValueError("恢复锦标赛的评审团与 checkpoint 冻结快照不一致")
 
     count = len(entrants)
     rounds = championship_round_count(count)
     winners: list[int] = list(range(count))
-    series_archives: list[SeriesArchive] = []
-    pairing_number = 0
+    series_archives: list[SeriesArchive] = list(checkpoint.completed_series)
+    pairing_number = len(series_archives)
 
-    for round_number in range(1, rounds + 1):
+    # Replay completed rounds to re-establish the bracket's surviving entrants.
+    cursor = 0
+    for round_number in range(1, checkpoint.completed_rounds + 1):
         pairing_count = count >> round_number
         round_winners: list[int] = []
+        for _position in range(pairing_count):
+            first_index = winners[0]
+            second_index = winners[1]
+            series = series_archives[cursor]
+            cursor += 1
+            winner_index, _ = _series_winner_indices(
+                descriptors, series, first_index, second_index
+            )
+            round_winners.append(winner_index)
+            winners = winners[2:]
+        winners = round_winners
+
+    for round_number in range(checkpoint.completed_rounds + 1, rounds + 1):
+        pairing_count = count >> round_number
+        round_winners: list[int] = []
+        round_series: list[SeriesArchive] = []
         for position in range(pairing_count):
             first_index = winners[2 * position]
             second_index = winners[2 * position + 1]
@@ -742,27 +994,91 @@ async def play_championship(
             archive = await play_two_leg_series(
                 game,
                 [entrants[first_index], entrants[second_index]],
-                seed=championship_round_seed(seed, round_number),
-                max_attempts=max_attempts,
+                seed=championship_round_seed(checkpoint.seed, round_number),
+                max_attempts=checkpoint.max_attempts,
                 on_event=event_callback,
                 judge_panel=judge_panel,
             )
-            series_archives.append(archive)
+            round_series.append(archive)
             winner_index, _ = _series_winner_indices(
                 descriptors, archive, first_index, second_index
             )
             round_winners.append(winner_index)
+        series_archives.extend(round_series)
         winners = round_winners
+        current = championship_checkpoint_with_series(
+            checkpoint,
+            series_archives,
+        )
+        checkpoint = current
+        if on_checkpoint is not None:
+            on_checkpoint(current)
 
     if len(winners) != 1:
         raise ValueError("锦标赛未能收敛到唯一的冠军")
     champion = descriptors[winners[0]]["name"]
-
     return championship_from_series(
         descriptors,
         series_archives,
-        seed=seed,
+        seed=checkpoint.seed,
         champion=champion,
+        championship_id=checkpoint.championship_id,
+        judge_panel=checkpoint.judge_panel,
+    )
+
+
+def championship_checkpoint_with_series(
+    checkpoint: ChampionshipCheckpoint,
+    completed_series: Sequence[SeriesArchive],
+) -> ChampionshipCheckpoint:
+    """Return a checkpoint extended to a valid new completed-series prefix."""
+
+    if not completed_series:
+        raise ValueError("锦标赛 checkpoint 不能追加空的双局赛列表")
+    if len(completed_series) <= len(checkpoint.completed_series):
+        raise ValueError("锦标赛 checkpoint 只能追加新的双局赛")
+    if tuple(completed_series[: len(checkpoint.completed_series)]) != checkpoint.completed_series:
+        raise ValueError("锦标赛 checkpoint 只能保留既有 prefix 并追加新双局赛")
+    values: dict[str, object] = {
+        field: getattr(checkpoint, field) for field in ChampionshipCheckpoint.model_fields
+    }
+    values["completed_series"] = tuple(completed_series)
+    values["updated_at"] = completed_series[-1].finished_at
+    return ChampionshipCheckpoint.model_validate(values)
+
+
+async def play_championship(
+    game: Game,
+    players: Sequence[Player],
+    seed: int = 0,
+    max_attempts: int = 3,
+    on_event: ChampionshipEventCallback | None = None,
+    *,
+    championship_id: str | None = None,
+    judge_panel: LLMJudgePanel | None = None,
+    on_checkpoint: ChampionshipCheckpointCallback | None = None,
+) -> ChampionshipArchive:
+    """Play one single-elimination knockout bracket of swapped-order series.
+
+    If ``on_checkpoint`` is supplied, it is invoked after each whole round is
+    resolved with an up-to-date :class:`ChampionshipCheckpoint`.  The
+    ``championship_id`` anchors the checkpoint identity so a consumer can
+    persist progress between rounds.
+    """
+
+    checkpoint = prepare_championship(
+        game,
+        players,
+        seed=seed,
+        max_attempts=max_attempts,
         championship_id=championship_id,
-        judge_panel=None if judge_panel is None else judge_panel.snapshot(),
+        judge_panel=judge_panel,
+    )
+    return await resume_championship(
+        game,
+        players,
+        checkpoint,
+        on_event=on_event,
+        on_checkpoint=on_checkpoint,
+        judge_panel=judge_panel,
     )

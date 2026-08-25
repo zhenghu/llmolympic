@@ -52,7 +52,9 @@ from llmolympic.core.archive import MatchArchive
 from llmolympic.core.budget_config import ResolvedProviderBudget, resolve_provider_budget
 from llmolympic.core.championship import (
     ChampionshipArchive,
-    play_championship,
+    ChampionshipCheckpoint,
+    prepare_championship,
+    resume_championship,
     validate_championship_player_count,
 )
 from llmolympic.core.events import EventType, MatchEvent
@@ -78,6 +80,8 @@ from llmolympic.core.storage import (
     DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
     SQLITE_INT_MAX,
     SQLITE_INT_MIN,
+    ChampionshipRunnerLease,
+    ChampionshipRunnerLeaseLostError,
     SaveResult,
     SQLiteStore,
     StorageError,
@@ -123,6 +127,7 @@ TOURNAMENT_MOVE_ATTEMPTS = 3
 DEFAULT_TOURNAMENT_GAME = "knowledge_quiz"
 DEFAULT_TOURNAMENT_PLAYERS = "mock:random,mock:fixed,mock:illegal"
 DEFAULT_TOURNAMENT_SEED = 0
+DEFAULT_CHAMPIONSHIP_PLAYERS = "mock:random,mock:fixed,mock:illegal,mock:balanced"
 TOURNAMENT_RUNNER_HEARTBEAT_SECONDS = DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS / 4
 TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS = 1.0
 LOCAL_WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -1428,6 +1433,70 @@ def _restore_round_robin(checkpoint: TournamentCheckpoint) -> tuple[Game, list[P
     return game, players
 
 
+def _championship_checkpoint_llm_timeout(
+    checkpoint: ChampionshipCheckpoint,
+) -> float | None:
+    """Return the one CLI-wide timeout frozen into all championship entrants."""
+
+    values = [descriptor.get("move_timeout_seconds") for descriptor in checkpoint.players]
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        raise ValueError("锦标赛 checkpoint 的选手超时配置不一致")
+    if first is None:
+        return None
+    if isinstance(first, bool) or not isinstance(first, (int, float)):
+        raise TypeError("锦标赛 checkpoint 的 LLM 超时无效")
+    return float(first)
+
+
+def _restore_championship(
+    checkpoint: ChampionshipCheckpoint,
+) -> tuple[Game, list[Player]]:
+    """Recreate providers from current config while preserving frozen identity."""
+
+    route_fields = tuple("route_id" in descriptor for descriptor in checkpoint.players)
+    if any(route_fields) and not all(route_fields):
+        raise ValueError("锦标赛 checkpoint 的 route_id 快照不完整")
+    has_route_snapshot = all(route_fields)
+    if has_route_snapshot:
+        for descriptor in checkpoint.players:
+            validate_route_id(descriptor.get("route_id"))
+
+    player_spec = ",".join(_checkpoint_player_spec(item) for item in checkpoint.players)
+    timeout = _championship_checkpoint_llm_timeout(checkpoint)
+    raw_rounds = checkpoint.game_config.get("rounds")
+    if raw_rounds is None:
+        rounds = None
+    elif isinstance(raw_rounds, bool) or not isinstance(raw_rounds, int):
+        raise ValueError("锦标赛 checkpoint 的 rounds 配置无效")
+    else:
+        rounds = raw_rounds
+    game, players = _prepare_championship(
+        game_name=checkpoint.game,
+        player_spec=player_spec,
+        rounds=rounds,
+        llm_timeout=timeout,
+        no_llm_timeout=timeout is None,
+    )
+    for player, descriptor in zip(players, checkpoint.players):
+        player.name = descriptor["name"]
+        if not has_route_snapshot:
+            if not isinstance(player, LLMPlayer):  # pragma: no cover - parser contract guard
+                raise TypeError("旧锦标赛 checkpoint 只能恢复 LLM/mock/Profile 选手")
+            player._use_legacy_route_description()
+    return game, players
+
+
+def _championship_resume_command(
+    checkpoint: ChampionshipCheckpoint,
+    store: SQLiteStore,
+) -> str:
+    return (
+        "llmolympic championship --resume "
+        f"{shlex.quote(checkpoint.championship_id)} --db {shlex.quote(str(store.path))}"
+    )
+
+
 def _tournament_workload(
     game: Game,
     player_count: int,
@@ -1833,6 +1902,54 @@ async def _runner_lease_heartbeat(
         if stop.is_set():
             return
         current = await _renew_runner_lease_with_retry(store, current, stop)
+
+
+async def _renew_championship_runner_lease_with_retry(
+    store: SQLiteStore,
+    lease: ChampionshipRunnerLease,
+    stop: asyncio.Event,
+) -> ChampionshipRunnerLease:
+    while True:
+        try:
+            return await asyncio.to_thread(store.renew_championship_runner, lease)
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy_or_locked(exc):
+                raise
+            remaining = lease.expires_at_epoch - time.time()
+            if remaining <= 0:
+                raise ChampionshipRunnerLeaseLostError(
+                    "锦标赛 runner lease 心跳未能在过期前取得 SQLite 写锁"
+                ) from exc
+            if stop.is_set():
+                return lease
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=min(TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS, remaining),
+                )
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                return lease
+
+
+async def _championship_runner_lease_heartbeat(
+    store: SQLiteStore,
+    lease: ChampionshipRunnerLease,
+    stop: asyncio.Event,
+) -> None:
+    current = lease
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=TOURNAMENT_RUNNER_HEARTBEAT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        if stop.is_set():
+            return
+        current = await _renew_championship_runner_lease_with_retry(store, current, stop)
 
 
 async def _run_round_robin(
@@ -2759,11 +2876,57 @@ def _render_championship_saved(
     console.print(line)
 
 
+def _render_championship_checkpoint_ready(
+    checkpoint: ChampionshipCheckpoint,
+    store: SQLiteStore,
+    resumed: bool,
+) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("锦标赛检查点已就绪", style="green")
+    if resumed:
+        line = Text("锦标赛检查点已加载", style="green")
+    line.append("\n  赛事 ID ")
+    line.append(literal_text(checkpoint.championship_id, max_chars=NAME_DISPLAY_LIMIT))
+    line.append(f"\n  进度 {completed}/{total} 个双局赛")
+    line.append("\n  恢复 ")
+    line.append(
+        literal_text(
+            _championship_resume_command(checkpoint, store),
+            multiline=False,
+        )
+    )
+    console.print(line)
+
+
+def _render_championship_checkpoint_saved(checkpoint: ChampionshipCheckpoint) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("✓ 检查点已保存", style="green")
+    line.append(f"  {completed}/{total} 个双局赛  ")
+    line.append(literal_text(checkpoint.championship_id, max_chars=NAME_DISPLAY_LIMIT))
+    console.print(line)
+
+
+def _render_championship_interrupted(
+    checkpoint: ChampionshipCheckpoint,
+    store: SQLiteStore,
+) -> None:
+    completed = len(checkpoint.completed_series)
+    total = len(checkpoint.schedule)
+    line = Text("锦标赛已中断。", style="yellow")
+    line.append(f"已保存 {completed}/{total} 个双局赛；未完成的整轮不会保存。")
+    line.append("\n恢复：")
+    line.append(literal_text(_championship_resume_command(checkpoint, store)))
+    console.print(line)
+
+
 async def _run_championship(
     game: Game,
     players: list[Player],
-    seed: int,
+    checkpoint: ChampionshipCheckpoint,
     store: SQLiteStore,
+    lease: ChampionshipRunnerLease | None = None,
     judge_panel: LLMJudgePanel | None = None,
 ) -> None:
     player_count = len(players)
@@ -2771,7 +2934,10 @@ async def _run_championship(
     intro = Text("项目 ")
     intro.append(literal_text(game.name, style="bold", max_chars=NAME_DISPLAY_LIMIT))
     intro.append(" · seed=")
-    intro.append(literal_text(seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(literal_text(checkpoint.seed, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append("\n赛事 ID ")
+    intro.append(literal_text(checkpoint.championship_id, max_chars=NAME_DISPLAY_LIMIT))
+    intro.append(f" · 已保存 {len(checkpoint.completed_series)}/{player_count - 1} 个双局赛")
     intro.append(f"\n{player_count} 名选手 · 单淘汰制 · {round_count} 轮 · "
                  f"{player_count - 1} 个双局赛")
     intro.append("\n选手：")
@@ -2779,7 +2945,8 @@ async def _run_championship(
         if index:
             intro.append(" · ")
         intro.append(literal_text(player.name, max_chars=NAME_DISPLAY_LIMIT))
-    _best_effort_render(console.print, Panel(intro, title=Text("锦标赛开始")))
+    title = "锦标赛恢复" if checkpoint.completed_series else "锦标赛开始"
+    _best_effort_render(console.print, Panel(intro, title=Text(title)))
 
     def render_pairing(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
         if event.type == EventType.MATCH_STARTED:
@@ -2797,31 +2964,70 @@ async def _run_championship(
         _emit_control_event("progress")
         guarded_render_pairing(pairing_number, leg_number, event)
 
-    championship = await play_championship(
-        game,
-        players,
-        seed=seed,
-        on_event=on_event,
-        judge_panel=judge_panel,
-    )
-    result = store.save_championship(championship, rating_source="engine")
+    def save_checkpoint(updated: ChampionshipCheckpoint) -> None:
+        if lease is not None:
+            store.save_championship_checkpoint(updated, lease=lease)
+        _best_effort_render(_render_championship_checkpoint_saved, updated)
+
+    async def _play() -> ChampionshipArchive:
+        return await resume_championship(
+            game,
+            players,
+            checkpoint,
+            on_event=on_event,
+            on_checkpoint=save_checkpoint,
+            judge_panel=judge_panel,
+        )
+
+    if lease is not None:
+        championship_task = asyncio.create_task(_play())
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            _championship_runner_lease_heartbeat(store, lease, heartbeat_stop)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {championship_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                heartbeat_error = heartbeat_task.exception()
+                if heartbeat_error is None:
+                    raise StorageError("锦标赛 runner lease 心跳意外停止")
+                raise heartbeat_error
+            championship = championship_task.result()
+        finally:
+            heartbeat_stop.set()
+            if not championship_task.done():
+                championship_task.cancel()
+            await asyncio.gather(championship_task, heartbeat_task, return_exceptions=True)
+    else:
+        championship = await _play()
+
+    if lease is not None:
+        result = store.finalize_championship_checkpoint(
+            championship.championship_id,
+            lease=lease,
+        )
+    else:
+        result = store.save_championship(championship, rating_source="engine")
     _best_effort_render(_render_championship_summary, championship)
     _best_effort_render(_render_championship_saved, championship, store, result)
 
 
 @app.command()
 def championship(
-    game: str = typer.Option(
-        "knowledge_quiz",
+    game: str | None = typer.Option(
+        None,
         "--game",
         "-g",
-        help=f"比赛项目: {', '.join(list_games('play'))}",
+        help=f"比赛项目: {', '.join(list_games('play'))}（新赛事默认 knowledge_quiz）",
     ),
-    players: str = typer.Option(
-        "mock:random,mock:fixed,mock:illegal,mock:balanced",
+    players: str | None = typer.Option(
+        None,
         "--players",
         "-p",
-        help="4、8 或 16 名非人类选手，如 profile:kimi,profile:deepseek,profile:local,...",
+        help="4、8 或 16 名非人类选手（新赛事默认四个 mock）",
     ),
     rounds: int | None = typer.Option(
         None,
@@ -2831,8 +3037,8 @@ def championship(
         max=100,
         help="题目型项目的每人题数（棋类项目不适用；默认 5）",
     ),
-    seed: int = typer.Option(
-        0,
+    seed: int | None = typer.Option(
+        None,
         "--seed",
         "-s",
         min=SQLITE_INT_MIN,
@@ -2892,6 +3098,11 @@ def championship(
         "--max-estimated-cost-usd",
         help="整项锦标赛按本地冻结价格计算的美元费用硬上限",
     ),
+    resume: str | None = typer.Option(
+        None,
+        "--resume",
+        help="从 SQLite 检查点恢复赛事 ID；比赛配置由检查点冻结",
+    ),
     database: Annotated[
         Path | None,
         typer.Option("--db", help="SQLite 文件；默认读取 LLMOLYMPIC_DB / storage.database"),
@@ -2900,55 +3111,201 @@ def championship(
     """4/8/16 名非人类选手的单淘汰制锦标赛，每场交换先后手双局赛。"""
 
     _validate_control_profile_snapshot()
-    selected_game, selected_players = _prepare_championship(
-        game_name=game,
-        player_spec=players,
-        rounds=rounds,
-        llm_timeout=llm_timeout,
-        no_llm_timeout=no_llm_timeout,
-    )
-    judge_panel = _prepare_judge_panel(
-        selected_game,
-        selected_players,
-        judge,
-        llm_timeout=llm_timeout,
-        no_llm_timeout=no_llm_timeout,
-    )
-    runtime_budget = _prepare_in_memory_budget(
-        selected_players,
-        judge_panel,
-        max_provider_calls=max_provider_calls,
-        max_input_tokens=max_input_tokens,
-        max_output_tokens_per_call=max_output_tokens_per_call,
-        max_total_output_tokens=max_total_output_tokens,
-        max_estimated_cost_usd=max_estimated_cost_usd,
-    )
-    store = _open_store(database)
+    resumed = resume is not None
+    runtime_budget: _RuntimeBudget | None = None
+    judge_panel: LLMJudgePanel | None = None
+    store: SQLiteStore | None = None
+    lease: ChampionshipRunnerLease | None = None
+    checkpoint: ChampionshipCheckpoint | None = None
     try:
-        _emit_control_event("running")
+        if resumed:
+            conflicts = [
+                option
+                for option, supplied in (
+                    ("--game", game is not None),
+                    ("--players", players is not None),
+                    ("--rounds", rounds is not None),
+                    ("--seed", seed is not None),
+                    ("--llm-timeout", llm_timeout is not None),
+                    ("--no-llm-timeout", no_llm_timeout),
+                    ("--judge", judge is not None),
+                    ("--max-provider-calls", max_provider_calls is not None),
+                    ("--max-input-tokens", max_input_tokens is not None),
+                    (
+                        "--max-output-tokens-per-call",
+                        max_output_tokens_per_call is not None,
+                    ),
+                    ("--max-total-output-tokens", max_total_output_tokens is not None),
+                    ("--max-estimated-cost-usd", max_estimated_cost_usd is not None),
+                )
+                if supplied
+            ]
+            if conflicts:
+                raise typer.BadParameter(
+                    f"使用 --resume 时不能同时指定比赛配置: {', '.join(conflicts)}；"
+                    "这些配置已由检查点冻结",
+                    param_hint="--resume",
+                )
+            if not resume.strip():
+                raise typer.BadParameter("恢复赛事 ID 不能为空", param_hint="--resume")
+            store = _open_store(database, create=False)
+            completed = store.get_championship(resume)
+            if completed is not None:
+                _best_effort_render(_render_championship_summary, completed)
+                line = Text("锦标赛 ", style="yellow")
+                line.append(literal_text(resume, max_chars=NAME_DISPLAY_LIMIT))
+                line.append(" 已完成，无需恢复，也不会重复更新。")
+                console.print(line)
+                return
+            checkpoint = store.get_championship_checkpoint(resume)
+            if checkpoint is None:
+                line = Text("未找到可恢复的锦标赛检查点：", style="red")
+                line.append(literal_text(resume, max_chars=NAME_DISPLAY_LIMIT))
+                console.print(line)
+                raise typer.Exit(code=1)
+        else:
+            selected_game, selected_players = _prepare_championship(
+                game_name=DEFAULT_TOURNAMENT_GAME if game is None else game,
+                player_spec=DEFAULT_CHAMPIONSHIP_PLAYERS if players is None else players,
+                rounds=rounds,
+                llm_timeout=llm_timeout,
+                no_llm_timeout=no_llm_timeout,
+            )
+            judge_panel = _prepare_judge_panel(
+                selected_game,
+                selected_players,
+                judge,
+                llm_timeout=llm_timeout,
+                no_llm_timeout=no_llm_timeout,
+            )
+            runtime_budget = _prepare_in_memory_budget(
+                selected_players,
+                judge_panel,
+                max_provider_calls=max_provider_calls,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens_per_call=max_output_tokens_per_call,
+                max_total_output_tokens=max_total_output_tokens,
+                max_estimated_cost_usd=max_estimated_cost_usd,
+            )
+            effective_seed = DEFAULT_TOURNAMENT_SEED if seed is None else seed
+            checkpoint = prepare_championship(
+                selected_game,
+                selected_players,
+                seed=effective_seed,
+                max_attempts=TOURNAMENT_MOVE_ATTEMPTS,
+                judge_panel=judge_panel,
+            )
+            store = _open_store(database)
+            store.save_championship_checkpoint(checkpoint)
+    except typer.BadParameter:
+        raise
+    except typer.Exit:
+        raise
+    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+        line = Text("无法创建或读取锦标赛检查点：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+
+    assert store is not None  # noqa: S101 - control-flow guard after setup branch
+    assert checkpoint is not None  # noqa: S101 - control-flow guard after setup branch
+    try:
+        claim = store.claim_championship_runner(checkpoint.championship_id)
+    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+        line = Text("无法取得锦标赛执行权：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        raise typer.Exit(code=1) from exc
+
+    checkpoint = claim.checkpoint
+    lease = claim.lease
+
+    try:
+        _best_effort_render(
+            _render_championship_checkpoint_ready, checkpoint, store, resumed
+        )
+        if checkpoint.is_complete:
+            result = store.finalize_championship_checkpoint(
+                checkpoint.championship_id,
+                lease=lease,
+            )
+            championship = store.get_championship(checkpoint.championship_id)
+            if championship is None:  # pragma: no cover - transaction contract guard
+                raise StorageError("锦标赛 checkpoint 已封存，但正式档案无法读取")
+            _best_effort_render(_render_championship_summary, championship)
+            _best_effort_render(_render_championship_saved, championship, store, result)
+            return
+        if resumed:
+            try:
+                selected_game, selected_players = _restore_championship(checkpoint)
+                judge_panel = _restore_checkpoint_judge_panel(
+                    checkpoint,
+                    selected_game,
+                    selected_players,
+                )
+            except typer.BadParameter:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise typer.BadParameter(
+                    f"无法从检查点恢复比赛配置: {exc}",
+                    param_hint="--resume",
+                ) from exc
+        _emit_control_event("running", tournament_id=checkpoint.championship_id)
         asyncio.run(
             _run_championship(
                 selected_game,
                 selected_players,
-                seed,
+                checkpoint,
                 store,
+                lease=lease,
                 judge_panel=judge_panel,
             )
         )
+    except KeyboardInterrupt as exc:
+        try:
+            latest = store.get_championship_checkpoint(checkpoint.championship_id) or checkpoint
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = checkpoint
+        _best_effort_render(_render_championship_interrupted, latest, store)
+        raise typer.Exit(code=130) from exc
     except UsageError as exc:
         _render_usage_error(exc)
+        try:
+            latest = store.get_championship_checkpoint(checkpoint.championship_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_championship_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
     except JudgePanelError as exc:
-        line = Text("评审失败，锦标赛未存档且未更新 ELO：", style="red")
+        line = Text("评审失败，锦标赛保持在最后完整检查点：", style="red")
         line.append(literal_text(exc))
         console.print(line)
+        try:
+            latest = store.get_championship_checkpoint(checkpoint.championship_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_championship_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
-    except (OSError, sqlite3.Error, StorageError) as exc:
-        line = Text("锦标赛已完成，但 SQLite 原子存档失败：", style="red")
+    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+        line = Text("锦标赛未完成：", style="red")
         line.append(literal_text(exc))
         console.print(line)
+        try:
+            latest = store.get_championship_checkpoint(checkpoint.championship_id)
+        except (OSError, sqlite3.Error, StorageError, ValueError):
+            latest = None
+        if latest is not None:
+            _best_effort_render(_render_championship_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
     finally:
+        try:
+            store.release_championship_runner(lease)
+        except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+            line = Text("警告：未能立即释放锦标赛执行权；租约过期后可恢复：", style="yellow")
+            line.append(literal_text(exc))
+            console.print(line)
         _best_effort_render(_render_usage_summary, runtime_budget)
 
 

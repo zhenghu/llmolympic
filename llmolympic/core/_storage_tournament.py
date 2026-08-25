@@ -1993,6 +1993,20 @@ class _TournamentMixin:
                 raise SeriesIdCollisionError(
                     f"series_id {series.series_id!r} 已由进行中的循环赛 checkpoint 保留"
                 )
+            championship_owner = connection.execute(
+                """
+                SELECT ccs.championship_id
+                FROM championship_checkpoint_series AS ccs
+                JOIN championship_checkpoints AS cc
+                  ON cc.championship_id = ccs.championship_id
+                WHERE cc.status = 'in_progress' AND ccs.series_id = ?
+                """,
+                (series.series_id,),
+            ).fetchone()
+            if championship_owner is not None:
+                raise SeriesIdCollisionError(
+                    f"series_id {series.series_id!r} 已由进行中的锦标赛 checkpoint 保留"
+                )
             for leg in series.legs:
                 checkpoint_match_owner = connection.execute(
                     """
@@ -2008,6 +2022,21 @@ class _TournamentMixin:
                 if checkpoint_match_owner is not None:
                     raise MatchIdCollisionError(
                         f"match_id {leg.match_id!r} 已由进行中的循环赛 checkpoint 保留"
+                    )
+                championship_match_owner = connection.execute(
+                    """
+                    SELECT ccs.championship_id
+                    FROM championship_checkpoint_series AS ccs
+                    JOIN championship_checkpoints AS cc
+                      ON cc.championship_id = ccs.championship_id
+                    WHERE cc.status = 'in_progress'
+                      AND (ccs.match_1_id = ? OR ccs.match_2_id = ?)
+                    """,
+                    (leg.match_id, leg.match_id),
+                ).fetchone()
+                if championship_match_owner is not None:
+                    raise MatchIdCollisionError(
+                        f"match_id {leg.match_id!r} 已由进行中的锦标赛 checkpoint 保留"
                     )
             existing = connection.execute(
                 """
