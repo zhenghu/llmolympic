@@ -1250,10 +1250,29 @@ def test_timeout_submission_race_is_atomic_first_write_wins(tmp_path: Path) -> N
 
 def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive = tmp_path / "archive.db"
     session = _session(archive)
     web = _web(archive)
+    original_cancel_request = InputSessionStore._cancel_request
+    cancel_attempts = 0
+
+    def contended_cancel_request(
+        current: InputSessionStore,
+        request_id: str,
+    ) -> None:
+        nonlocal cancel_attempts
+        cancel_attempts += 1
+        if cancel_attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_cancel_request(current, request_id)
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_cancel_request",
+        contended_cancel_request,
+    )
 
     async def scenario() -> None:
         cancelled = asyncio.create_task(session.resolve("first", timeout_seconds=1.0))
@@ -1261,6 +1280,7 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
         cancelled.cancel()
         with pytest.raises(asyncio.CancelledError):
             await cancelled
+        assert cancel_attempts == 2
         assert _error_code(
             lambda: _submit(
                 web,
@@ -1284,6 +1304,40 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
 
     try:
         asyncio.run(scenario())
+    finally:
+        session.close()
+
+
+def test_cancel_request_surfaces_non_contention_sqlite_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session(tmp_path / "cancel-failure.db", heartbeat_seconds=59.0)
+
+    class FailingConnection:
+        rolled_back = False
+        closed = False
+
+        def execute(self, _statement: str, _parameters=()):
+            raise sqlite3.OperationalError("malformed database schema")
+
+        def rollback(self) -> None:
+            self.rolled_back = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+    monkeypatch.setattr(session, "_owner_connection", lambda: connection)
+
+    try:
+        with pytest.raises(HumanInputError) as caught:
+            session._cancel_request("a" * 32)
+        assert caught.value.code == "input_unavailable"
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+        assert str(caught.value.__cause__) == "malformed database schema"
+        assert connection.rolled_back
+        assert connection.closed
     finally:
         session.close()
 

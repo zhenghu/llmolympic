@@ -609,7 +609,14 @@ class InputSessionStore:
                 details={"timeout_seconds": timeout_seconds},
             ) from exc
         except asyncio.CancelledError:
-            await asyncio.to_thread(self._cancel_request, request_id)
+            try:
+                await asyncio.to_thread(
+                    self._retry_sqlite_contention,
+                    lambda: self._cancel_request(request_id),
+                )
+            except HumanInputError:
+                # Cleanup remains best-effort and must not replace cancellation.
+                pass
             raise
 
     def _create_request(
@@ -839,10 +846,7 @@ class InputSessionStore:
             _secure_file(self.path)
 
     def _cancel_request(self, request_id: str) -> None:
-        try:
-            connection = self._owner_connection()
-        except HumanInputError:
-            return
+        connection = self._owner_connection()
         now = float(self._clock())
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -862,8 +866,9 @@ class InputSessionStore:
                 ),
             )
             connection.commit()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             connection.rollback()
+            raise HumanInputError("input_unavailable") from exc
         finally:
             connection.close()
             try:
