@@ -710,6 +710,296 @@ class _LiveRun:
         self.close()
 
 
+def _championship_public_name(descriptor: Mapping[str, object]) -> str:
+    display_name = descriptor.get("display_name")
+    if isinstance(display_name, str) and display_name:
+        return display_name
+    name = descriptor.get("name")
+    if not isinstance(name, str) or not name:  # pragma: no cover - model contract guard
+        raise ValueError("championship player has no public name")
+    return name
+
+
+def _championship_pairing_context(
+    checkpoint: ChampionshipCheckpoint,
+    pairing_number: int,
+    leg_number: int,
+) -> dict[str, int]:
+    """Return the complete Live v2 placement for one championship match event."""
+
+    if leg_number not in {1, 2}:
+        raise ValueError("championship leg_number must be one or two")
+    if not 1 <= pairing_number <= len(checkpoint.schedule):
+        raise ValueError("championship pairing_number is outside the frozen bracket")
+    spec = checkpoint.schedule[pairing_number - 1]
+    if spec.pairing_number != pairing_number:
+        raise ValueError("championship schedule is not in canonical pairing order")
+    round_specs = tuple(
+        candidate
+        for candidate in checkpoint.schedule
+        if candidate.round_number == spec.round_number
+    )
+    round_pairing_number = next(
+        index
+        for index, candidate in enumerate(round_specs, start=1)
+        if candidate.pairing_number == pairing_number
+    )
+    return {
+        "round_number": spec.round_number,
+        "round_count": len(checkpoint.players).bit_length() - 1,
+        "round_pairing_number": round_pairing_number,
+        "round_pairing_count": len(round_specs),
+        "pairing_number": pairing_number,
+        "pairing_count": len(checkpoint.schedule),
+        "leg_number": leg_number,
+    }
+
+
+def _championship_series_live_entry(
+    checkpoint: ChampionshipCheckpoint,
+    pairing_number: int,
+    series: SeriesArchive | None = None,
+) -> dict[str, object]:
+    """Project one committed two-leg result without exposing Provider identity."""
+
+    if series is None:
+        series = checkpoint.completed_series[pairing_number - 1]
+    first, second = series.players
+    first_name = first["name"]
+    second_name = second["name"]
+    first_points = series.points[first_name]
+    second_points = series.points[second_name]
+    if first_points > second_points:
+        winner = first
+    elif second_points > first_points:
+        winner = second
+    else:
+        first_technical = series.standings[first_name].technical_losses
+        second_technical = series.standings[second_name].technical_losses
+        if first_technical < second_technical:
+            winner = first
+        elif second_technical < first_technical:
+            winner = second
+        else:
+            winner = first if first["entrant_id"] < second["entrant_id"] else second
+    return {
+        "context": _championship_pairing_context(checkpoint, pairing_number, 2),
+        "players": (
+            _championship_public_name(first),
+            _championship_public_name(second),
+        ),
+        "winner": _championship_public_name(winner),
+        "series_id": series.series_id,
+        "match_ids": tuple(leg.match_id for leg in series.legs),
+    }
+
+
+def _championship_checkpoint_live_bracket(
+    checkpoint: ChampionshipCheckpoint,
+) -> tuple[dict[str, object], ...]:
+    bracket: list[dict[str, object]] = []
+    for pairing_number in range(1, len(checkpoint.completed_series) + 1):
+        entry = _championship_series_live_entry(checkpoint, pairing_number)
+        context = entry["context"]
+        if not isinstance(context, Mapping):  # pragma: no cover - internal contract guard
+            raise TypeError("championship live context is invalid")
+        bracket.append(
+            {
+                "round_number": context["round_number"],
+                "round_pairing_number": context["round_pairing_number"],
+                "pairing_number": context["pairing_number"],
+                "players": entry["players"],
+                "winner": entry["winner"],
+                "series_id": entry["series_id"],
+                "match_ids": entry["match_ids"],
+                "status": "committed",
+            }
+        )
+    return tuple(bracket)
+
+
+def _championship_archive_match_ids(
+    championship: ChampionshipArchive,
+) -> tuple[str, ...]:
+    return tuple(
+        leg.match_id
+        for pairing in championship.pairings
+        for leg in pairing.series.legs
+    )
+
+
+def _championship_checkpoint_match_ids(
+    checkpoint: ChampionshipCheckpoint,
+) -> tuple[str, ...]:
+    return tuple(
+        leg.match_id
+        for series in checkpoint.completed_series
+        for leg in series.legs
+    )
+
+
+class _ChampionshipLiveRun:
+    """Failure-isolated Live v2 publisher for one resumable championship run."""
+
+    def __init__(self, database: str | Path, checkpoint: ChampionshipCheckpoint) -> None:
+        self._publisher: LivePublisher | None = None
+        self._live_id: str | None = None
+        self._terminal = False
+        self._warned = False
+        self._championship_id = checkpoint.championship_id
+        self._game = checkpoint.game
+        self._players: tuple[str, ...] = ()
+        self._initial_bracket: tuple[dict[str, object], ...] = ()
+        try:
+            self._players = tuple(
+                _championship_public_name(descriptor) for descriptor in checkpoint.players
+            )
+            self._initial_bracket = _championship_checkpoint_live_bracket(checkpoint)
+            self._publisher = LivePublisher(database, "championship")
+            if self._publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - live observation is strictly non-critical
+            self._warn_once()
+
+    def _warn_once(self) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        _render_live_warning()
+
+    def observe(self, event: MatchEvent, *, context: Mapping[str, object]) -> None:
+        publisher = self._publisher
+        if publisher is None or self._terminal:
+            return
+        try:
+            if publisher.failed:
+                self._warn_once()
+                return
+            if self._live_id is None:
+                if event.type != EventType.MATCH_STARTED:
+                    return
+                self._live_id = publisher.start_session(
+                    event,
+                    context,
+                    players=self._players,
+                    game=self._game,
+                    championship_id=self._championship_id,
+                    initial_bracket=self._initial_bracket,
+                )
+                success = self._live_id is not None
+                if success:
+                    _emit_control_event("live_started", live_id=self._live_id)
+            else:
+                success = publisher.publish(self._live_id, event, context=context)
+            if not success or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - publisher failures must not escape callbacks
+            self._warn_once()
+
+    def pairing_completed(
+        self,
+        checkpoint: ChampionshipCheckpoint,
+        pairing_number: int,
+        series: SeriesArchive,
+    ) -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            entry = _championship_series_live_entry(
+                checkpoint,
+                pairing_number,
+                series,
+            )
+            success = publisher.publish_pairing_completed(
+                self._live_id,
+                context=entry["context"],
+                players=entry["players"],
+                winner=entry["winner"],
+                series_id=entry["series_id"],
+                match_ids=entry["match_ids"],
+            )
+            if not success or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - provisional display cannot affect persistence
+            self._warn_once()
+
+    def round_committed(self, *, context: Mapping[str, object]) -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            success = publisher.publish_round_committed(
+                self._live_id,
+                context=context,
+            )
+            if not success or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - committed display cannot affect persistence
+            self._warn_once()
+
+    def checkpoint_round_committed(self, checkpoint: ChampionshipCheckpoint) -> None:
+        """Publish only after the caller durably saves the whole-round checkpoint."""
+
+        try:
+            self.round_committed(
+                context=_championship_pairing_context(
+                    checkpoint,
+                    len(checkpoint.completed_series),
+                    2,
+                )
+            )
+        except Exception:  # noqa: BLE001 - projection cannot affect checkpoint writes
+            self._warn_once()
+
+    def complete(
+        self,
+        championship: ChampionshipArchive,
+        *,
+        final_match_ids: Sequence[str],
+    ) -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            self._terminal = publisher.complete(
+                self._live_id,
+                final_kind="championship",
+                final_id=championship.championship_id,
+                final_match_ids=final_match_ids,
+                champion=championship.champion,
+            )
+            if not self._terminal or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - archive success cannot depend on live completion
+            self._warn_once()
+
+    def interrupt(self, reason_code: str = "producer_failed") -> None:
+        publisher = self._publisher
+        if publisher is None or self._live_id is None or self._terminal:
+            return
+        try:
+            self._terminal = publisher.interrupt(
+                self._live_id,
+                reason_code=reason_code,
+            )
+            if not self._terminal or publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - interruption is a best-effort status signal
+            self._warn_once()
+
+    def close(self) -> None:
+        publisher = self._publisher
+        if publisher is None:
+            return
+        try:
+            publisher.close()
+            if publisher.failed:
+                self._warn_once()
+        except Exception:  # noqa: BLE001 - cleanup cannot change championship semantics
+            self._warn_once()
+
+
 def _best_effort_render(render: Callable[..., None], *args: object) -> None:
     """执行非关键渲染，确保显示异常不会改变比赛与持久化语义。"""
 
@@ -2942,6 +3232,7 @@ async def _run_championship(
     players: list[Player],
     checkpoint: ChampionshipCheckpoint,
     store: SQLiteStore,
+    live: _ChampionshipLiveRun,
     lease: ChampionshipRunnerLease | None = None,
     judge_panel: LLMJudgePanel | None = None,
 ) -> None:
@@ -2979,10 +3270,25 @@ async def _run_championship(
     def on_event(pairing_number: int, leg_number: int, event: MatchEvent) -> None:
         _emit_control_event("progress")
         guarded_render_pairing(pairing_number, leg_number, event)
+        live.observe(
+            event,
+            context=_championship_pairing_context(
+                checkpoint,
+                pairing_number,
+                leg_number,
+            ),
+        )
+
+    def on_pairing_completed(
+        pairing_number: int,
+        series: SeriesArchive,
+    ) -> None:
+        live.pairing_completed(checkpoint, pairing_number, series)
 
     def save_checkpoint(updated: ChampionshipCheckpoint) -> None:
         if lease is not None:
             store.save_championship_checkpoint(updated, lease=lease)
+            live.checkpoint_round_committed(updated)
         _best_effort_render(_render_championship_checkpoint_saved, updated)
 
     async def _play() -> ChampionshipArchive:
@@ -2991,6 +3297,7 @@ async def _run_championship(
             players,
             checkpoint,
             on_event=on_event,
+            on_pairing_completed=on_pairing_completed,
             on_checkpoint=save_checkpoint,
             judge_panel=judge_panel,
         )
@@ -3020,6 +3327,13 @@ async def _run_championship(
     else:
         championship = await _play()
 
+    championship_match_ids = _championship_archive_match_ids(championship)
+    _emit_control_event(
+        "finalizing",
+        final_kind="championship",
+        final_id=championship.championship_id,
+        final_match_ids=list(championship_match_ids),
+    )
     if lease is not None:
         result = store.finalize_championship_checkpoint(
             championship.championship_id,
@@ -3027,6 +3341,16 @@ async def _run_championship(
         )
     else:
         result = store.save_championship(championship, rating_source="engine")
+    live.complete(
+        championship,
+        final_match_ids=championship_match_ids,
+    )
+    _emit_control_event(
+        "completed",
+        final_kind="championship",
+        final_id=championship.championship_id,
+        final_match_ids=list(championship_match_ids),
+    )
     _best_effort_render(_render_championship_summary, championship)
     _best_effort_render(_render_championship_saved, championship, store, result)
 
@@ -3134,6 +3458,7 @@ def championship(
     store: SQLiteStore | None = None
     lease: ChampionshipRunnerLease | None = None
     checkpoint: ChampionshipCheckpoint | None = None
+    live: _ChampionshipLiveRun | None = None
     try:
         if resumed:
             conflicts = [
@@ -3168,6 +3493,23 @@ def championship(
             store = _open_store(database, create=False)
             completed = store.get_championship(resume)
             if completed is not None:
+                final_match_ids = _championship_archive_match_ids(completed)
+                _emit_control_event(
+                    "running",
+                    championship_id=completed.championship_id,
+                )
+                _emit_control_event(
+                    "finalizing",
+                    final_kind="championship",
+                    final_id=completed.championship_id,
+                    final_match_ids=list(final_match_ids),
+                )
+                _emit_control_event(
+                    "completed",
+                    final_kind="championship",
+                    final_id=completed.championship_id,
+                    final_match_ids=list(final_match_ids),
+                )
                 _best_effort_render(_render_championship_summary, completed)
                 line = Text("锦标赛 ", style="yellow")
                 line.append(literal_text(resume, max_chars=NAME_DISPLAY_LIMIT))
@@ -3297,10 +3639,22 @@ def championship(
         raise typer.Exit(code=1) from exc
 
     try:
+        _emit_control_event(
+            "running",
+            championship_id=checkpoint.championship_id,
+        )
+        live = _ChampionshipLiveRun(store.path, checkpoint)
         _best_effort_render(
             _render_championship_checkpoint_ready, checkpoint, store, resumed
         )
         if checkpoint.is_complete:
+            final_match_ids = _championship_checkpoint_match_ids(checkpoint)
+            _emit_control_event(
+                "finalizing",
+                final_kind="championship",
+                final_id=checkpoint.championship_id,
+                final_match_ids=list(final_match_ids),
+            )
             result = store.finalize_championship_checkpoint(
                 checkpoint.championship_id,
                 lease=lease,
@@ -3308,6 +3662,19 @@ def championship(
             championship = store.get_championship(checkpoint.championship_id)
             if championship is None:  # pragma: no cover - transaction contract guard
                 raise StorageError("锦标赛 checkpoint 已封存，但正式档案无法读取")
+            archived_match_ids = _championship_archive_match_ids(championship)
+            if archived_match_ids != final_match_ids:
+                raise StorageError("锦标赛正式档案的对局顺序与 checkpoint 不一致")
+            live.complete(
+                championship,
+                final_match_ids=final_match_ids,
+            )
+            _emit_control_event(
+                "completed",
+                final_kind="championship",
+                final_id=championship.championship_id,
+                final_match_ids=list(final_match_ids),
+            )
             _best_effort_render(_render_championship_summary, championship)
             _best_effort_render(_render_championship_saved, championship, store, result)
             return
@@ -3333,13 +3700,14 @@ def championship(
                 runtime_budget.resolved,
                 runtime_budget.ledger,
             )
-        _emit_control_event("running", tournament_id=checkpoint.championship_id)
+        assert live is not None  # noqa: S101 - initialized before all execution paths
         asyncio.run(
             _run_championship(
                 selected_game,
                 selected_players,
                 checkpoint,
                 store,
+                live,
                 lease=lease,
                 judge_panel=judge_panel,
             )
@@ -3383,6 +3751,9 @@ def championship(
             _best_effort_render(_render_championship_interrupted, latest, store)
         raise typer.Exit(code=1) from exc
     finally:
+        if live is not None:
+            live.interrupt()
+            live.close()
         try:
             store.release_championship_runner(lease)
         except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:

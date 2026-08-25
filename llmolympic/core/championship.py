@@ -54,6 +54,7 @@ _SEED_DOMAIN = b"llmolympic.championship-round-seed-v1\0"
 
 ChampionshipSource = Literal["local_engine", "external"]
 ChampionshipEventCallback = Callable[[int, int, MatchEvent], None]
+ChampionshipPairingCallback = Callable[[int, SeriesArchive], None]
 ChampionshipCheckpointCallback = Callable[["ChampionshipCheckpoint"], None]
 
 
@@ -918,6 +919,7 @@ async def resume_championship(
     checkpoint: ChampionshipCheckpoint,
     *,
     on_event: ChampionshipEventCallback | None = None,
+    on_pairing_completed: ChampionshipPairingCallback | None = None,
     on_checkpoint: ChampionshipCheckpointCallback | None = None,
     judge_panel: LLMJudgePanel | None = None,
 ) -> ChampionshipArchive:
@@ -1004,6 +1006,8 @@ async def resume_championship(
                 descriptors, archive, first_index, second_index
             )
             round_winners.append(winner_index)
+            if on_pairing_completed is not None:
+                on_pairing_completed(pairing_number, archive)
         series_archives.extend(round_series)
         winners = round_winners
         current = championship_checkpoint_with_series(
@@ -1056,14 +1060,16 @@ async def play_championship(
     *,
     championship_id: str | None = None,
     judge_panel: LLMJudgePanel | None = None,
+    on_pairing_completed: ChampionshipPairingCallback | None = None,
     on_checkpoint: ChampionshipCheckpointCallback | None = None,
 ) -> ChampionshipArchive:
     """Play one single-elimination knockout bracket of swapped-order series.
 
-    If ``on_checkpoint`` is supplied, it is invoked after each whole round is
-    resolved with an up-to-date :class:`ChampionshipCheckpoint`.  The
-    ``championship_id`` anchors the checkpoint identity so a consumer can
-    persist progress between rounds.
+    ``on_pairing_completed`` is invoked after each two-leg series and before
+    the next pairing starts.  If ``on_checkpoint`` is supplied, it is invoked
+    after each whole round is resolved with an up-to-date
+    :class:`ChampionshipCheckpoint`.  The ``championship_id`` anchors the
+    checkpoint identity so a consumer can persist progress between rounds.
     """
 
     checkpoint = prepare_championship(
@@ -1079,6 +1085,7 @@ async def play_championship(
         players,
         checkpoint,
         on_event=on_event,
+        on_pairing_completed=on_pairing_completed,
         on_checkpoint=on_checkpoint,
         judge_panel=judge_panel,
     )

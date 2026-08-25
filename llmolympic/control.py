@@ -34,6 +34,7 @@ from pydantic import (
 )
 
 from llmolympic.config import ProviderProfile, load_profiles
+from llmolympic.core.championship import ChampionshipCheckpoint
 from llmolympic.core.game import (
     MAX_PLATFORM_PLAYERS,
     describe_game_config,
@@ -41,11 +42,12 @@ from llmolympic.core.game import (
 )
 from llmolympic.core.storage import SCHEMA_VERSION
 from llmolympic.core.tournament import TournamentCheckpoint
+from llmolympic.core.usage import ProviderBudgetPolicy, UsageValidationError
 from llmolympic.games import GAME_REGISTRY, create_game, game_supports_mode
 from llmolympic.providers.base import validate_base_url
 from llmolympic.web.models import API_VERSION, GameInfo
 
-CONTROL_SCHEMA_VERSION = 1
+CONTROL_SCHEMA_VERSION = 2
 MAX_PREPARED_JOBS = 1
 MAX_CONTROL_BODY_BYTES = 32 * 1024
 JOB_RETENTION_SECONDS = 24 * 60 * 60
@@ -54,7 +56,7 @@ MAX_UNCONFIRMED_TOURNAMENT_MATCHES = 30
 MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS = 5_000
 TOURNAMENT_MOVE_ATTEMPTS = 3
 
-ControlMode = Literal["play", "series", "round_robin"]
+ControlMode = Literal["play", "series", "round_robin", "championship"]
 ControlJobStatus = Literal[
     "prepared",
     "starting",
@@ -66,7 +68,7 @@ ControlJobStatus = Literal[
     "failed",
     "interrupted",
 ]
-ControlFinalKind = Literal["match", "series", "tournament"]
+ControlFinalKind = Literal["match", "series", "tournament", "championship"]
 ControlFailureCode = Literal[
     "controller_restarted",
     "worker_failed",
@@ -91,9 +93,44 @@ _BIDI_CONTROLS = frozenset(
 _SQLITE_INT_MIN = -(2**63)
 _SQLITE_INT_MAX = 2**63 - 1
 _MAX_COST_USD = Decimal(1_000_000)
-_MOCK_PLAYER_STRATEGIES = ("random", "fixed", "illegal")
+_MOCK_PLAYER_STRATEGIES = ("random", "fixed", "illegal", "balanced")
 _MOCK_JUDGE_STRATEGIES = ("strict", "balanced", "lenient")
 _TERMINAL_STATUSES = frozenset({"cancelled", "completed", "failed", "interrupted"})
+_CONTROL_JOBS_V1_COLUMNS = (
+    ("job_id", "TEXT", 0, None, 1),
+    ("prepare_key", "TEXT", 1, None, 0),
+    ("request_digest", "TEXT", 1, None, 0),
+    ("spec_json", "TEXT", 1, None, 0),
+    ("preview_json", "TEXT", 1, None, 0),
+    ("status", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+    ("started_at", "TEXT", 0, None, 0),
+    ("finished_at", "TEXT", 0, None, 0),
+    ("live_id", "TEXT", 0, None, 0),
+    ("tournament_id", "TEXT", 0, None, 0),
+    ("final_kind", "TEXT", 0, None, 0),
+    ("final_id", "TEXT", 0, None, 0),
+    ("final_match_ids_json", "TEXT", 1, "'[]'", 0),
+    ("failure_code", "TEXT", 0, None, 0),
+    ("child_pid", "INTEGER", 0, None, 0),
+)
+_CONTROL_JOBS_V2_COLUMNS = (
+    *_CONTROL_JOBS_V1_COLUMNS[:12],
+    ("championship_id", "TEXT", 0, None, 0),
+    *_CONTROL_JOBS_V1_COLUMNS[12:],
+)
+_CONTROL_JOBS_V2_MIGRATED_COLUMNS = (
+    *_CONTROL_JOBS_V1_COLUMNS,
+    ("championship_id", "TEXT", 0, None, 0),
+)
+_CONTROL_OPERATIONS_COLUMNS = (
+    ("idempotency_key", "TEXT", 0, None, 1),
+    ("job_id", "TEXT", 1, None, 0),
+    ("operation", "TEXT", 1, None, 0),
+    ("request_digest", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+)
 
 
 class ControlError(RuntimeError):
@@ -134,7 +171,7 @@ def _canonical_integer(value: str, *, minimum: int, maximum: int) -> str:
 class ControlPlayerSpec(_ControlModel):
     kind: Literal["human", "mock", "profile"]
     name: str | None = None
-    strategy: Literal["random", "fixed", "illegal"] | None = None
+    strategy: Literal["random", "fixed", "illegal", "balanced"] | None = None
     profile_id: str | None = None
 
     @model_validator(mode="after")
@@ -268,6 +305,7 @@ class ControlJobSpec(_ControlModel):
     budget: ControlBudgetSpec = ControlBudgetSpec()
     allow_large_tournament: bool = False
     resume_tournament_id: str | None = None
+    resume_championship_id: str | None = None
 
     @field_validator("seed")
     @classmethod
@@ -290,9 +328,19 @@ class ControlJobSpec(_ControlModel):
 
     @model_validator(mode="after")
     def validate_semantics(self) -> Self:
-        if self.resume_tournament_id is not None:
-            if self.mode != "round_robin" or _SAFE_ID_RE.fullmatch(self.resume_tournament_id) is None:
-                raise ValueError("only round_robin can resume a safe tournament ID")
+        resume_id = (
+            self.resume_tournament_id
+            if self.resume_tournament_id is not None
+            else self.resume_championship_id
+        )
+        if self.resume_tournament_id is not None and self.resume_championship_id is not None:
+            raise ValueError("only one competition checkpoint can be resumed")
+        if resume_id is not None:
+            expected_mode = (
+                "round_robin" if self.resume_tournament_id is not None else "championship"
+            )
+            if self.mode != expected_mode or _SAFE_ID_RE.fullmatch(resume_id) is None:
+                raise ValueError(f"only {expected_mode} can resume its safe competition ID")
             if (
                 self.players
                 or self.judges
@@ -309,12 +357,15 @@ class ControlJobSpec(_ControlModel):
 
         if not self.game or len(self.players) < 2:
             raise ValueError("new jobs require a game and at least two players")
-        if not game_supports_mode(self.game, self.mode):
+        game_mode = "play" if self.mode == "championship" else self.mode
+        if not game_supports_mode(self.game, game_mode):
             raise ValueError("game does not support selected mode")
         if self.mode == "series" and len(self.players) != 2:
             raise ValueError("series requires exactly two players")
         if self.mode == "round_robin" and not 3 <= len(self.players) <= MAX_PLATFORM_PLAYERS:
             raise ValueError("round_robin requires 3-16 players")
+        if self.mode == "championship" and len(self.players) not in {4, 8, 16}:
+            raise ValueError("championship requires exactly 4, 8, or 16 players")
         if self.mode != "play" and any(player.kind == "human" for player in self.players):
             raise ValueError("human players are supported only in play mode")
         identities = [player.identity_key() for player in self.players]
@@ -333,8 +384,8 @@ class ControlJobSpec(_ControlModel):
         kwargs: dict[str, int] = {}
         if self.rounds is not None:
             kwargs["rounds"] = self.rounds
-        game = create_game(self.game, mode=self.mode, **kwargs)
-        validate_player_count(game, len(self.players))
+        game = create_game(self.game, mode=game_mode, **kwargs)
+        validate_player_count(game, 2 if self.mode == "championship" else len(self.players))
         return self
 
     def uses_profiles(self) -> bool:
@@ -527,6 +578,7 @@ class ControlJob(_ControlModel):
     finished_at: str | None = None
     live_id: str | None = None
     tournament_id: str | None = None
+    championship_id: str | None = None
     final_kind: ControlFinalKind | None = None
     final_id: str | None = None
     final_match_ids: Annotated[tuple[str, ...], Field(max_length=4096)] = ()
@@ -543,7 +595,7 @@ class ControlJob(_ControlModel):
             raise ValueError("job ID is invalid")
         return value
 
-    @field_validator("live_id", "tournament_id", "final_id")
+    @field_validator("live_id", "tournament_id", "championship_id", "final_id")
     @classmethod
     def validate_optional_id(cls, value: str | None) -> str | None:
         if value is not None and _SAFE_ID_RE.fullmatch(value) is None:
@@ -576,13 +628,34 @@ class ControlJob(_ControlModel):
             raise ValueError("series result must reference two match archives")
         if self.final_kind == "tournament" and not self.final_match_ids:
             raise ValueError("tournament result must reference match archives")
+        if self.final_kind == "championship" and not self.final_match_ids:
+            raise ValueError("championship result must reference match archives")
+        if self.final_kind == "championship" and (
+            len(self.final_match_ids) not in {6, 14, 30}
+            or len(self.final_match_ids) != self.preview.match_count
+        ):
+            raise ValueError(
+                "championship result must contain every canonical bracket match"
+            )
         expected_kind = {
             "play": "match",
             "series": "series",
             "round_robin": "tournament",
+            "championship": "championship",
         }[self.spec.mode]
         if self.final_kind is not None and self.final_kind != expected_kind:
             raise ValueError("final result kind does not match the job mode")
+        if self.final_kind == "championship" and (
+            self.championship_id is None or self.final_id != self.championship_id
+        ):
+            raise ValueError("championship result must match the running championship ID")
+        if self.spec.mode == "round_robin":
+            if self.championship_id is not None:
+                raise ValueError("round_robin jobs cannot carry a championship ID")
+        elif self.tournament_id is not None:
+            raise ValueError("only round_robin jobs can carry a tournament ID")
+        if self.spec.mode != "championship" and self.championship_id is not None:
+            raise ValueError("only championship jobs can carry a championship ID")
         return self
 
 
@@ -751,8 +824,8 @@ class JobStore:
                     pass
 
     @staticmethod
-    def _initialize(connection: sqlite3.Connection) -> None:
-        connection.executescript(
+    def _create_current_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS control_jobs (
                 job_id TEXT PRIMARY KEY,
@@ -767,6 +840,7 @@ class JobStore:
                 finished_at TEXT,
                 live_id TEXT,
                 tournament_id TEXT,
+                championship_id TEXT,
                 final_kind TEXT,
                 final_id TEXT,
                 final_match_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -776,7 +850,11 @@ class JobStore:
                     'prepared','starting','running','finalizing','cancel_requested',
                     'cancelled','completed','failed','interrupted'
                 ))
-            );
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS control_operations (
                 idempotency_key TEXT PRIMARY KEY,
                 job_id TEXT NOT NULL,
@@ -784,13 +862,122 @@ class JobStore:
                 request_digest TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (job_id) REFERENCES control_jobs(job_id)
-            );
+            )
             """
         )
+
+    @staticmethod
+    def _initialize(connection: sqlite3.Connection) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, CONTROL_SCHEMA_VERSION):
+        if version not in (0, 1, CONTROL_SCHEMA_VERSION):
             raise ControlError("control_unavailable")
-        connection.execute(f"PRAGMA user_version={CONTROL_SCHEMA_VERSION}")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if version == 1:
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_schema "
+                        "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                    )
+                }
+                job_columns = tuple(
+                    tuple(row[1:])
+                    for row in connection.execute("PRAGMA table_info(control_jobs)")
+                )
+                operation_columns = tuple(
+                    tuple(row[1:])
+                    for row in connection.execute("PRAGMA table_info(control_operations)")
+                )
+                operation_foreign_keys = tuple(
+                    tuple(row[2:])
+                    for row in connection.execute(
+                        "PRAGMA foreign_key_list(control_operations)"
+                    )
+                )
+                job_indexes = tuple(
+                    sorted(
+                        (row["unique"], row["origin"], row["partial"])
+                        for row in connection.execute("PRAGMA index_list(control_jobs)")
+                    )
+                )
+                operation_indexes = tuple(
+                    sorted(
+                        (row["unique"], row["origin"], row["partial"])
+                        for row in connection.execute(
+                            "PRAGMA index_list(control_operations)"
+                        )
+                    )
+                )
+                if (
+                    tables != {"control_jobs", "control_operations"}
+                    or job_columns != _CONTROL_JOBS_V1_COLUMNS
+                    or operation_columns != _CONTROL_OPERATIONS_COLUMNS
+                    or operation_foreign_keys
+                    != (("control_jobs", "job_id", "job_id", "NO ACTION", "NO ACTION", "NONE"),)
+                    or job_indexes != ((1, "pk", 0), (1, "u", 0))
+                    or operation_indexes != ((1, "pk", 0),)
+                ):
+                    raise ControlError("control_unavailable")
+                legacy_rows = connection.execute(
+                    "SELECT job_id, spec_json, request_digest FROM control_jobs"
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    raw_spec = legacy_row["spec_json"]
+                    if (
+                        not isinstance(raw_spec, str)
+                        or hashlib.sha256(raw_spec.encode()).hexdigest()
+                        != legacy_row["request_digest"]
+                    ):
+                        raise ControlError("control_unavailable")
+                    legacy_payload = json.loads(
+                        raw_spec,
+                        parse_constant=_reject_nonfinite_json,
+                    )
+                    if (
+                        not isinstance(legacy_payload, dict)
+                        or "resume_championship_id" in legacy_payload
+                    ):
+                        raise ControlError("control_unavailable")
+                    legacy_payload["resume_championship_id"] = None
+                    normalized_spec = ControlJobSpec.model_validate(legacy_payload)
+                    normalized_json = _canonical_json(
+                        normalized_spec.model_dump(mode="json")
+                    )
+                    connection.execute(
+                        "UPDATE control_jobs SET spec_json = ?, request_digest = ? "
+                        "WHERE job_id = ?",
+                        (
+                            normalized_json,
+                            hashlib.sha256(normalized_json.encode()).hexdigest(),
+                            legacy_row["job_id"],
+                        ),
+                    )
+                connection.execute(
+                    "ALTER TABLE control_jobs ADD COLUMN championship_id TEXT"
+                )
+            JobStore._create_current_schema(connection)
+            current_columns = tuple(
+                tuple(row[1:])
+                for row in connection.execute("PRAGMA table_info(control_jobs)")
+            )
+            current_operation_columns = tuple(
+                tuple(row[1:])
+                for row in connection.execute("PRAGMA table_info(control_operations)")
+            )
+            if (
+                current_columns
+                not in {_CONTROL_JOBS_V2_COLUMNS, _CONTROL_JOBS_V2_MIGRATED_COLUMNS}
+                or current_operation_columns != _CONTROL_OPERATIONS_COLUMNS
+            ):
+                raise ControlError("control_unavailable")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ControlError("control_unavailable")
+            connection.execute(f"PRAGMA user_version={CONTROL_SCHEMA_VERSION}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def _row_to_job(self, row: sqlite3.Row) -> ControlJob:
         try:
@@ -800,11 +987,20 @@ class JobStore:
             resumable = False
             if (
                 row["status"] in {"cancelled", "failed", "interrupted"}
-                and spec.mode == "round_robin"
-                and row["tournament_id"] is not None
+                and spec.mode in {"round_robin", "championship"}
             ):
+                resume_id = (
+                    row["tournament_id"]
+                    if spec.mode == "round_robin"
+                    else row["championship_id"]
+                )
                 try:
-                    _resume_preview(self.archive_database, row["tournament_id"])
+                    if resume_id is None:
+                        raise ControlError("resume_unavailable")
+                    if spec.mode == "round_robin":
+                        _resume_preview(self.archive_database, resume_id)
+                    else:
+                        _resume_championship_preview(self.archive_database, resume_id)
                 except ControlError:
                     pass
                 else:
@@ -820,6 +1016,7 @@ class JobStore:
                 finished_at=row["finished_at"],
                 live_id=row["live_id"],
                 tournament_id=row["tournament_id"],
+                championship_id=row["championship_id"],
                 final_kind=row["final_kind"],
                 final_id=row["final_id"],
                 final_match_ids=tuple(final_ids),
@@ -1013,6 +1210,7 @@ class JobStore:
         finished_at: str | None = None,
         live_id: str | None = None,
         tournament_id: str | None = None,
+        championship_id: str | None = None,
         final_kind: ControlFinalKind | None = None,
         final_id: str | None = None,
         final_match_ids: Sequence[str] | None = None,
@@ -1030,6 +1228,7 @@ class JobStore:
             ("finished_at", finished_at),
             ("live_id", live_id),
             ("tournament_id", tournament_id),
+            ("championship_id", championship_id),
             ("final_kind", final_kind),
             ("final_id", final_id),
             ("failure_code", failure_code),
@@ -1140,10 +1339,12 @@ def control_catalog() -> ControlCatalogResponse:
     games: list[ControlGameInfo] = []
     for name, game_class in sorted(GAME_REGISTRY.items()):
         declared_maximum = getattr(game_class, "max_players", None)
+        game_info = GameInfo.from_game(name, game_class)
+        supported_modes: tuple[ControlMode, ...] = tuple(game_info.supported_modes)
         games.append(
             ControlGameInfo(
                 name=name,
-                supported_modes=GameInfo.from_game(name, game_class).supported_modes,
+                supported_modes=supported_modes,
                 requires_judge_panel=bool(
                     getattr(game_class, "requires_judge_panel", False)
                 ),
@@ -1375,6 +1576,333 @@ def _resume_preview(
         connection.close()
 
 
+def _resume_championship_preview(
+    archive_database: str | Path,
+    championship_id: str,
+) -> ControlPreview:
+    """Read and validate one knockout checkpoint without mutating the archive DB."""
+
+    try:
+        path = Path(archive_database).expanduser().resolve(strict=False)
+        if not path.is_file():
+            raise ControlError("resume_unavailable")
+        uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+        connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=2.0,
+            isolation_level=None,
+        )
+    except ControlError:
+        raise
+    except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise ControlError("resume_unavailable") from exc
+
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=2000")
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise ControlError("resume_unavailable")
+        for table_name in (
+            "championship_checkpoints",
+            "championship_checkpoint_series",
+            "championship_runner_leases",
+            "provider_budgets",
+        ):
+            table = connection.execute(
+                "SELECT type FROM sqlite_schema WHERE name = ?",
+                (table_name,),
+            ).fetchone()
+            if table is None or table["type"] != "table":
+                raise ControlError("resume_unavailable")
+
+        row = connection.execute(
+            """
+            SELECT championship_id, game, seed, players_json, game_config_json,
+                   schedule_json, max_attempts, pairing_count, created_at,
+                   updated_at, status, finalized_at, final_championship_id,
+                   config_json
+            FROM championship_checkpoints
+            WHERE championship_id = ?
+            """,
+            (championship_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "in_progress"
+            or row["finalized_at"] is not None
+            or row["final_championship_id"] is not None
+        ):
+            raise ControlError("resume_unavailable")
+
+        lease = connection.execute(
+            "SELECT token_digest, expires_at_epoch "
+            "FROM championship_runner_leases WHERE championship_id = ?",
+            (championship_id,),
+        ).fetchone()
+        if lease is not None and lease["token_digest"] is not None:
+            token_digest = lease["token_digest"]
+            expires_at_epoch = lease["expires_at_epoch"]
+            if (
+                not isinstance(token_digest, bytes)
+                or len(token_digest) != 32
+                or isinstance(expires_at_epoch, bool)
+                or not isinstance(expires_at_epoch, int)
+            ):
+                raise ControlError("resume_unavailable")
+            if expires_at_epoch > int(datetime.now(UTC).timestamp()):
+                raise ControlError("resume_unavailable")
+
+        raw_config = row["config_json"]
+        if not isinstance(raw_config, str) or len(raw_config.encode("utf-8")) > 1_048_576:
+            raise ControlError("resume_unavailable")
+        config_payload = json.loads(raw_config, parse_constant=_reject_nonfinite_json)
+        if (
+            not isinstance(config_payload, dict)
+            or "completed_series" in config_payload
+            or "updated_at" in config_payload
+        ):
+            raise ControlError("resume_unavailable")
+
+        series_rows = connection.execute(
+            """
+            SELECT pairing_number, series_id, match_1_id, match_2_id,
+                   completed_at, series_json
+            FROM championship_checkpoint_series
+            WHERE championship_id = ?
+            ORDER BY pairing_number
+            """,
+            (championship_id,),
+        ).fetchall()
+        completed_payloads: list[object] = []
+        for expected_pairing, series_row in enumerate(series_rows, start=1):
+            raw_series = series_row["series_json"]
+            if (
+                series_row["pairing_number"] != expected_pairing
+                or not isinstance(raw_series, str)
+                or len(raw_series.encode("utf-8")) > 1_048_576
+            ):
+                raise ControlError("resume_unavailable")
+            completed_payloads.append(
+                json.loads(raw_series, parse_constant=_reject_nonfinite_json)
+            )
+
+        payload = dict(config_payload)
+        payload["updated_at"] = row["updated_at"]
+        payload["completed_series"] = completed_payloads
+        checkpoint = ChampionshipCheckpoint.model_validate(payload)
+        expected_config = checkpoint.model_dump(mode="json")
+        expected_config.pop("completed_series")
+        expected_config.pop("updated_at")
+        if (
+            checkpoint.championship_id != row["championship_id"]
+            or checkpoint.championship_id != championship_id
+            or checkpoint.game != row["game"]
+            or checkpoint.seed != row["seed"]
+            or checkpoint.max_attempts != row["max_attempts"]
+            or len(checkpoint.schedule) != row["pairing_count"]
+            or _canonical_json(checkpoint.players) != row["players_json"]
+            or _canonical_json(checkpoint.game_config) != row["game_config_json"]
+            or _canonical_json(
+                tuple(item.model_dump(mode="json") for item in checkpoint.schedule)
+            )
+            != row["schedule_json"]
+            or _canonical_json(expected_config) != _canonical_json(config_payload)
+            or datetime.fromisoformat(row["created_at"]) != checkpoint.created_at
+            or datetime.fromisoformat(row["updated_at"]) != checkpoint.updated_at
+        ):
+            raise ControlError("resume_unavailable")
+        for series_row, series in zip(series_rows, checkpoint.completed_series):
+            if (
+                series_row["series_id"] != series.series_id
+                or series_row["match_1_id"] != series.legs[0].match_id
+                or series_row["match_2_id"] != series.legs[1].match_id
+                or datetime.fromisoformat(series_row["completed_at"]) != series.finished_at
+                or _canonical_json(series.model_dump(mode="json"))
+                != _canonical_json(
+                    json.loads(
+                        series_row["series_json"],
+                        parse_constant=_reject_nonfinite_json,
+                    )
+                )
+            ):
+                raise ControlError("resume_unavailable")
+
+        names = tuple(
+            _safe_name(descriptor.get("display_name") or descriptor.get("name"), label="player")
+            for descriptor in checkpoint.players
+        )
+        timeout_values = tuple(
+            descriptor.get("move_timeout_seconds") for descriptor in checkpoint.players
+        )
+        if any(value != timeout_values[0] for value in timeout_values[1:]):
+            raise ControlError("resume_unavailable")
+        llm_timeout = timeout_values[0]
+        if llm_timeout is not None and (
+            isinstance(llm_timeout, bool)
+            or not isinstance(llm_timeout, (int, float))
+            or not math.isfinite(llm_timeout)
+            or not 0 < llm_timeout <= 86_400
+        ):
+            raise ControlError("resume_unavailable")
+
+        judge_labels: tuple[str, ...] = ()
+        if checkpoint.judge_panel is not None:
+            judge_labels = tuple(
+                _safe_name(
+                    (
+                        f"Profile · {item.profile_id}"
+                        if item.profile_id is not None
+                        else f"{item.provider}:{item.model}"
+                    ),
+                    label="judge",
+                )
+                for item in checkpoint.judge_panel.panel
+            )
+        rounds = checkpoint.game_config.get("rounds")
+        if rounds is not None and (
+            isinstance(rounds, bool) or not isinstance(rounds, int) or not 1 <= rounds <= 100
+        ):
+            raise ControlError("resume_unavailable")
+
+        providers: list[str] = []
+        expected_route_ids: set[str] = set()
+        profile_ids: set[str] = set()
+        profile_models: dict[str, set[str]] = {}
+        for descriptor in checkpoint.players:
+            provider = descriptor.get("provider")
+            if not isinstance(provider, str) or not provider:
+                raise ControlError("resume_unavailable")
+            providers.append(provider)
+            route_id = descriptor.get("route_id")
+            if not isinstance(route_id, str) or not route_id:
+                raise ControlError("resume_unavailable")
+            expected_route_ids.add(route_id)
+            profile_id = descriptor.get("profile_id")
+            if profile_id is not None:
+                if not isinstance(profile_id, str) or _PROFILE_ID_RE.fullmatch(profile_id) is None:
+                    raise ControlError("resume_unavailable")
+                profile_ids.add(profile_id)
+                model = descriptor.get("model")
+                if not isinstance(model, str) or not model:
+                    raise ControlError("resume_unavailable")
+                profile_models.setdefault(profile_id, set()).add(model)
+            elif provider != "mock":
+                raise ControlError("resume_unavailable")
+        if checkpoint.judge_panel is not None:
+            for descriptor in checkpoint.judge_panel.panel:
+                providers.append(descriptor.provider)
+                if descriptor.route_id is None:
+                    raise ControlError("resume_unavailable")
+                expected_route_ids.add(descriptor.route_id)
+                if descriptor.profile_id is not None:
+                    if _PROFILE_ID_RE.fullmatch(descriptor.profile_id) is None:
+                        raise ControlError("resume_unavailable")
+                    profile_ids.add(descriptor.profile_id)
+                    profile_models.setdefault(descriptor.profile_id, set()).add(
+                        descriptor.model
+                    )
+                elif descriptor.provider != "mock":
+                    raise ControlError("resume_unavailable")
+
+        budget_rows = connection.execute(
+            """
+            SELECT budget_id, policy_json, policy_digest, limit_calls,
+                   limit_input_tokens, limit_output_tokens,
+                   limit_estimated_cost_nanos, poison_reason_code,
+                   finalized_at_epoch
+            FROM provider_budgets
+            WHERE championship_id = ?
+            """,
+            (championship_id,),
+        ).fetchall()
+        if len(budget_rows) > 1:
+            raise ControlError("resume_unavailable")
+        has_budget = len(budget_rows) == 1
+        requires_budget = any(provider != "mock" for provider in providers)
+        if requires_budget:
+            if not has_budget:
+                raise ControlError("resume_unavailable")
+            budget_row = budget_rows[0]
+            limits = (
+                budget_row["limit_calls"],
+                budget_row["limit_input_tokens"],
+                budget_row["limit_output_tokens"],
+                budget_row["limit_estimated_cost_nanos"],
+            )
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in limits
+            ):
+                raise ControlError("resume_unavailable")
+            if (
+                budget_row["poison_reason_code"] is not None
+                or budget_row["finalized_at_epoch"] is not None
+            ):
+                raise ControlError("resume_unavailable")
+            try:
+                policy = ProviderBudgetPolicy.from_canonical_json(budget_row["policy_json"])
+            except (TypeError, ValueError, UsageValidationError) as exc:
+                raise ControlError("resume_unavailable") from exc
+            if (
+                policy.digest != budget_row["policy_digest"]
+                or {route.route_id for route in policy.routes} != expected_route_ids
+                or any(route.price is None for route in policy.routes)
+            ):
+                raise ControlError("resume_unavailable")
+
+        try:
+            profiles = load_profiles() if profile_ids else {}
+        except (OSError, TypeError, ValueError) as exc:
+            raise ControlError("profile_unavailable") from exc
+        prepared_profiles: list[ControlPreparedProfile] = []
+        for profile_id in sorted(profile_ids):
+            profile = profiles.get(profile_id)
+            if profile is None or not _profile_ready(profile):
+                raise ControlError("profile_unavailable")
+            prepared_profiles.append(
+                _prepared_profile(
+                    profile,
+                    effective_models=tuple(profile_models[profile_id]),
+                )
+            )
+
+        pairing_count = len(checkpoint.schedule)
+        return ControlPreview(
+            player_count=len(checkpoint.players),
+            human_count=0,
+            match_count=pairing_count * 2,
+            pairing_count=pairing_count,
+            rated=False,
+            requires_provider_budget=requires_budget,
+            frozen_game=checkpoint.game,
+            frozen_players=names,
+            frozen_judges=judge_labels,
+            frozen_rounds=rounds,
+            frozen_seed=str(checkpoint.seed),
+            frozen_llm_timeout_seconds=(
+                None if llm_timeout is None else float(llm_timeout)
+            ),
+            uses_frozen_budget=has_budget,
+            prepared_profiles=tuple(prepared_profiles),
+            warnings=("resume_uses_frozen_configuration",),
+        )
+    except ControlError:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        sqlite3.Error,
+    ) as exc:
+        raise ControlError("resume_unavailable") from exc
+    finally:
+        connection.close()
+
+
 def validate_job_spec(
     spec: ControlJobSpec,
     *,
@@ -1384,6 +1912,13 @@ def validate_job_spec(
         if archive_database is None:
             raise ControlError("resume_unavailable")
         return _resume_preview(archive_database, spec.resume_tournament_id)
+    if spec.resume_championship_id is not None:
+        if archive_database is None:
+            raise ControlError("resume_unavailable")
+        return _resume_championship_preview(
+            archive_database,
+            spec.resume_championship_id,
+        )
     profile_ids = sorted(
         {
             item.profile_id
@@ -1407,7 +1942,12 @@ def validate_job_spec(
     if participant_tokens & {judge.cli_token() for judge in spec.judges}:
         raise ControlError("invalid_request")
     count = len(spec.players)
-    pairing_count = count * (count - 1) // 2 if spec.mode == "round_robin" else None
+    if spec.mode == "round_robin":
+        pairing_count = count * (count - 1) // 2
+    elif spec.mode == "championship":
+        pairing_count = count - 1
+    else:
+        pairing_count = None
     match_count = 1 if spec.mode == "play" else 2
     if pairing_count is not None:
         match_count = pairing_count * 2
@@ -1441,7 +1981,9 @@ def validate_job_spec(
         human_count=sum(player.kind == "human" for player in spec.players),
         match_count=match_count,
         pairing_count=pairing_count,
-        rated=spec.mode == "round_robin" or count == 2,
+        rated=spec.mode == "round_robin" or (
+            spec.mode in {"play", "series"} and count == 2
+        ),
         requires_provider_budget=bool(profile_ids),
         prepared_profiles=tuple(prepared_profiles),
         warnings=tuple(warnings),
@@ -1461,6 +2003,9 @@ def build_job_argv(
     argv = [str(python_executable), "-m", "llmolympic", command]
     if spec.resume_tournament_id is not None:
         argv.extend(("--resume", spec.resume_tournament_id, "--db", str(archive_database)))
+        return tuple(argv)
+    if spec.resume_championship_id is not None:
+        argv.extend(("--resume", spec.resume_championship_id, "--db", str(archive_database)))
         return tuple(argv)
     argv.extend(
         (

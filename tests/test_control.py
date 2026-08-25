@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sqlite3
 import stat
@@ -14,8 +16,10 @@ from pydantic import ValidationError
 from llmolympic import control
 from llmolympic.config import ProviderProfile
 from llmolympic.control import (
+    CONTROL_SCHEMA_VERSION,
     ControlBudgetSpec,
     ControlError,
+    ControlJob,
     ControlJobSpec,
     ControlParticipationLink,
     ControlPlayerSpec,
@@ -26,10 +30,16 @@ from llmolympic.control import (
     profile_configuration_digest,
     validate_job_spec,
 )
+from llmolympic.core.championship import prepare_championship, resume_championship
 from llmolympic.core.player import LLMPlayer
 from llmolympic.core.storage import SQLiteStore
 from llmolympic.core.tournament import prepare_round_robin
-from llmolympic.core.usage import BudgetLimits, ProviderBudgetPolicy, RouteBudgetPolicy
+from llmolympic.core.usage import (
+    BudgetLimits,
+    ProviderBudgetPolicy,
+    RouteBudgetPolicy,
+    TokenPrice,
+)
 from llmolympic.games import create_game
 from llmolympic.providers import create_profile_provider
 from llmolympic.providers.mock import MockProvider
@@ -99,6 +109,49 @@ def _round_robin_spec() -> ControlJobSpec:
     )
 
 
+def _championship_spec() -> ControlJobSpec:
+    return ControlJobSpec(
+        mode="championship",
+        game="math_quiz",
+        players=tuple(
+            ControlPlayerSpec(kind="mock", strategy=strategy)
+            for strategy in ("random", "fixed", "illegal", "balanced")
+        ),
+        rounds=2,
+        seed="23",
+    )
+
+
+def _resume_championship_spec(championship_id: str) -> ControlJobSpec:
+    return ControlJobSpec(
+        mode="championship",
+        resume_championship_id=championship_id,
+    )
+
+
+def _championship_checkpoint_database(
+    path: Path,
+    *,
+    championship_id: str = "resume-championship",
+) -> Path:
+    players = [
+        LLMPlayer(
+            name=f"Mock {strategy}",
+            provider=MockProvider(strategy=strategy),
+            model=strategy,
+        )
+        for strategy in ("random", "fixed", "illegal", "balanced")
+    ]
+    checkpoint = prepare_championship(
+        create_game("math_quiz", mode="play", rounds=2),
+        players,
+        seed=23,
+        championship_id=championship_id,
+    )
+    SQLiteStore(path).save_championship_checkpoint(checkpoint)
+    return path
+
+
 def _checkpoint_database(path: Path, *, tournament_id: str = "resume-tournament") -> Path:
     players = [
         LLMPlayer(
@@ -151,6 +204,253 @@ def _profile_checkpoint_database(
         policy,
     )
     return path
+
+
+def _profile_championship_checkpoint_database(
+    path: Path,
+    profile: ProviderProfile,
+    *,
+    complete_budget: bool,
+) -> Path:
+    players = [
+        LLMPlayer(
+            name="Profile",
+            provider=create_profile_provider(profile),
+            model="frozen-model",
+        ),
+        *(
+            LLMPlayer(
+                name=f"Mock {strategy}",
+                provider=MockProvider(strategy=strategy),
+                model=strategy,
+            )
+            for strategy in ("random", "fixed", "balanced")
+        ),
+    ]
+    checkpoint = prepare_championship(
+        create_game("math_quiz", mode="play", rounds=1),
+        players,
+        seed=29,
+        championship_id="profile-championship-resume",
+    )
+    price = TokenPrice(0, 0) if complete_budget else None
+    policy = ProviderBudgetPolicy(
+        max_output_tokens_per_call=128,
+        routes=tuple(
+            RouteBudgetPolicy(route_id=player.route_id, price=price)
+            for player in players
+        ),
+    )
+    SQLiteStore(path).create_championship_checkpoint_with_provider_budget(
+        checkpoint,
+        "profile-championship-budget",
+        BudgetLimits(
+            calls=100,
+            input=100_000,
+            output=100_000,
+            estimated_cost=0 if complete_budget else None,
+        ),
+        policy,
+    )
+    return path
+
+
+def test_championship_spec_preview_and_argv_are_unrated_and_fixed(tmp_path: Path) -> None:
+    spec = _championship_spec()
+
+    preview = validate_job_spec(spec)
+    argv = build_job_argv(
+        spec,
+        archive_database=tmp_path / "championship.db",
+        web_base_url="http://127.0.0.1:8765",
+        python_executable="/fixed/python",
+    )
+
+    assert preview.player_count == 4
+    assert preview.pairing_count == 3
+    assert preview.match_count == 6
+    assert preview.rated is False
+    assert preview.requires_provider_budget is False
+    assert argv[:4] == ("/fixed/python", "-m", "llmolympic", "championship")
+    assert argv[argv.index("--players") + 1] == (
+        "mock:random,mock:fixed,mock:illegal,mock:balanced"
+    )
+
+
+def test_championship_final_shape_requires_every_bracket_match(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "championship-final-shape.db")
+    spec = _championship_spec()
+    prepared = store.prepare(
+        spec,
+        validate_job_spec(spec),
+        idempotency_key="championship-final-shape",
+    )
+    payload = prepared.model_dump(mode="json")
+    payload.update(
+        {
+            "status": "finalizing",
+            "championship_id": "championship-final",
+            "final_kind": "championship",
+            "final_id": "championship-final",
+            "final_match_ids": [f"match-{index}" for index in range(4)],
+        }
+    )
+
+    with pytest.raises(ValidationError, match="canonical bracket match"):
+        ControlJob.model_validate(payload)
+
+
+@pytest.mark.parametrize("player_count", [4, 8, 16])
+def test_championship_accepts_only_power_of_two_bracket_sizes(player_count: int) -> None:
+    players = tuple(
+        ControlPlayerSpec(kind="profile", profile_id=f"entrant-{index}")
+        for index in range(player_count)
+    )
+
+    assert ControlJobSpec(
+        mode="championship",
+        game="math_quiz",
+        players=players,
+    ).players == players
+
+
+@pytest.mark.parametrize("player_count", [2, 3, 5, 6, 7, 9, 15])
+def test_championship_rejects_non_bracket_sizes(player_count: int) -> None:
+    players = tuple(
+        ControlPlayerSpec(kind="profile", profile_id=f"entrant-{index}")
+        for index in range(player_count)
+    )
+
+    with pytest.raises(ValidationError, match="4, 8, or 16"):
+        ControlJobSpec(
+            mode="championship",
+            game="math_quiz",
+            players=players,
+        )
+
+
+def test_championship_rejects_humans_and_games_without_play_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError, match="human players"):
+        ControlJobSpec(
+            mode="championship",
+            game="math_quiz",
+            players=(
+                ControlPlayerSpec(kind="human", name="Human"),
+                ControlPlayerSpec(kind="mock", strategy="random"),
+                ControlPlayerSpec(kind="mock", strategy="fixed"),
+                ControlPlayerSpec(kind="mock", strategy="balanced"),
+            ),
+        )
+
+    base_game = control.GAME_REGISTRY["math_quiz"]
+
+    class RoundRobinOnly(base_game):
+        supported_modes = frozenset({"round_robin"})
+
+    monkeypatch.setitem(control.GAME_REGISTRY, "round_robin_only", RoundRobinOnly)
+    with pytest.raises(ValidationError, match="does not support"):
+        ControlJobSpec(
+            mode="championship",
+            game="round_robin_only",
+            players=_championship_spec().players,
+        )
+
+
+def test_championship_resume_preview_accepts_a_complete_checkpoint_read_only(
+    tmp_path: Path,
+) -> None:
+    database = _championship_checkpoint_database(tmp_path / "complete-checkpoint.db")
+    archive = SQLiteStore(database, create=False)
+    checkpoint = archive.get_championship_checkpoint("resume-championship")
+    assert checkpoint is not None
+    game = create_game("math_quiz", mode="play", rounds=2)
+    players = [
+        LLMPlayer(
+            name=f"Mock {strategy}",
+            provider=MockProvider(strategy=strategy),
+            model=strategy,
+        )
+        for strategy in ("random", "fixed", "illegal", "balanced")
+    ]
+    claim = archive.claim_championship_runner(checkpoint.championship_id)
+
+    async def finish() -> None:
+        await resume_championship(
+            game,
+            players,
+            claim.checkpoint,
+            on_checkpoint=lambda updated: archive.save_championship_checkpoint(
+                updated,
+                lease=claim.lease,
+            ),
+        )
+
+    asyncio.run(finish())
+    assert archive.release_championship_runner(claim.lease)
+    completed = archive.get_championship_checkpoint(checkpoint.championship_id)
+    assert completed is not None and completed.is_complete
+    before = (database.stat().st_mtime_ns, database.read_bytes())
+
+    preview = validate_job_spec(
+        _resume_championship_spec(checkpoint.championship_id),
+        archive_database=database,
+    )
+    argv = build_job_argv(
+        _resume_championship_spec(checkpoint.championship_id),
+        archive_database=database,
+        web_base_url="http://127.0.0.1:8765",
+        python_executable="/fixed/python",
+    )
+
+    assert preview.pairing_count == 3
+    assert preview.match_count == 6
+    assert preview.rated is False
+    assert preview.frozen_players == tuple(player.name for player in players)
+    assert argv == (
+        "/fixed/python",
+        "-m",
+        "llmolympic",
+        "championship",
+        "--resume",
+        checkpoint.championship_id,
+        "--db",
+        str(database),
+    )
+    assert (database.stat().st_mtime_ns, database.read_bytes()) == before
+
+
+@pytest.mark.parametrize("complete_budget", [True, False])
+def test_profile_championship_resume_requires_a_complete_persistent_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete_budget: bool,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="local",
+        provider="ollama",
+        default_model="current-model",
+        base_url="http://127.0.0.1:11434/v1",
+    )
+    database = _profile_championship_checkpoint_database(
+        tmp_path / f"profile-championship-{complete_budget}.db",
+        profile,
+        complete_budget=complete_budget,
+    )
+    monkeypatch.setattr(control, "load_profiles", lambda: {"local": profile})
+    spec = _resume_championship_spec("profile-championship-resume")
+
+    if not complete_budget:
+        with pytest.raises(ControlError, match="resume_unavailable"):
+            validate_job_spec(spec, archive_database=database)
+        return
+
+    preview = validate_job_spec(spec, archive_database=database)
+    assert preview.requires_provider_budget is True
+    assert preview.uses_frozen_budget is True
+    assert preview.prepared_profiles[0].profile_id == "local"
+    assert preview.prepared_profiles[0].effective_models == ("frozen-model",)
 
 
 def test_resume_preview_hydrates_validated_frozen_configuration_read_only(
@@ -300,6 +600,36 @@ def test_terminal_round_robin_job_is_resumable_only_with_a_valid_checkpoint(
         failure_code="worker_failed" if status == "failed" else None,
     )
 
+    assert terminal.resumable is True
+
+
+def test_terminal_championship_job_is_resumable_with_a_valid_checkpoint(
+    tmp_path: Path,
+) -> None:
+    database = _championship_checkpoint_database(tmp_path / "championship-resumable.db")
+    store = JobStore(database)
+    spec = _championship_spec()
+    prepared = store.prepare(
+        spec,
+        validate_job_spec(spec),
+        idempotency_key="prepare-championship-resumable",
+    )
+    store.transition(
+        prepared.job_id,
+        expected=("prepared",),
+        status="running",
+        championship_id="resume-championship",
+    )
+
+    terminal = store.transition(
+        prepared.job_id,
+        expected=("running",),
+        status="interrupted",
+        failure_code="worker_interrupted",
+    )
+
+    assert terminal.championship_id == "resume-championship"
+    assert terminal.tournament_id is None
     assert terminal.resumable is True
 
 
@@ -495,6 +825,11 @@ def test_catalog_exposes_profile_availability_without_credentials_or_route(
     assert "sensitive-endpoint.example" not in payload
     assert "base_url" not in payload
     assert "api_key_env" not in payload
+    catalog = control_catalog()
+    math_quiz = next(game for game in catalog.games if game.name == "math_quiz")
+    assert "championship" in math_quiz.supported_modes
+    assert math_quiz.supported_modes.count("championship") == 1
+    assert "balanced" in catalog.mock_player_strategies
 
 
 def test_profile_jobs_require_a_ready_allowlisted_profile_and_complete_budget(
@@ -675,6 +1010,86 @@ def test_job_store_is_private_idempotent_fenced_and_contains_no_secret_columns(
         "secret",
     ):
         assert forbidden not in normalized_columns
+
+
+def test_control_schema_v1_migrates_old_rows_and_idempotency_to_v2(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive.db"
+    original_store = JobStore(archive)
+    spec = _mock_spec()
+    preview = validate_job_spec(spec)
+    original = original_store.prepare(
+        spec,
+        preview,
+        idempotency_key="legacy-prepare",
+    )
+    with sqlite3.connect(original_store.path) as connection:
+        raw_payload = json.loads(
+            connection.execute(
+                "SELECT spec_json FROM control_jobs WHERE job_id = ?",
+                (original.job_id,),
+            ).fetchone()[0]
+        )
+        assert raw_payload.pop("resume_championship_id") is None
+        legacy_json = json.dumps(
+            raw_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        connection.execute(
+            "UPDATE control_jobs SET spec_json = ?, request_digest = ? WHERE job_id = ?",
+            (
+                legacy_json,
+                control.hashlib.sha256(legacy_json.encode()).hexdigest(),
+                original.job_id,
+            ),
+        )
+        connection.execute("ALTER TABLE control_jobs DROP COLUMN championship_id")
+        connection.execute("PRAGMA user_version=1")
+
+    migrated_store = JobStore(archive)
+    migrated = migrated_store.get(original.job_id)
+    repeated = migrated_store.prepare(
+        spec,
+        preview,
+        idempotency_key="legacy-prepare",
+    )
+    with sqlite3.connect(migrated_store.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(control_jobs)")
+        }
+
+    assert version == CONTROL_SCHEMA_VERSION == 2
+    assert "championship_id" in columns
+    assert migrated.championship_id is None
+    assert migrated.spec == spec
+    assert repeated == migrated
+
+
+def test_control_schema_v1_rejects_unknown_extensions_without_partial_migration(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive.db"
+    original = JobStore(archive)
+    with sqlite3.connect(original.path) as connection:
+        connection.execute("ALTER TABLE control_jobs DROP COLUMN championship_id")
+        connection.execute("ALTER TABLE control_jobs ADD COLUMN unknown_extension TEXT")
+        connection.execute("PRAGMA user_version=1")
+
+    with pytest.raises(ControlError, match="control_unavailable"):
+        JobStore(archive)
+
+    with sqlite3.connect(original.path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(control_jobs)")
+        }
+    assert version == 1
+    assert "unknown_extension" in columns
+    assert "championship_id" not in columns
 
 
 def test_job_store_rejects_a_symlink_without_touching_its_target(tmp_path: Path) -> None:

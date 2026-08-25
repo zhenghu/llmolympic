@@ -67,6 +67,21 @@ class _PublicModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
 
+def _valid_public_player_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 512
+        and not any(
+            ord(character) < 32
+            or 127 <= ord(character) <= 159
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or character in _BIDI_CONTROL_CHARACTERS
+            for character in value
+        )
+    )
+
+
 def _utc_json(value: datetime) -> str:
     """Render every timestamp in one stable UTC representation."""
 
@@ -247,9 +262,9 @@ class ErrorResponse(_PublicModel):
     error: ErrorDetail
 
 
-GameMode: TypeAlias = Literal["play", "series", "round_robin"]
+GameMode: TypeAlias = Literal["play", "series", "round_robin", "championship"]
 LiveMatchStatus: TypeAlias = Literal["running", "completed", "interrupted"]
-LiveFinalKind: TypeAlias = Literal["match", "series", "tournament"]
+LiveFinalKind: TypeAlias = Literal["match", "series", "tournament", "championship"]
 ParticipationStatus: TypeAlias = Literal["active", "completed", "interrupted", "expired"]
 ParticipationRequestState: TypeAlias = Literal[
     "pending",
@@ -264,6 +279,7 @@ _MODE_FINAL_KIND: dict[GameMode, LiveFinalKind] = {
     "play": "match",
     "series": "series",
     "round_robin": "tournament",
+    "championship": "championship",
 }
 
 
@@ -274,7 +290,13 @@ class GameInfo(_PublicModel):
 
     @classmethod
     def from_game(cls, name: str, game_class: type) -> GameInfo:
-        modes = getattr(game_class, "supported_modes", ("play", "series", "round_robin"))
+        modes = set(
+            getattr(game_class, "supported_modes", ("play", "series", "round_robin"))
+        )
+        # A championship composes the ordinary two-player play capability into
+        # a bracket; it is intentionally not a new core Game mode.
+        if "play" in modes:
+            modes.add("championship")
         return cls(
             name=name,
             supported_modes=tuple(sorted(modes)),
@@ -544,15 +566,115 @@ def public_event(event: MatchEvent) -> PublicEvent:
     return PublicEvent.from_event(event)
 
 
+_CHAMPIONSHIP_PLAYER_COUNTS = frozenset({4, 8, 16})
+
+
+def _validate_championship_placement(
+    *,
+    round_number: int,
+    round_count: int,
+    round_pairing_number: int,
+    round_pairing_count: int,
+    pairing_number: int,
+    pairing_count: int,
+    leg_number: int,
+) -> None:
+    player_count = pairing_count + 1
+    if player_count not in _CHAMPIONSHIP_PLAYER_COUNTS:
+        raise ValueError("championship pairing_count must describe a 4/8/16-player bracket")
+    if round_count != player_count.bit_length() - 1:
+        raise ValueError("championship round_count is inconsistent with player_count")
+    if not 1 <= round_number <= round_count:
+        raise ValueError("championship round_number is outside the bracket")
+    expected_round_pairings = player_count >> round_number
+    if round_pairing_count != expected_round_pairings:
+        raise ValueError("championship round_pairing_count is inconsistent")
+    if not 1 <= round_pairing_number <= round_pairing_count:
+        raise ValueError("championship round_pairing_number is outside the round")
+    expected_pairing_number = (
+        player_count
+        - (player_count >> (round_number - 1))
+        + round_pairing_number
+    )
+    if pairing_number != expected_pairing_number:
+        raise ValueError("championship pairing_number is not canonical")
+    if leg_number not in {1, 2}:
+        raise ValueError("live series leg number must be one or two")
+
+
+class LiveChampionshipContext(_PublicModel):
+    """Canonical placement within a single-elimination two-leg bracket."""
+
+    round_number: int = Field(ge=1)
+    round_count: int = Field(ge=1)
+    round_pairing_number: int = Field(ge=1)
+    round_pairing_count: int = Field(ge=1)
+    pairing_number: int = Field(ge=1)
+    pairing_count: int = Field(ge=1)
+    leg_number: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _validate_placement(self) -> LiveChampionshipContext:
+        _validate_championship_placement(**self.model_dump())
+        return self
+
+
 class LiveEventContext(_PublicModel):
     """Placement of one match event within a top-level live run."""
 
     pairing_number: int | None = Field(default=None, ge=1)
+    pairing_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
     leg_number: int | None = Field(default=None, ge=1)
+    round_number: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_pairing_number: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_pairing_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
     match_event_seq: int = Field(ge=0)
 
     @model_validator(mode="after")
     def _validate_placement(self) -> LiveEventContext:
+        championship_fields = (
+            self.round_number,
+            self.round_count,
+            self.round_pairing_number,
+            self.round_pairing_count,
+        )
+        if any(value is not None for value in championship_fields):
+            values = {
+                "round_number": self.round_number,
+                "round_count": self.round_count,
+                "round_pairing_number": self.round_pairing_number,
+                "round_pairing_count": self.round_pairing_count,
+                "pairing_number": self.pairing_number,
+                "pairing_count": self.pairing_count,
+                "leg_number": self.leg_number,
+            }
+            if any(value is None for value in values.values()):
+                raise ValueError("championship event context must be complete")
+            _validate_championship_placement(**values)  # type: ignore[arg-type]
+            return self
+        if self.pairing_count is not None:
+            raise ValueError("pairing_count is reserved for complete championship context")
         if self.leg_number is not None and self.leg_number not in {1, 2}:
             raise ValueError("live series leg number must be one or two")
         if self.pairing_number is not None and self.leg_number is None:
@@ -563,6 +685,7 @@ class LiveEventContext(_PublicModel):
 class LiveEventItem(_PublicModel):
     """One event ordered by the broker-wide sequence of its live session."""
 
+    kind: Literal["match_event"] = "match_event"
     seq: int = Field(ge=0)
     context: LiveEventContext
     event: PublicEvent
@@ -574,8 +697,181 @@ class LiveEventItem(_PublicModel):
         return self
 
 
+class LiveChampionshipPairing(_PublicModel):
+    """Disclosure-safe result for one two-leg bracket pairing."""
+
+    round_number: int = Field(ge=1)
+    round_pairing_number: int = Field(ge=1)
+    pairing_number: int = Field(ge=1)
+    players: tuple[str, str]
+    winner: str
+    series_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    match_ids: tuple[str, str]
+    status: Literal["provisional", "committed"]
+
+    @field_validator("players")
+    @classmethod
+    def _validate_pairing_players(cls, value: tuple[str, str]) -> tuple[str, str]:
+        if value[0] == value[1] or any(
+            not _valid_public_player_name(player) for player in value
+        ):
+            raise ValueError("championship pairing requires two distinct public players")
+        return value
+
+    @field_validator("match_ids")
+    @classmethod
+    def _validate_pairing_match_ids(cls, value: tuple[str, str]) -> tuple[str, str]:
+        if value[0] == value[1] or any(
+            _SAFE_PUBLIC_ID_RE.fullmatch(match_id) is None for match_id in value
+        ):
+            raise ValueError("championship pairing requires two distinct match ids")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_winner(self) -> LiveChampionshipPairing:
+        if self.winner not in self.players:
+            raise ValueError("championship pairing winner must be one of its players")
+        return self
+
+
+class LiveChampionshipBracket(_PublicModel):
+    """Materialized, reconnect-safe public championship bracket."""
+
+    championship_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    player_count: int
+    round_count: int = Field(ge=1)
+    pairing_count: int = Field(ge=1)
+    champion: str | None = None
+    pairings: tuple[LiveChampionshipPairing, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_bracket(self) -> LiveChampionshipBracket:
+        if self.player_count not in _CHAMPIONSHIP_PLAYER_COUNTS:
+            raise ValueError("championship bracket requires 4, 8, or 16 players")
+        if self.round_count != self.player_count.bit_length() - 1:
+            raise ValueError("championship bracket round_count is inconsistent")
+        if self.pairing_count != self.player_count - 1:
+            raise ValueError("championship bracket pairing_count is inconsistent")
+        if len(self.pairings) > self.pairing_count:
+            raise ValueError("championship bracket has too many pairings")
+        if tuple(pairing.pairing_number for pairing in self.pairings) != tuple(
+            range(1, len(self.pairings) + 1)
+        ):
+            raise ValueError("championship bracket pairings must be a canonical prefix")
+
+        committed_count = 0
+        provisional_seen = False
+        series_ids: set[str] = set()
+        match_ids: set[str] = set()
+        for pairing in self.pairings:
+            round_pairing_count = self.player_count >> pairing.round_number
+            _validate_championship_placement(
+                round_number=pairing.round_number,
+                round_count=self.round_count,
+                round_pairing_number=pairing.round_pairing_number,
+                round_pairing_count=round_pairing_count,
+                pairing_number=pairing.pairing_number,
+                pairing_count=self.pairing_count,
+                leg_number=2,
+            )
+            if pairing.status == "committed":
+                if provisional_seen:
+                    raise ValueError("committed championship pairings must precede provisional ones")
+                committed_count += 1
+            else:
+                provisional_seen = True
+            if pairing.series_id in series_ids or any(
+                match_id in match_ids for match_id in pairing.match_ids
+            ):
+                raise ValueError("championship bracket archive ids must be unique")
+            series_ids.add(pairing.series_id)
+            match_ids.update(pairing.match_ids)
+
+        valid_committed_boundaries = {
+            0,
+            *(
+                self.player_count - (self.player_count >> round_number)
+                for round_number in range(1, self.round_count + 1)
+            ),
+        }
+        if committed_count not in valid_committed_boundaries:
+            raise ValueError("committed championship pairings must end at a whole-round boundary")
+        provisional = self.pairings[committed_count:]
+        if provisional:
+            completed_rounds = next(
+                round_number
+                for round_number in range(self.round_count + 1)
+                if committed_count
+                == self.player_count - (self.player_count >> round_number)
+            )
+            next_round = completed_rounds + 1
+            if next_round > self.round_count or any(
+                pairing.round_number != next_round for pairing in provisional
+            ):
+                raise ValueError("provisional championship pairings must belong to the next round")
+        if self.champion is not None and (
+            committed_count != self.pairing_count
+            or not self.pairings
+            or self.champion != self.pairings[-1].winner
+        ):
+            raise ValueError("champion requires a fully committed bracket")
+        return self
+
+
+class LivePairingCompletedItem(_PublicModel):
+    """Provisional pairing result, pending the whole-round checkpoint commit."""
+
+    kind: Literal["pairing_completed"] = "pairing_completed"
+    seq: int = Field(ge=0)
+    context: LiveChampionshipContext
+    pairing: LiveChampionshipPairing
+
+    @model_validator(mode="after")
+    def _validate_pairing_context(self) -> LivePairingCompletedItem:
+        if self.context.leg_number != 2 or self.pairing.status != "provisional":
+            raise ValueError("pairing_completed must describe a provisional second-leg result")
+        if (
+            self.pairing.round_number != self.context.round_number
+            or self.pairing.round_pairing_number != self.context.round_pairing_number
+            or self.pairing.pairing_number != self.context.pairing_number
+        ):
+            raise ValueError("pairing_completed context does not match its pairing")
+        return self
+
+
+class LiveRoundCommittedItem(_PublicModel):
+    """Acknowledgement emitted only after a whole-round checkpoint commits."""
+
+    kind: Literal["round_committed"] = "round_committed"
+    seq: int = Field(ge=0)
+    context: LiveChampionshipContext
+    pairing_numbers: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def _validate_round(self) -> LiveRoundCommittedItem:
+        first = self.context.pairing_number - self.context.round_pairing_number + 1
+        expected = tuple(range(first, first + self.context.round_pairing_count))
+        if self.context.leg_number != 2 or self.pairing_numbers != expected:
+            raise ValueError("round_committed must acknowledge the complete canonical round")
+        return self
+
+
+LiveStreamItem: TypeAlias = Annotated[
+    LiveEventItem | LivePairingCompletedItem | LiveRoundCommittedItem,
+    Field(discriminator="kind"),
+]
+
+
 class LiveMatchSummary(_PublicModel):
-    """Disclosure-safe state for one top-level match, series, or tournament run."""
+    """Disclosure-safe state for one top-level live run."""
 
     live_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
     mode: GameMode
@@ -588,6 +884,30 @@ class LiveMatchSummary(_PublicModel):
     pairing_number: int | None = Field(default=None, ge=1)
     pairing_count: int | None = Field(default=None, ge=1)
     leg_number: int | None = Field(default=None, ge=1)
+    round_number: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_pairing_number: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    round_pairing_count: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    championship_bracket: LiveChampionshipBracket | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     final_kind: LiveFinalKind | None = None
     final_id: str | None = Field(
         default=None,
@@ -605,15 +925,7 @@ class LiveMatchSummary(_PublicModel):
     @classmethod
     def _validate_players(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) < 2 or len(value) > 16 or len(value) != len(set(value)) or any(
-            not player
-            or len(player) > 512
-            or any(
-                ord(character) < 32
-                or 127 <= ord(character) <= 159
-                or 0xD800 <= ord(character) <= 0xDFFF
-                or character in _BIDI_CONTROL_CHARACTERS
-                for character in player
-            )
+            not _valid_public_player_name(player)
             for player in value
         ):
             raise ValueError("live players must contain at least two display names")
@@ -644,18 +956,100 @@ class LiveMatchSummary(_PublicModel):
             self.pairing_number is not None
             or self.pairing_count is not None
             or self.leg_number is not None
+            or self.round_number is not None
+            or self.round_count is not None
+            or self.round_pairing_number is not None
+            or self.round_pairing_count is not None
         ):
             raise ValueError("single-match live runs cannot have series context")
         if self.mode == "series" and (
-            self.pairing_number is not None or self.pairing_count is not None
+            self.pairing_number is not None
+            or self.pairing_count is not None
+            or self.round_number is not None
+            or self.round_count is not None
+            or self.round_pairing_number is not None
+            or self.round_pairing_count is not None
         ):
             raise ValueError("series live runs cannot have tournament context")
-        if self.mode in {"series", "round_robin"} and (
+        if self.mode in {"series", "round_robin", "championship"} and (
             self.leg_number is not None and self.leg_number not in {1, 2}
         ):
             raise ValueError("live series leg number must be one or two")
         if self.mode == "round_robin" and self.pairing_count is None:
             raise ValueError("tournament live runs require pairing_count")
+        championship_fields = {
+            "round_number": self.round_number,
+            "round_count": self.round_count,
+            "round_pairing_number": self.round_pairing_number,
+            "round_pairing_count": self.round_pairing_count,
+            "pairing_number": self.pairing_number,
+            "pairing_count": self.pairing_count,
+            "leg_number": self.leg_number,
+        }
+        if self.mode == "round_robin" and any(
+            championship_fields[field] is not None
+            for field in (
+                "round_number",
+                "round_count",
+                "round_pairing_number",
+                "round_pairing_count",
+            )
+        ):
+            raise ValueError("round-robin live runs cannot have championship context")
+        if self.mode == "championship":
+            if any(value is None for value in championship_fields.values()):
+                raise ValueError("championship live runs require complete bracket context")
+            _validate_championship_placement(**championship_fields)  # type: ignore[arg-type]
+            if len(self.players) not in _CHAMPIONSHIP_PLAYER_COUNTS:
+                raise ValueError("championship live runs require 4, 8, or 16 players")
+            if self.championship_bracket is None:
+                raise ValueError("championship live runs require a materialized bracket")
+            bracket = self.championship_bracket
+            if bracket.player_count != len(self.players):
+                raise ValueError("championship roster and bracket size differ")
+            pairing_winners: dict[tuple[int, int], str] = {}
+            for pairing in bracket.pairings:
+                if pairing.round_number == 1:
+                    offset = (pairing.round_pairing_number - 1) * 2
+                    expected_players = self.players[offset : offset + 2]
+                else:
+                    previous_round = pairing.round_number - 1
+                    previous_offset = (pairing.round_pairing_number - 1) * 2 + 1
+                    expected_players = (
+                        pairing_winners.get((previous_round, previous_offset)),
+                        pairing_winners.get((previous_round, previous_offset + 1)),
+                    )
+                if tuple(expected_players) != pairing.players:
+                    raise ValueError("championship pairing players do not follow bracket winners")
+                pairing_winners[(pairing.round_number, pairing.round_pairing_number)] = (
+                    pairing.winner
+                )
+            materialized_count = len(bracket.pairings)
+            if self.pairing_number not in {
+                materialized_count,
+                materialized_count + 1,
+            }:
+                raise ValueError("championship current pairing does not follow its bracket")
+            if self.pairing_number == materialized_count:
+                if materialized_count == 0 or self.leg_number != 2:
+                    raise ValueError("materialized championship pairing requires leg two")
+                latest = bracket.pairings[-1]
+                if (
+                    self.round_number != latest.round_number
+                    or self.round_pairing_number != latest.round_pairing_number
+                ):
+                    raise ValueError("championship current context differs from latest pairing")
+            elif bracket.pairings and bracket.pairings[-1].status == "provisional":
+                latest = bracket.pairings[-1]
+                if (
+                    self.round_number != latest.round_number
+                    or self.round_pairing_number != latest.round_pairing_number + 1
+                ):
+                    raise ValueError("championship cannot advance before round commit")
+            if self.status != "completed" and bracket.champion is not None:
+                raise ValueError("unfinished championship live runs cannot expose a champion")
+        elif self.championship_bracket is not None:
+            raise ValueError("only championship live runs may expose a bracket")
         if self.status == "completed":
             if (
                 self.final_kind != _MODE_FINAL_KIND[self.mode]
@@ -673,6 +1067,27 @@ class LiveMatchSummary(_PublicModel):
                 and len(self.final_match_ids) != self.pairing_count * 2
             ):
                 raise ValueError("completed tournament match archive count is inconsistent")
+            if self.mode == "championship":
+                bracket = self.championship_bracket
+                if (
+                    bracket is None
+                    or self.round_number != self.round_count
+                    or self.round_pairing_number != 1
+                    or self.round_pairing_count != 1
+                    or self.pairing_number != self.pairing_count
+                    or self.leg_number != 2
+                    or self.final_id != bracket.championship_id
+                    or bracket.champion is None
+                    or len(bracket.pairings) != bracket.pairing_count
+                    or any(pairing.status != "committed" for pairing in bracket.pairings)
+                    or self.final_match_ids
+                    != tuple(
+                        match_id
+                        for pairing in bracket.pairings
+                        for match_id in pairing.match_ids
+                    )
+                ):
+                    raise ValueError("completed championship archive references are inconsistent")
         elif self.final_kind is not None or self.final_id is not None or self.final_match_ids:
             raise ValueError("unfinished live runs cannot expose final archive references")
         return self
@@ -686,7 +1101,7 @@ class LiveMatchListResponse(_PublicModel):
 class LiveMatchDetail(_PublicModel):
     api_version: Literal["v1"] = API_VERSION
     match: LiveMatchSummary
-    events: tuple[LiveEventItem, ...]
+    events: tuple[LiveStreamItem, ...]
     next_seq: int = Field(ge=0)
     has_more: bool
 
@@ -704,6 +1119,104 @@ class LiveMatchDetail(_PublicModel):
             raise ValueError("next_seq exceeds live event count")
         if self.has_more != (self.next_seq < self.match.event_count):
             raise ValueError("has_more does not match live event count")
+        if self.match.mode != "championship":
+            if any(not isinstance(item, LiveEventItem) for item in self.events):
+                raise ValueError("non-championship live runs accept match events only")
+            return self
+
+        bracket = self.match.championship_bracket
+        if bracket is None:  # pragma: no cover - LiveMatchSummary already enforces this
+            raise ValueError("championship live detail requires a bracket")
+        pairings = {
+            pairing.pairing_number: pairing for pairing in bracket.pairings
+        }
+        for item in self.events:
+            context = item.context
+            if (
+                context.round_count != bracket.round_count
+                or context.pairing_count != bracket.pairing_count
+                or context.pairing_number > len(bracket.pairings) + 1
+            ):
+                raise ValueError("championship live item does not match its bracket")
+            if isinstance(item, LiveEventItem):
+                if any(
+                    value is None
+                    for value in (
+                        context.round_number,
+                        context.round_pairing_number,
+                        context.round_pairing_count,
+                        context.leg_number,
+                    )
+                ):
+                    raise ValueError("championship match events require complete context")
+                materialized = pairings.get(context.pairing_number)
+                if materialized is not None:
+                    expected_players = materialized.players
+                elif context.round_number == 1:
+                    offset = 2 * (context.round_pairing_number - 1)  # type: ignore[operator]
+                    expected_players = self.match.players[offset : offset + 2]
+                else:
+                    previous_round = context.round_number - 1  # type: ignore[operator]
+                    previous_offset = 2 * (context.round_pairing_number - 1) + 1  # type: ignore[operator]
+                    first_source = next(
+                        (
+                            pairing.winner
+                            for pairing in bracket.pairings
+                            if pairing.round_number == previous_round
+                            and pairing.round_pairing_number == previous_offset
+                        ),
+                        None,
+                    )
+                    second_source = next(
+                        (
+                            pairing.winner
+                            for pairing in bracket.pairings
+                            if pairing.round_number == previous_round
+                            and pairing.round_pairing_number == previous_offset + 1
+                        ),
+                        None,
+                    )
+                    expected_players = (first_source, second_source)
+                if len(expected_players) != 2 or any(
+                    player is None for player in expected_players
+                ):
+                    raise ValueError("championship event pairing cannot be resolved")
+                base_players = tuple(expected_players)
+                event = item.event
+                if event.player is not None and event.player not in base_players:
+                    raise ValueError("championship event player is outside its pairing")
+                if isinstance(event.data, MatchStartedData):
+                    ordered_players = (
+                        base_players
+                        if context.leg_number == 1
+                        else tuple(reversed(base_players))
+                    )
+                    if event.data.game != self.match.game or event.data.players != ordered_players:
+                        raise ValueError("match_started does not match championship pairing")
+                elif isinstance(event.data, MatchFinishedData) and (
+                    set(event.data.scores) != set(base_players)
+                    or (
+                        event.data.forfeited_by is not None
+                        and event.data.forfeited_by not in base_players
+                    )
+                ):
+                    raise ValueError("match_finished does not match championship pairing")
+                continue
+            if isinstance(item, LivePairingCompletedItem):
+                materialized = pairings.get(item.context.pairing_number)
+                if (
+                    materialized is None
+                    or materialized.model_dump(exclude={"status"})
+                    != item.pairing.model_dump(exclude={"status"})
+                ):
+                    raise ValueError("pairing event does not match materialized bracket")
+                continue
+            if any(
+                pairings.get(pairing_number) is None
+                or pairings[pairing_number].status != "committed"
+                for pairing_number in item.pairing_numbers
+            ):
+                raise ValueError("round event does not match committed bracket")
         return self
 
 
@@ -897,7 +1410,7 @@ class WSLiveEventEnvelope(_PublicModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     )
-    item: LiveEventItem
+    item: LiveStreamItem
 
 
 class WSLiveCompleteEnvelope(_PublicModel):
@@ -932,6 +1445,12 @@ class WSLiveCompleteEnvelope(_PublicModel):
             raise ValueError("completed match envelope has inconsistent archive references")
         if self.final_kind == "series" and len(self.final_match_ids) != 2:
             raise ValueError("completed series envelope must reference exactly two matches")
+        if self.final_kind == "championship" and len(self.final_match_ids) not in {
+            6,
+            14,
+            30,
+        }:
+            raise ValueError("completed championship envelope has invalid archive count")
         return self
 
 
@@ -1053,6 +1572,9 @@ __all__ = [
     "LeaderboardEntry",
     "LeaderboardEntryPublic",
     "LeaderboardResponse",
+    "LiveChampionshipBracket",
+    "LiveChampionshipContext",
+    "LiveChampionshipPairing",
     "LiveEventContext",
     "LiveEventItem",
     "LiveFinalKind",
@@ -1060,6 +1582,9 @@ __all__ = [
     "LiveMatchListResponse",
     "LiveMatchStatus",
     "LiveMatchSummary",
+    "LivePairingCompletedItem",
+    "LiveRoundCommittedItem",
+    "LiveStreamItem",
     "LiveWebSocketEnvelope",
     "MatchDetail",
     "MatchFinishedData",

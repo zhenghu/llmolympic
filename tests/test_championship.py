@@ -227,6 +227,47 @@ def test_play_championship_checkpoint_callback_captures_rounds() -> None:
     assert archive.championship_id == checkpoints[1].championship_id
 
 
+def test_pairing_callback_precedes_next_pairing_and_round_checkpoint() -> None:
+    game = create_game("knowledge_quiz", rounds=1)
+    players = _players(4)
+    lifecycle: list[tuple[str, int]] = []
+
+    archive = asyncio.run(
+        play_championship(
+            game,
+            players,
+            seed=5,
+            on_event=lambda pairing, _leg, _event: lifecycle.append(
+                ("event", pairing)
+            ),
+            on_pairing_completed=lambda pairing, series: lifecycle.append(
+                ("pairing", pairing)
+            )
+            if len(series.legs) == 2
+            else lifecycle.append(("invalid", pairing)),
+            on_checkpoint=lambda checkpoint: lifecycle.append(
+                ("round", checkpoint.completed_rounds)
+            ),
+        )
+    )
+
+    assert [pairing for kind, pairing in lifecycle if kind == "pairing"] == [1, 2, 3]
+    assert "invalid" not in [kind for kind, _value in lifecycle]
+    assert lifecycle.index(("pairing", 1)) < next(
+        index
+        for index, item in enumerate(lifecycle)
+        if item == ("event", 2)
+    )
+    assert lifecycle.index(("pairing", 2)) < lifecycle.index(("round", 1))
+    assert lifecycle.index(("round", 1)) < next(
+        index
+        for index, item in enumerate(lifecycle)
+        if item == ("event", 3)
+    )
+    assert lifecycle[-2:] == [("pairing", 3), ("round", 2)]
+    assert [pairing.pairing_number for pairing in archive.pairings] == [1, 2, 3]
+
+
 def test_resume_championship_skips_completed_rounds() -> None:
     game = create_game("knowledge_quiz", rounds=1)
     players = _players(4)
@@ -254,6 +295,7 @@ def test_resume_championship_skips_completed_rounds() -> None:
     checkpoint = championship_checkpoint_with_series(checkpoint, first_round_series)
 
     events: list[tuple[int, int]] = []
+    completed_pairings: list[int] = []
     checkpoints: list[object] = []
 
     resumed = asyncio.run(
@@ -262,12 +304,16 @@ def test_resume_championship_skips_completed_rounds() -> None:
             players,
             checkpoint,
             on_event=lambda pairing, leg, event: events.append((pairing, leg)),
+            on_pairing_completed=lambda pairing, _series: completed_pairings.append(
+                pairing
+            ),
             on_checkpoint=checkpoints.append,
         )
     )
 
     # Only the final round's pairing (pairing number 3) is replayed.
     assert all(pairing == 3 for pairing, _ in events)
+    assert completed_pairings == [3]
     assert resumed.championship_id == "resume-champ-1"
     assert [c.completed_rounds for c in checkpoints] == [2]
     assert len(resumed.pairings) == 3
@@ -407,4 +453,3 @@ def test_eight_player_championship_checkpoint_per_round(tmp_path) -> None:
     formal = store.get_championship("champ-8-player-1")
     assert formal is not None
     assert formal.model_dump(mode="json") == archive.model_dump(mode="json")
-
