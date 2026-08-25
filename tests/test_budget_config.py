@@ -39,8 +39,38 @@ def test_resolved_budget_freezes_zero_cost_mock_route_and_stable_scope_id() -> N
         )
         == 0
     )
-    assert resolved.budget_id_for("tournament-1") == resolved.budget_id_for("tournament-1")
-    assert resolved.budget_id_for("tournament-1") != resolved.budget_id_for("tournament-2")
+    first = resolved.budget_id_for("tournament", "shared-scope")
+    assert first.startswith("budget:v2:")
+    assert first == resolved.budget_id_for("tournament", "shared-scope")
+    assert first == resolved.budget_id_for("shared-scope")
+    assert first != resolved.budget_id_for("tournament", "other-scope")
+    assert first != resolved.budget_id_for("championship", "shared-scope")
+
+
+@pytest.mark.parametrize(
+    ("scope_kind", "scope_id"),
+    [
+        ("", "scope"),
+        ("Championship", "scope"),
+        ("championship/unsafe", "scope"),
+        ("championship", ""),
+        ("championship", "x" * 513),
+    ],
+)
+def test_budget_scope_rejects_ambiguous_or_unbounded_inputs(
+    scope_kind: str,
+    scope_id: str,
+) -> None:
+    player = LLMPlayer("mock", MockProvider("fixed"), "fixed")
+    resolved = resolve_provider_budget(
+        [player],
+        _settings(max_provider_calls=1),
+        {},
+    )
+
+    assert resolved is not None
+    with pytest.raises(UsageValidationError, match="budget scope"):
+        resolved.budget_id_for(scope_kind, scope_id)
 
 
 def test_cloud_cost_budget_requires_exact_price() -> None:

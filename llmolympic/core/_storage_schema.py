@@ -15,7 +15,6 @@ from llmolympic.core._storage_types import (
     _V5_REQUIRED_COLUMNS,
     _V6_REQUIRED_COLUMNS,
     _V9_REQUIRED_COLUMNS,
-    _V10_REQUIRED_COLUMNS,
     SQLITE_INT_MAX,
     RatingSource,
     StorageError,
@@ -703,17 +702,31 @@ class _SchemaMixin:
         )
 
     @staticmethod
-    def _create_provider_usage_schema(connection: sqlite3.Connection) -> None:
-        """Create the content-free, integer-only Provider budget ledger."""
+    def _create_provider_budget_schema(
+        connection: sqlite3.Connection,
+        *,
+        table_name: str = "provider_budgets",
+    ) -> None:
+        """Create the current Provider-budget parent table.
 
+        ``provider_budgets_v11`` is the only alternate name used while an
+        existing v10 parent is rebuilt transactionally.  Keeping the table name
+        closed over a fixed allow-list prevents a migration helper from becoming
+        a general SQL-identifier interpolation surface.
+        """
+
+        if table_name not in {"provider_budgets", "provider_budgets_v11"}:
+            raise ValueError("unsupported Provider budget table name")
         connection.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS provider_budgets (
+            CREATE TABLE IF NOT EXISTS {table_name} (
                 budget_id TEXT PRIMARY KEY
                     CHECK (length(budget_id) BETWEEN 1 AND 128
                            AND instr(budget_id, char(0)) = 0),
                 tournament_id TEXT UNIQUE
                     REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                championship_id TEXT UNIQUE
+                    REFERENCES championship_checkpoints(championship_id) ON DELETE RESTRICT,
                 policy_json TEXT NOT NULL
                     CHECK (length(policy_json) BETWEEN 1 AND 65536),
                 policy_digest TEXT NOT NULL CHECK (
@@ -748,6 +761,9 @@ class _SchemaMixin:
                 finalized_at_epoch INTEGER CHECK (
                     finalized_at_epoch IS NULL OR finalized_at_epoch >= created_at_epoch
                 ),
+                CHECK (
+                    (tournament_id IS NOT NULL) + (championship_id IS NOT NULL) <= 1
+                ),
                 CHECK (spent_calls <= {SQLITE_INT_MAX} - reserved_calls),
                 CHECK (spent_input_tokens <= {SQLITE_INT_MAX} - reserved_input_tokens),
                 CHECK (spent_output_tokens <= {SQLITE_INT_MAX} - reserved_output_tokens),
@@ -779,6 +795,12 @@ class _SchemaMixin:
             ) STRICT
             """
         )
+
+    @staticmethod
+    def _create_provider_usage_schema(connection: sqlite3.Connection) -> None:
+        """Create the content-free, integer-only Provider budget ledger."""
+
+        _SchemaMixin._create_provider_budget_schema(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS provider_call_attempts (
@@ -919,6 +941,126 @@ class _SchemaMixin:
             WHERE runner_generation IS NOT NULL
             """
         )
+
+    @staticmethod
+    def _create_provider_usage_schema_v10(connection: sqlite3.Connection) -> None:
+        """Create the canonical pre-championship-budget v10 ledger shape."""
+
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS provider_budgets (
+                budget_id TEXT PRIMARY KEY
+                    CHECK (length(budget_id) BETWEEN 1 AND 128
+                           AND instr(budget_id, char(0)) = 0),
+                tournament_id TEXT UNIQUE
+                    REFERENCES tournament_checkpoints(tournament_id) ON DELETE RESTRICT,
+                policy_json TEXT NOT NULL
+                    CHECK (length(policy_json) BETWEEN 1 AND 65536),
+                policy_digest TEXT NOT NULL CHECK (
+                    length(policy_digest) = 64
+                    AND policy_digest = lower(policy_digest)
+                    AND policy_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+                limit_calls INTEGER CHECK (limit_calls IS NULL OR limit_calls >= 0),
+                limit_input_tokens INTEGER
+                    CHECK (limit_input_tokens IS NULL OR limit_input_tokens >= 0),
+                limit_output_tokens INTEGER
+                    CHECK (limit_output_tokens IS NULL OR limit_output_tokens >= 0),
+                limit_estimated_cost_nanos INTEGER
+                    CHECK (limit_estimated_cost_nanos IS NULL
+                           OR limit_estimated_cost_nanos >= 0),
+                spent_calls INTEGER NOT NULL CHECK (spent_calls >= 0),
+                spent_input_tokens INTEGER NOT NULL CHECK (spent_input_tokens >= 0),
+                spent_output_tokens INTEGER NOT NULL CHECK (spent_output_tokens >= 0),
+                spent_estimated_cost_nanos INTEGER NOT NULL
+                    CHECK (spent_estimated_cost_nanos >= 0),
+                reserved_calls INTEGER NOT NULL CHECK (reserved_calls >= 0),
+                reserved_input_tokens INTEGER NOT NULL CHECK (reserved_input_tokens >= 0),
+                reserved_output_tokens INTEGER NOT NULL CHECK (reserved_output_tokens >= 0),
+                reserved_estimated_cost_nanos INTEGER NOT NULL
+                    CHECK (reserved_estimated_cost_nanos >= 0),
+                poison_reason_code TEXT CHECK (
+                    poison_reason_code IS NULL OR poison_reason_code IN (
+                        'usage_exceeds_reservation', 'usage_counter_overflow'
+                    )
+                ),
+                created_at_epoch INTEGER NOT NULL CHECK (created_at_epoch >= 0),
+                finalized_at_epoch INTEGER CHECK (
+                    finalized_at_epoch IS NULL OR finalized_at_epoch >= created_at_epoch
+                ),
+                CHECK (spent_calls <= {SQLITE_INT_MAX} - reserved_calls),
+                CHECK (spent_input_tokens <= {SQLITE_INT_MAX} - reserved_input_tokens),
+                CHECK (spent_output_tokens <= {SQLITE_INT_MAX} - reserved_output_tokens),
+                CHECK (
+                    spent_estimated_cost_nanos
+                    <= {SQLITE_INT_MAX} - reserved_estimated_cost_nanos
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_calls IS NULL
+                    OR (spent_calls <= limit_calls
+                        AND reserved_calls <= limit_calls - spent_calls)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_input_tokens IS NULL
+                    OR (spent_input_tokens <= limit_input_tokens
+                        AND reserved_input_tokens <= limit_input_tokens - spent_input_tokens)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_output_tokens IS NULL
+                    OR (spent_output_tokens <= limit_output_tokens
+                        AND reserved_output_tokens <= limit_output_tokens - spent_output_tokens)
+                ),
+                CHECK (
+                    poison_reason_code IS NOT NULL OR limit_estimated_cost_nanos IS NULL
+                    OR (spent_estimated_cost_nanos <= limit_estimated_cost_nanos
+                        AND reserved_estimated_cost_nanos
+                            <= limit_estimated_cost_nanos - spent_estimated_cost_nanos)
+                )
+            ) STRICT
+            """
+        )
+        # The current helper is deliberately idempotent: the v10 parent above
+        # remains untouched while the shared attempt table and indexes are built.
+        _SchemaMixin._create_provider_usage_schema(connection)
+
+    @staticmethod
+    def _migrate_provider_usage_to_v11(connection: sqlite3.Connection) -> None:
+        """Rebuild only the budget parent, preserving every v10 attempt row."""
+
+        if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 0:
+            raise StorageError("SQLite v11 Provider budget migration requires foreign_keys=OFF")
+        _SchemaMixin._create_provider_budget_schema(
+            connection,
+            table_name="provider_budgets_v11",
+        )
+        connection.execute(
+            """
+            INSERT INTO provider_budgets_v11 (
+                budget_id, tournament_id, championship_id,
+                policy_json, policy_digest,
+                limit_calls, limit_input_tokens, limit_output_tokens,
+                limit_estimated_cost_nanos,
+                spent_calls, spent_input_tokens, spent_output_tokens,
+                spent_estimated_cost_nanos,
+                reserved_calls, reserved_input_tokens, reserved_output_tokens,
+                reserved_estimated_cost_nanos,
+                poison_reason_code, created_at_epoch, finalized_at_epoch
+            )
+            SELECT
+                budget_id, tournament_id, NULL,
+                policy_json, policy_digest,
+                limit_calls, limit_input_tokens, limit_output_tokens,
+                limit_estimated_cost_nanos,
+                spent_calls, spent_input_tokens, spent_output_tokens,
+                spent_estimated_cost_nanos,
+                reserved_calls, reserved_input_tokens, reserved_output_tokens,
+                reserved_estimated_cost_nanos,
+                poison_reason_code, created_at_epoch, finalized_at_epoch
+            FROM provider_budgets
+            """
+        )
+        connection.execute("DROP TABLE provider_budgets")
+        connection.execute("ALTER TABLE provider_budgets_v11 RENAME TO provider_budgets")
 
     @staticmethod
     @lru_cache(maxsize=1)
@@ -1554,13 +1696,10 @@ class _SchemaMixin:
 
     @staticmethod
     def _verify_v10_schema(connection: sqlite3.Connection) -> None:
-        _SchemaMixin._verify_required_columns(connection, _V10_REQUIRED_COLUMNS)
-        _SchemaMixin._verify_one_runner_lease_schema(
-            connection,
-            table="championship_runner_leases",
-            owner_table="championship_checkpoints",
-            owner_column="championship_id",
-        )
+        try:
+            verify_schema_manifest(connection, _SchemaMixin._expected_v10_schema_manifest())
+        except SchemaManifestError as exc:
+            raise StorageError(f"SQLite 数据库结构与 v10 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
@@ -1639,10 +1778,10 @@ class _SchemaMixin:
             _SchemaMixin._create_checkpoint_schema(reference)
             _SchemaMixin._create_runner_lease_schema(reference)
             _SchemaMixin._create_rating_operation_schema(reference)
-            _SchemaMixin._create_provider_usage_schema(reference)
             _SchemaMixin._create_championship_schema(reference)
             _SchemaMixin._create_championship_checkpoint_schema(reference)
             _SchemaMixin._create_championship_runner_lease_schema(reference)
+            _SchemaMixin._create_provider_usage_schema(reference)
             return introspect_schema(reference)
 
     @staticmethod
@@ -1664,7 +1803,7 @@ class _SchemaMixin:
             _SchemaMixin._create_checkpoint_schema(reference)
             _SchemaMixin._create_runner_lease_schema(reference)
             _SchemaMixin._create_rating_operation_schema(reference)
-            _SchemaMixin._create_provider_usage_schema(reference)
+            _SchemaMixin._create_provider_usage_schema_v10(reference)
             return introspect_schema(reference)
 
     @staticmethod
@@ -1686,8 +1825,26 @@ class _SchemaMixin:
             _SchemaMixin._create_checkpoint_schema(reference)
             _SchemaMixin._create_runner_lease_schema(reference)
             _SchemaMixin._create_rating_operation_schema(reference)
-            _SchemaMixin._create_provider_usage_schema(reference)
+            _SchemaMixin._create_provider_usage_schema_v10(reference)
             _SchemaMixin._create_championship_schema(reference)
+            return introspect_schema(reference)
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _expected_v10_schema_manifest() -> SchemaManifest:
+        """Build the canonical pre-championship-budget v10 manifest."""
+
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
+            _SchemaMixin._create_base_schema(reference)
+            _SchemaMixin._create_series_schema(reference)
+            _SchemaMixin._create_tournament_schema(reference)
+            _SchemaMixin._create_checkpoint_schema(reference)
+            _SchemaMixin._create_runner_lease_schema(reference)
+            _SchemaMixin._create_rating_operation_schema(reference)
+            _SchemaMixin._create_provider_usage_schema_v10(reference)
+            _SchemaMixin._create_championship_schema(reference)
+            _SchemaMixin._create_championship_checkpoint_schema(reference)
+            _SchemaMixin._create_championship_runner_lease_schema(reference)
             return introspect_schema(reference)
 
     @staticmethod
@@ -1702,7 +1859,7 @@ class _SchemaMixin:
         try:
             verify_schema_manifest(connection, _SchemaMixin._expected_schema_manifest())
         except SchemaManifestError as exc:
-            raise StorageError(f"SQLite 数据库结构与 v10 manifest 不一致：{exc}") from exc
+            raise StorageError(f"SQLite 数据库结构与 v11 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:
@@ -1714,4 +1871,3 @@ class _SchemaMixin:
         if rating_source not in ("engine", "imported"):
             raise ValueError("rating_source 必须是 'engine' 或 'imported'")
         return rating_source
-

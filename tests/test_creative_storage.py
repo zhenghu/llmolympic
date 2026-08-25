@@ -198,7 +198,7 @@ def test_creative_match_round_trips_and_updates_elo_once(tmp_path) -> None:
             json.loads(row[0])
             for row in connection.execute("SELECT identity_json FROM entrants").fetchall()
         ]
-    assert schema_before == schema_after == SCHEMA_VERSION == 10
+    assert schema_before == schema_after == SCHEMA_VERSION
     assert identities
     assert all("route_id" not in identity for identity in identities)
 
@@ -414,7 +414,7 @@ def test_creative_v1_judging_sqlite_round_trip_does_not_rewrite_archive(tmp_path
             "SELECT archive_json FROM matches WHERE match_id = ?",
             (historical.match_id,),
         ).fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
     loaded = store.get_match(historical.match_id)
     assert loaded is not None

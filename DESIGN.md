@@ -42,14 +42,16 @@
   引擎生成为 `local_engine`，外部构造为 `external`。只有旧 match/series schema v1
   （包括历史上省略版本号的 JSON）读入时标为 `legacy`；tournament/championship
   schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 10`，以 `entrants`、`entrant_id` 和展示名快照
+- SQLite 使用 `PRAGMA user_version = 11`，以 `entrants`、`entrant_id` 和展示名快照
   持久化对局、系列赛、循环赛、锦标赛、两类检查点、runner lease、榜单及评分历史。v1–v6
   数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表，v1–v6→v7 会按既有
   `rating_history` 写入顺序回填全局评分操作，并把历史 `matches` / `series_archives`
   规范化为当前表结构且原样保留归档 JSON；v7→v8 以 additive migration 新增 Provider
   预算及无内容调用尝试账本；v8→v9 以 additive migration 新增锦标赛档案、参赛者与
   对阵关系表；v9→v10 以 additive migration 新增锦标赛 checkpoint、已完成双局赛前缀与
-  runner lease。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
+  runner lease；v10→v11 在精确 v10 manifest 审计后事务性重建 `provider_budgets`，新增
+  互斥的 championship 作用域，并保留既有循环赛/独立预算和全部调用尝试。旧 checkpoint
+  不会被追溯绑定预算。所有升级失败时都回滚且
   不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
@@ -68,7 +70,7 @@
 ### 1.3 严格只读赛事审计
 
 - `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
-  `integrity_check` 和当前 schema v10 结构 manifest 覆盖整个文件，业务语义深验则限定在
+  `integrity_check` 和当前 schema v11 结构 manifest 覆盖整个文件，业务语义深验则限定在
   目标赛事。manifest 通过 `table_xinfo` / `table_list` / `index_list` / `index_xinfo` /
   `foreign_key_list` 及 fail-closed SQL token 解析，完整核对列、PK、UNIQUE、CHECK、FK、
   显式索引、排序/排序规则、partial predicate、STRICT/WITHOUT ROWID 和额外对象；不依赖
@@ -124,11 +126,13 @@
   价格和动态 OpenRouter 路由均 fail closed。OpenAI 与 Provider Profiles 是云端 LLM，
   Ollama 是本地 LLM，mock 是算法，human 是外部人类；Ollama/mock 未显式给价时按零估价。
 - `play` 的参赛者和评委共享一个内存 `UsageBudget`；`series` 两局共享同一个内存账本。
-  `round-robin` 在创建 checkpoint 的同一事务中写入 SQLite v8 budget，冻结限额、output cap、
+  `round-robin` 在创建 checkpoint 的同一事务中写入 SQLite v8 budget，`championship` 从
+  SQLite v11 起以同样方式写入独立作用域的 budget，冻结限额、output cap、
   input-bound/cost-rounding 版本及 `route_id → price` policy。每次 reserve/dispatch/settle
   都受 runner lease generation fencing；takeover 会释放旧 generation 的 reserved attempt，
   并把 dispatched attempt 按完整上界记为 unknown，然后才允许新 runner 继续。
-- `round-robin --resume` 拒绝所有显式预算 CLI 选项，并只读取 SQLite 中的冻结 policy；当前
+- `round-robin --resume` 与 `championship --resume` 拒绝所有显式预算 CLI 选项，并只读取
+  SQLite 中的冻结 policy；当前
   `[budget]`、`[pricing]` 及预算环境变量不会改变旧赛事。历史无预算 checkpoint 继续无预算
   恢复。`--allow-large-tournament` 只跳过静态规模确认，绝不改变硬预算状态机或额度。
 - 账本只持久化 opaque `route_id`、整数 policy/限额/累计值、attempt 状态、时间和 lease
@@ -288,7 +292,11 @@ CLI                  Web / WebSocket
   prefix 原子追加到 checkpoint；`--resume` 从最后完整轮边界恢复，跨进程 runner lease
   保证同一时刻只有一个执行者。恢复时核对 `Game.describe_config()`、完整 Player
   descriptor 与冻结评审团快照，只运行未完成轮次；全部完成时才在最终事务内封存正式
-  锦标赛档案与全部子双局赛（仍不计分）。锦标赛 checkpoint 暂不接入 Web 控制面，
+  锦标赛档案与全部子双局赛（仍不计分）。SQLite v11 为锦标赛增加持久 Provider 预算：
+  checkpoint 与预算原子创建，调用尝试受 championship runner generation fencing，接管时
+  保守清算旧 generation，最终事务同时封存档案、checkpoint、lease 与预算；命名 Profile
+  运行必须显式启用硬预算，历史无预算 Profile checkpoint 安全拒绝。锦标赛 checkpoint
+  暂不接入 Web 控制面，
   实时直播 sidecar 也仍未扩展为锦标赛模式。
 
 ## 7. 技术栈
@@ -352,6 +360,9 @@ CLI                  Web / WebSocket
    原子追加已完成的子双局赛 prefix；`llmolympic championship --resume` 从最后完整
    轮边界恢复，跨进程 runner lease 单写者互斥，恢复时校验项目配置、选手描述与冻结
    评审团快照，只运行未完成轮次，完成后在最终事务内封存正式档案与全部子双局赛（仍
-   不计分）。锦标赛尚未接入 Web 控制面与实时直播。
+   不计分）。4.6 预算增量（SQLite v11）再为锦标赛加入与 checkpoint 原子创建、跨进程恢复
+   不重置、runner generation fencing、接管保守清算及最终事务封存的 Provider 硬预算 ✅；
+   命名 Profile 运行必须显式启用预算，历史无预算 Profile checkpoint 安全拒绝。锦标赛尚未
+   接入 Web 控制面与实时直播。
    后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及锦标赛的
    Web 控制面与直播；之后新增项目继续保持纯插件接入。

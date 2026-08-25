@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -21,6 +22,7 @@ from llmolympic.core.usage import (
 from llmolympic.providers.base import DEFAULT_MAX_OUTPUT_TOKENS, UsageSupport
 
 _DYNAMIC_OPENROUTER_MODELS = frozenset({"openrouter/auto", "openrouter/free"})
+_BUDGET_SCOPE_KIND_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,16 +52,31 @@ class ResolvedProviderBudget:
             b"llmolympic-resolved-provider-budget-v1\0" + self.canonical_json.encode("ascii")
         ).hexdigest()
 
-    def budget_id_for(self, scope_id: str) -> str:
+    def budget_id_for(
+        self,
+        scope_kind: str,
+        scope_id: str | None = None,
+    ) -> str:
+        """Derive a v2 ID, retaining the v0.10 one-argument tournament API."""
+
+        if scope_id is None:
+            scope_id = scope_kind
+            scope_kind = "tournament"
+        if not isinstance(scope_kind, str) or _BUDGET_SCOPE_KIND_RE.fullmatch(scope_kind) is None:
+            raise UsageValidationError(
+                "budget scope kind must be a bounded lowercase ASCII identifier"
+            )
         if not isinstance(scope_id, str) or not scope_id or len(scope_id) > 512:
             raise UsageValidationError("budget scope id must be a bounded non-empty string")
         digest = hashlib.sha256(
-            b"llmolympic-provider-budget-scope-v1\0"
+            b"llmolympic-provider-budget-scope-v2\0"
+            + scope_kind.encode("ascii")
+            + b"\0"
             + scope_id.encode("utf-8")
             + b"\0"
             + self.digest.encode("ascii")
         ).hexdigest()
-        return f"budget:v1:{digest}"
+        return f"budget:v2:{digest}"
 
 
 def budget_is_enabled(settings: ProviderBudgetSettings) -> bool:

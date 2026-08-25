@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+- SQLite schema 升级至 v11：在通过 v10 精确 manifest 审计后，事务性重建
+  `provider_budgets`，新增唯一 `championship_id` 外键，并保证一份预算至多属于循环赛或
+  锦标赛中的一种。既有循环赛与独立预算、调用尝试及整数累计值原样保留；迁移失败会整体
+  回滚。锦标赛现在把 checkpoint 与冻结 Provider policy 原子创建，调用尝试受 championship
+  runner generation fencing；过期执行者接管时释放未调度预留、把已调度未知调用按完整上界
+  计费，最终档案、checkpoint、runner lease 与预算在同一事务中封存。
+- `championship` 的命名 Profile 参赛者或评委现在必须显式启用硬预算；恢复只使用 SQLite
+  冻结值，不接受当前预算配置覆盖。历史上没有预算账本的 Profile checkpoint 会在重建
+  Provider 前安全拒绝；全 Mock 无预算锦标赛继续兼容。预算 ID 升级为按赛事种类隔离的
+  `budget:v2`，既有 `budget:v1` 仍可按持久化关联恢复。
+
 ## [0.10.0] - 2026-08-25
 
 - 为锦标赛补齐 checkpoint/resume：SQLite v10 新增

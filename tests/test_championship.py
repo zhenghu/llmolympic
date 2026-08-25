@@ -21,6 +21,7 @@ from llmolympic.core.championship import (
 )
 from llmolympic.core.player import LLMPlayer
 from llmolympic.core.storage import (
+    SCHEMA_VERSION,
     ChampionshipRunnerLeaseBusyError,
     SeriesIdCollisionError,
     SQLiteStore,
@@ -108,7 +109,7 @@ def test_championship_save_is_unrated_and_idempotent(tmp_path) -> None:
     assert loaded.model_dump(mode="json") == archive.model_dump(mode="json")
 
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             connection.execute(
                 "SELECT count(*) FROM championship_archives WHERE rated = 1"
@@ -322,7 +323,7 @@ def test_championship_checkpoint_storage_round_trip_and_lease(tmp_path) -> None:
     assert formal is not None
     assert formal.model_dump(mode="json") == archive.model_dump(mode="json")
     with sqlite3.connect(store.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert (
             connection.execute(
                 "SELECT status FROM championship_checkpoints"
@@ -406,5 +407,4 @@ def test_eight_player_championship_checkpoint_per_round(tmp_path) -> None:
     formal = store.get_championship("champ-8-player-1")
     assert formal is not None
     assert formal.model_dump(mode="json") == archive.model_dump(mode="json")
-
 

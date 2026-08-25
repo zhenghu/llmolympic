@@ -119,10 +119,12 @@ chmod 600 config.toml
 ### 升级已有数据库
 
 首次用当前源码版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
-v10 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
+v11 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
 评分操作序号，并把历史迁移产生的 `matches` / `series_archives` 表规范化；v8 新增无内容的
 Provider 预算与调用尝试账本；v9 新增锦标赛正式档案关系表；v10 新增锦标赛 checkpoint、
-已完成双局赛前缀和跨进程 runner lease。旧 checkpoint 不会被追溯附加预算。升级前请停止
+已完成双局赛前缀和跨进程 runner lease；v11 在精确校验 v10 结构后事务性重建预算父表，
+增加锦标赛预算作用域并原样保留既有预算和调用尝试。旧 checkpoint 不会被追溯附加预算。
+升级前请停止
 所有正在写入该数据库的赛事进程，
 并使用 SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和
 `-shm` 文件。升级后的数据库不应再交给只支持旧 schema 的版本打开。可先运行
@@ -170,7 +172,8 @@ llmolympic play --game chess --players ollama:llama3.1:8b,mock:fixed
 
 ### Provider 硬预算
 
-`play`、`series` 和 `round-robin` 提供五个逐字段解析的 Provider 预算项；优先级均为
+`play`、`series`、`round-robin` 和 `championship` 提供五个逐字段解析的 Provider 预算项；
+优先级均为
 CLI > 环境变量 > `[budget]` > 默认值：
 
 | 语义 | CLI | 环境变量 | `config.toml` |
@@ -216,8 +219,9 @@ Ollama 和 mock 未显式配置价格时按零估价。美元数值只是按这�
 不是 Provider 最终账单或账户级支付保护；仍须在 Provider 账户或网关设置独立费用上限。
 
 `play` 的所有参赛者与创意评委共享一个内存账本；`series` 的两局共享同一内存账本，不能
-在第二局重新获得额度。`round-robin` 则使用 SQLite v8 持久化整项赛事的冻结 policy、限额、
-预留与实际用量，跨进程恢复也不会重置预算。预算表只保存 opaque `route_id`、整数限额/计数、
+在第二局重新获得额度。`round-robin` 使用 SQLite v8、`championship` 使用 SQLite v11
+持久化整项赛事的冻结 policy、限额、预留与实际用量，跨进程恢复也不会重置预算。预算表只
+保存 opaque `route_id`、整数限额/计数、
 状态、时间与 lease generation，不保存 API Key、原始端点、请求头、模型名、prompt、response
 或 Provider 原始异常。
 
@@ -567,14 +571,21 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 未完成轮次不会形成可见前缀，`championship --resume <CHAMPIONSHIP_ID>` 会从上一完整轮边界
 重新运行整轮。恢复时不能覆盖开赛时冻结的项目配置、选手描述、seed、超时或创意评审团，
 跨进程 runner lease 会阻止两个执行者同时保存进度或封存同一锦标赛。全部轮次完成后，
-正式锦标赛、配对和子双局赛才在最终事务中一起封存。锦标赛 checkpoint 当前仅支持 CLI，
+正式锦标赛、配对和子双局赛才在最终事务中一起封存。
+
+当前源码的 SQLite v11 还会把新锦标赛的冻结 Provider 预算与空 checkpoint 原子创建；
+参赛者和创意评委共享同一持久账本，恢复只读取数据库中的冻结限额、路由价格和单次输出上限。
+runner generation 同时 fencing 预算调用：接管时，旧执行者未调度的预留会释放，已经调度但
+无法确认用量的调用按完整上界计费。命名 Profile 参赛者或评委必须显式启用硬预算；历史上
+缺少预算账本的 Profile checkpoint 会在重建 Provider 前安全拒绝，全 Mock 无预算 checkpoint
+仍可恢复。锦标赛 checkpoint 当前仅支持 CLI，
 尚未接入 Web 控制面或实时直播。
 
 ### 严格只读赛事审计
 
 `audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
 权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
-schema v10 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
+schema v11 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
 正式赛事、参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分
 赛事的稳定身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
 已封存赛事会验证正式档案。manifest 会核对表与列、PK、UNIQUE、CHECK、FK、显式索引及
@@ -665,7 +676,7 @@ quorum 时命令失败，不写入对局，也不更新 ELO。
 `panel` 中冻结完整评审团及每名评委的 `route_id`；即使全部参赛者都已技术放弃、没有
 实际评委调用，也能复核评委路由唯一性。v3 还绑定规范化 `JudgingRequest` 摘要，使题面、
 rubric、匿名映射和作品正文不能在不破坏深度审计的情况下被替换。旧 schema v1/v2 裁决仍
-可读取；其中 v1 因没有路由快照，不能被视为已验证路由独立。SQLite 当前使用 schema v10；
+可读取；其中 v1 因没有路由快照，不能被视为已验证路由独立。SQLite 当前使用 schema v11；
 Provider 预算账本自 v8 起保留。最终双人比分继续进入总榜和 `creative_writing` 项目榜。
 
 评委原始响应、API Key、原始端点和请求头不会进入档案。`route_id` 是稳定、可跨档案
