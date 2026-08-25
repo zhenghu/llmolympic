@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+import llmolympic.human_input as human_input_module
 from llmolympic.core.player import HumanPlayer, PlayerTimeoutError
 from llmolympic.core.storage import SQLiteStore
 from llmolympic.human_input import (
@@ -106,8 +107,12 @@ async def _wait_for_request(
     session: InputSessionStore,
     *,
     previous: str | None = None,
+    timeout_seconds: float = 5.0,
 ):
-    for _ in range(100):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    delay = 0.005
+    while True:
         try:
             snapshot = _load(web, session)
         except HumanInputError as exc:
@@ -117,7 +122,11 @@ async def _wait_for_request(
             request = snapshot.request
             if request is not None and request.request_id != previous:
                 return request
-        await asyncio.sleep(0.005)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(delay, remaining))
+        delay = min(delay * 2, 0.05)
     raise AssertionError("browser-human request did not become visible")
 
 
@@ -502,6 +511,154 @@ def test_sixteen_seats_retry_contention_across_heartbeat_and_polling(
     finally:
         for session in sessions:
             session.close()
+
+
+@pytest.mark.parametrize(
+    ("sqlite_code", "sqlite_message"),
+    [
+        (None, "database is locked"),
+        (sqlite3.SQLITE_BUSY, "database is busy"),
+    ],
+)
+def test_web_connection_retries_transient_schema_contention_and_closes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_code: int | None,
+    sqlite_message: str,
+) -> None:
+    archive = tmp_path / "web-schema-contention.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    web = _web(archive)
+    original_connect = human_input_module._connect
+    original_validate_schema = human_input_module._validate_schema
+    connections: list[sqlite3.Connection] = []
+    attempts = 0
+
+    def recording_connect(*args, **kwargs) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    def contended_validate_schema(connection: sqlite3.Connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError(sqlite_message)
+            if sqlite_code is not None:
+                error.sqlite_errorcode = sqlite_code
+            raise HumanInputError("input_unavailable") from error
+        original_validate_schema(connection)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(human_input_module, "_connect", recording_connect)
+            patch.setattr(
+                human_input_module,
+                "_validate_schema",
+                contended_validate_schema,
+            )
+            connection = web._connection()
+            try:
+                assert attempts == 2
+                assert connection is connections[1]
+                with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                    connections[0].execute("SELECT 1")
+                assert connection.execute("SELECT 1").fetchone()[0] == 1
+            finally:
+                connection.close()
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "sqlite_message"),
+    [
+        ("input_invalid", None),
+        ("input_unavailable", "malformed database schema"),
+    ],
+)
+def test_web_connection_does_not_retry_non_contention_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    sqlite_message: str | None,
+) -> None:
+    archive = tmp_path / f"web-schema-{error_code}.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    web = _web(archive)
+    original_connect = human_input_module._connect
+    connections: list[sqlite3.Connection] = []
+    attempts = 0
+
+    def recording_connect(*args, **kwargs) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    def failing_validate_schema(_connection: sqlite3.Connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if sqlite_message is None:
+            raise HumanInputError(error_code)
+        try:
+            raise sqlite3.OperationalError(sqlite_message)
+        except sqlite3.OperationalError as exc:
+            raise HumanInputError(error_code) from exc
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(human_input_module, "_connect", recording_connect)
+            patch.setattr(
+                human_input_module,
+                "_validate_schema",
+                failing_validate_schema,
+            )
+            with pytest.raises(HumanInputError) as caught:
+                web._connection()
+            assert caught.value.code == error_code
+            if sqlite_message is not None:
+                assert str(caught.value.__cause__) == sqlite_message
+            assert attempts == 1
+            assert len(connections) == 1
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                connections[0].execute("SELECT 1")
+    finally:
+        session.close()
+
+
+def test_connect_closes_connection_when_a_setup_pragma_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "connect-pragma-contention.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    input_path = derive_human_input_database_path(archive)
+
+    class FailingConnection:
+        row_factory = None
+        closed = False
+
+        def execute(self, _statement: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                human_input_module.sqlite3,
+                "connect",
+                lambda *_args, **_kwargs: connection,
+            )
+            with pytest.raises(HumanInputError) as caught:
+                human_input_module._connect(input_path, create=False)
+            assert caught.value.code == "input_unavailable"
+            assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+            assert connection.closed
+    finally:
+        session.close()
 
 
 def test_heartbeat_contention_exhaustion_becomes_explicit_session_failure(
@@ -1101,17 +1258,71 @@ def test_timeout_submission_race_is_atomic_first_write_wins(tmp_path: Path) -> N
 
 def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     archive = tmp_path / "archive.db"
     session = _session(archive)
     web = _web(archive)
+    original_create_request = InputSessionStore._create_request
+    original_cancel_request = InputSessionStore._cancel_request
+    request_committed = threading.Event()
+    allow_create_return = threading.Event()
+    create_attempts = 0
+    cancel_attempts = 0
+
+    def delayed_create_request(
+        current: InputSessionStore,
+        prompt: str,
+        timeout_seconds: float,
+        match_event_seq: int,
+    ) -> str:
+        nonlocal create_attempts
+        create_attempts += 1
+        request_id = original_create_request(
+            current,
+            prompt,
+            timeout_seconds,
+            match_event_seq,
+        )
+        if create_attempts == 1:
+            request_committed.set()
+            assert allow_create_return.wait(timeout=5.0)
+        return request_id
+
+    def contended_cancel_request(
+        current: InputSessionStore,
+        request_id: str,
+    ) -> None:
+        nonlocal cancel_attempts
+        cancel_attempts += 1
+        if cancel_attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original_cancel_request(current, request_id)
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_create_request",
+        delayed_create_request,
+    )
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_cancel_request",
+        contended_cancel_request,
+    )
 
     async def scenario() -> None:
         cancelled = asyncio.create_task(session.resolve("first", timeout_seconds=1.0))
-        first = await _wait_for_request(web, session)
+        assert await asyncio.to_thread(request_committed.wait, 2.0)
+        snapshot = _load(web, session)
+        assert snapshot.request is not None
+        first = snapshot.request
         cancelled.cancel()
+        await asyncio.sleep(0)
+        assert not cancelled.done()
+        allow_create_return.set()
         with pytest.raises(asyncio.CancelledError):
             await cancelled
+        assert cancel_attempts == 2
         assert _error_code(
             lambda: _submit(
                 web,
@@ -1135,6 +1346,95 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
 
     try:
         asyncio.run(scenario())
+    finally:
+        allow_create_return.set()
+        session.close()
+
+
+def test_cancelled_failed_creation_is_drained_and_latest_cancellation_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session(tmp_path / "cancel-create-failure.db", heartbeat_seconds=59.0)
+    creation_entered = threading.Event()
+    allow_creation_failure = threading.Event()
+
+    def failing_create_request(
+        _current: InputSessionStore,
+        _prompt: str,
+        _timeout_seconds: float,
+        _match_event_seq: int,
+    ) -> str:
+        creation_entered.set()
+        assert allow_creation_failure.wait(timeout=5.0)
+        raise HumanInputError("input_unavailable")
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_create_request",
+        failing_create_request,
+    )
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            cancelled = asyncio.create_task(
+                session.resolve("first", timeout_seconds=1.0)
+            )
+            assert await asyncio.to_thread(creation_entered.wait, 2.0)
+            cancelled.cancel("first")
+            await asyncio.sleep(0)
+            cancelled.cancel("second")
+            await asyncio.sleep(0)
+            allow_creation_failure.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await cancelled
+            assert caught.value.args == ("second",)
+            await asyncio.sleep(0)
+            assert unhandled == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        allow_creation_failure.set()
+        session.close()
+
+
+def test_cancel_request_surfaces_non_contention_sqlite_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session(tmp_path / "cancel-failure.db", heartbeat_seconds=59.0)
+
+    class FailingConnection:
+        rolled_back = False
+        closed = False
+
+        def execute(self, _statement: str, _parameters=()):
+            raise sqlite3.OperationalError("malformed database schema")
+
+        def rollback(self) -> None:
+            self.rolled_back = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+    monkeypatch.setattr(session, "_owner_connection", lambda: connection)
+
+    try:
+        with pytest.raises(HumanInputError) as caught:
+            session._cancel_request("a" * 32)
+        assert caught.value.code == "input_unavailable"
+        assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+        assert str(caught.value.__cause__) == "malformed database schema"
+        assert connection.rolled_back
+        assert connection.closed
     finally:
         session.close()
 

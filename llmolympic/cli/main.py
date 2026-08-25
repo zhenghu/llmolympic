@@ -3498,7 +3498,7 @@ def leaderboard(
 
 @app.command(name="archive")
 def show_archive(
-    match_id: str = typer.Argument(..., help="对局、系列赛或循环赛 ID"),
+    match_id: str = typer.Argument(..., help="对局、系列赛、循环赛或锦标赛 ID"),
     database: Annotated[Path | None, typer.Option("--db", help="SQLite 文件")] = None,
 ) -> None:
     """输出一场对局、一个双局赛、一个循环赛或一个锦标赛的完整 JSON 档案。"""
@@ -3527,5 +3527,6 @@ def show_archive(
             archive.to_json(),
             max_chars=ARCHIVE_DISPLAY_LIMIT,
             multiline=True,
-        )
+        ),
+        soft_wrap=True,
     )

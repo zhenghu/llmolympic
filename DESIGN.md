@@ -42,13 +42,14 @@
   引擎生成为 `local_engine`，外部构造为 `external`。只有旧 match/series schema v1
   （包括历史上省略版本号的 JSON）读入时标为 `legacy`；tournament/championship
   schema v1 不使用 legacy 来源。
-- SQLite 使用 `PRAGMA user_version = 9`，以 `entrants`、`entrant_id` 和展示名快照
-  持久化对局、系列赛、循环赛、循环赛检查点、runner lease、榜单及评分历史。v1–v6
+- SQLite 使用 `PRAGMA user_version = 10`，以 `entrants`、`entrant_id` 和展示名快照
+  持久化对局、系列赛、循环赛、锦标赛、两类检查点、runner lease、榜单及评分历史。v1–v6
   数据库升级在单一事务内完成；v5→v6 会增加 runner lease 表，v1–v6→v7 会按既有
   `rating_history` 写入顺序回填全局评分操作，并把历史 `matches` / `series_archives`
   规范化为当前表结构且原样保留归档 JSON；v7→v8 以 additive migration 新增 Provider
   预算及无内容调用尝试账本；v8→v9 以 additive migration 新增锦标赛档案、参赛者与
-  对阵关系表。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
+  对阵关系表；v9→v10 以 additive migration 新增锦标赛 checkpoint、已完成双局赛前缀与
+  runner lease。旧 checkpoint 不会被追溯绑定预算。所有升级失败时都回滚且
   不提升版本号。
 - 历史名称映射为 `legacy:` + `SHA-256(name.encode("utf-8"))`。计算使用名称的
   **精确 UTF-8 字节**，不做 Unicode 规范化或大小写折叠；legacy 命名空间与新
@@ -61,12 +62,13 @@
   `rating_source="engine"` 仅供
   本进程完成对局后的可信调用路径，
   双人对局才计分；它是调用方信任声明，不是认证、签名或对来源的密码学证明。
-  同一 match/series/tournament ID 也不能通过重新保存从 imported 升级为 engine。
+  同一 match/series/tournament/championship ID 也不能通过重新保存从 imported 升级为
+  engine。
 
 ### 1.3 严格只读赛事审计
 
 - `audit-tournament` 只审计调用方指定的一项循环赛或 checkpoint；SQLite 的完整
-  `integrity_check` 和当前 schema v8 结构 manifest 覆盖整个文件，业务语义深验则限定在
+  `integrity_check` 和当前 schema v10 结构 manifest 覆盖整个文件，业务语义深验则限定在
   目标赛事。manifest 通过 `table_xinfo` / `table_list` / `index_list` / `index_xinfo` /
   `foreign_key_list` 及 fail-closed SQL token 解析，完整核对列、PK、UNIQUE、CHECK、FK、
   显式索引、排序/排序规则、partial predicate、STRICT/WITHOUT ROWID 和额外对象；不依赖
@@ -177,8 +179,8 @@ class Game(Protocol):
 评委 ID 和 `route_id` 均唯一，正常裁决的成功/失败记录必须精确覆盖该快照；全固定分路径
 虽然不调用评委，也仍保留同一快照。v3 额外绑定规范化请求摘要，将任务、rubric、匿名映射
 和作品正文与裁决证据连接；深度审计按事件重建请求并复核摘要。旧 v1/v2 裁决兼容读取，
-但 v1 不具备已验证的路由独立性。嵌套裁决版本升级不改变 MatchArchive v2；当前 SQLite
-schema v8 另行承载 Provider 预算账本。
+但 v1 不具备已验证的路由独立性。嵌套裁决版本升级不改变 MatchArchive v2；SQLite v8
+引入的 Provider 预算账本在后续 schema 中继续保留。
 
 创意 `series` 的两局复用一个 `JudgePanelSnapshot` 并原子计分；`round-robin` 在零进度
 checkpoint 中冻结同一快照，恢复时由当前凭据重建评委并在模型调用前验证安全描述与路由。
@@ -342,9 +344,10 @@ CLI                  Web / WebSocket
    比赛 worker 经既有事务写入，网页不能提交命令、路径、凭据、endpoint 或任意模型配置。
    该控制面仍只信任回环地址上的本机操作者，同一数据库最多一个活动 Web 任务，
    play/series 中断后不自动重跑。
-   4.6 以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
+   4.6（v0.9.0）以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
    先后手双局赛、确定性平局打破、SQLite v9 只存档不计分的锦标赛档案；串行执行。
-   4.6 追加锦标赛 checkpoint/resume ✅：SQLite v10 新增 `championship_checkpoints` /
+   4.6 后续增量（v0.10.0）追加锦标赛 checkpoint/resume ✅：SQLite v10 新增
+   `championship_checkpoints` /
    `championship_checkpoint_series` / `championship_runner_leases`，每完成一整轮
    原子追加已完成的子双局赛 prefix；`llmolympic championship --resume` 从最后完整
    轮边界恢复，跨进程 runner lease 单写者互斥，恢复时校验项目配置、选手描述与冻结

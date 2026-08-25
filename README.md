@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.9.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.10.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.9.0/llmolympic-0.9.0-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.9.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.10.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command`、`championship.command`、
 `start_web.command` 和 `stop_web.command` 随源码仓库和 GitHub 自动生成的源码归档提供，不包含在
 wheel 中。
@@ -119,10 +119,11 @@ chmod 600 config.toml
 ### 升级已有数据库
 
 首次用当前源码版本打开旧版 SQLite 存档时，程序会在事务内将 schema 升级到
-v8 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
+v10 并保留既有档案和 ELO。v7 会按既有 `rating_history` 的 SQLite 写入顺序回填全局
 评分操作序号，并把历史迁移产生的 `matches` / `series_archives` 表规范化；v8 新增无内容的
-Provider 预算与调用尝试账本。旧 checkpoint 不会被追溯附加预算。升级前请停止所有正在写入
-该数据库的赛事进程，
+Provider 预算与调用尝试账本；v9 新增锦标赛正式档案关系表；v10 新增锦标赛 checkpoint、
+已完成双局赛前缀和跨进程 runner lease。旧 checkpoint 不会被追溯附加预算。升级前请停止
+所有正在写入该数据库的赛事进程，
 并使用 SQLite 备份机制制作一致备份；如果直接复制文件，必须同时处理同名的 `-wal` 和
 `-shm` 文件。升级后的数据库不应再交给只支持旧 schema 的版本打开。可先运行
 `llmolympic doctor --db 路径` 进行只读检查；`doctor` 不执行迁移。
@@ -293,6 +294,9 @@ llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db --j
 llmolympic championship --game knowledge_quiz \
   --players mock:random,mock:fixed,mock:illegal,mock:balanced --rounds 5 --seed 42
 
+# 自 v0.10.0 起：从最后完成的整轮边界恢复中断的锦标赛
+llmolympic championship --resume <CHAMPIONSHIP_ID> --db ~/.llmolympic/llmolympic.db
+
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
 llmolympic play --game chess --players human:我,mock:random
 
@@ -320,7 +324,7 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_OR_CHAMPIONSHIP_ID>
 
 ```bash
 python -m pip install \
-  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.9.0/llmolympic-0.9.0-py3-none-any.whl"
+  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl"
 ```
 
 安装后可以打开本机 Web 服务。正式存档和实时 sidecar 对 Web 进程始终只读；只有持席位
@@ -367,7 +371,8 @@ Provider 调用前安全失败。
 含非 Mock Provider 却没有冻结预算的旧 checkpoint 仍可使用 CLI 按既有规则处理，但 Web 不会
 事后附加预算或启动它。`play` 与 `series` 不会自动重跑，以免重复 Provider 调用。
 
-要从浏览器真正参加一场比赛，先保持 Web 服务运行，再在另一个终端启动单场 `play`：
+要从浏览器真正参加一场比赛，可以在持管理凭证的 `/new` 页面直接创建含 Human 的单场
+`play`；也可以保持 Web 服务运行，再从另一个终端启动同一数据库上的 `play`：
 
 ```bash
 llmolympic play \
@@ -451,7 +456,7 @@ POST、Bearer capability、严格 JSON/体积上限和幂等标识。正式主�
 worker 的既有原子存档路径。jobs sidecar 和公开 DTO 只保留 Profile ID、脱敏显示名、Provider
 类型、默认模型与无凭据配置摘要，不包含 endpoint、凭据环境变量名或值、请求头或原始失败详情。
 旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样
-公开。带正式身份认证、资源授权和 TLS 的远程使用，以及独立的单场多题总分制锦标赛模式，
+公开。带正式身份认证、资源授权和 TLS 的远程使用，以及锦标赛 Web 控制与实时直播，
 仍留给后续阶段四切片。
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
@@ -551,11 +556,25 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 从 SQLite v5 升级前应先停止仍在运行的旧版 `round-robin` 进程；旧进程本身不理解 v6 lease，
 不能依靠升级后的数据库反向约束已经加载的旧代码。
 
+### 单淘汰锦标赛与恢复
+
+`championship` 接受 4、8 或 16 名非人类选手，按单淘汰制逐轮运行；每个对阵交换先后手
+完成两局，平局依次按较少技术负和较小 `entrant_id` 确定晋级者。锦标赛及其子双局赛会
+完整存档，但不更新 ELO。
+
+自 v0.10.0 起，`championship` 会在首次 Provider 调用前创建 SQLite v10 checkpoint 并
+显示锦标赛 ID 与恢复命令。每完成一整轮才原子追加该轮全部双局赛；若进程在一轮中途退出，
+未完成轮次不会形成可见前缀，`championship --resume <CHAMPIONSHIP_ID>` 会从上一完整轮边界
+重新运行整轮。恢复时不能覆盖开赛时冻结的项目配置、选手描述、seed、超时或创意评审团，
+跨进程 runner lease 会阻止两个执行者同时保存进度或封存同一锦标赛。全部轮次完成后，
+正式锦标赛、配对和子双局赛才在最终事务中一起封存。锦标赛 checkpoint 当前仅支持 CLI，
+尚未接入 Web 控制面或实时直播。
+
 ### 严格只读赛事审计
 
 `audit-tournament` 不创建 Provider、不访问网络，也不经 `SQLiteStore` 的初始化、迁移或
 权限收紧路径。它以 immutable、query-only 快照执行完整 SQLite integrity check、当前
-schema v8 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
+schema v10 结构 manifest 与外键完整性检查，再深度核对指定赛事的 checkpoint 连续前缀、
 正式赛事、参赛者/配对/系列/对局关系索引、checkpoint 与既有可信身份的可封存性、已计分
 赛事的稳定身份绑定，以及赛事 ELO 快照、逐局贡献和评分历史。进行中的赛事会报告可恢复进度；
 已封存赛事会验证正式档案。manifest 会核对表与列、PK、UNIQUE、CHECK、FK、显式索引及
@@ -609,12 +628,14 @@ LLM 每步默认限时 120 秒，可用 `--llm-timeout`、环境变量
 封存同一赛事也不会重复计分。循环赛在最终封存事务开始时读取并冻结当前 ELO，
 再为所有对局计算期望值；因此中断期间先落库的其他计分对局会先进入基准分。在给定
 同一组已完成对局结果和同一封存基准分时，ELO 聚合不受处理或保存顺序影响。对阵执行
-顺序仍可能影响有状态或随机 Provider 的实际输出。
+顺序仍可能影响有状态或随机 Provider 的实际输出。`championship` 则在每个完整轮次结束时
+原子追加不计分 checkpoint，全部轮次完成后再用最终事务封存锦标赛、子系列和对局，始终
+不更新 ELO。
 直接使用 Python 存储 API 时，`SQLiteStore.save_match()` / `save_series()` /
-`save_tournament()` 默认按外部导入处理，只存档、不计分；只有本地比赛引擎应显式传入
-`rating_source="engine"`，该参数是本进程内的信任声明，并非来源认证或数字签名。
-`history` 会标出循环赛 ID、对阵号、系列赛 ID 与局号；`archive` 可用对局、系列赛
-或循环赛 ID 读取对应的完整档案。
+`save_tournament()` / `save_championship()` 默认按外部导入处理，只存档、不计分；只有本地
+比赛引擎应显式传入 `rating_source="engine"`，该参数是本进程内的信任声明，并非来源认证
+或数字签名。`history` 会标出循环赛 ID、对阵号、系列赛 ID 与局号；`archive` 可用对局、
+系列赛、循环赛或锦标赛 ID 读取对应的完整档案。
 完整事件流、每步作答、选手配置和最终比分均保存在档案中。默认数据库位于
 `~/.llmolympic/llmolympic.db`；可用 `LLMOLYMPIC_DB`、`[storage] database`
 或各命令的 `--db` 覆盖。
@@ -644,8 +665,8 @@ quorum 时命令失败，不写入对局，也不更新 ELO。
 `panel` 中冻结完整评审团及每名评委的 `route_id`；即使全部参赛者都已技术放弃、没有
 实际评委调用，也能复核评委路由唯一性。v3 还绑定规范化 `JudgingRequest` 摘要，使题面、
 rubric、匿名映射和作品正文不能在不破坏深度审计的情况下被替换。旧 schema v1/v2 裁决仍
-可读取；其中 v1 因没有路由快照，不能被视为已验证路由独立。SQLite 当前使用 schema v8，
-最终双人比分继续进入总榜和 `creative_writing` 项目榜。
+可读取；其中 v1 因没有路由快照，不能被视为已验证路由独立。SQLite 当前使用 schema v10；
+Provider 预算账本自 v8 起保留。最终双人比分继续进入总榜和 `creative_writing` 项目榜。
 
 评委原始响应、API Key、原始端点和请求头不会进入档案。`route_id` 是稳定、可跨档案
 关联的端点伪名；常见端点可能通过字典枚举被猜出，因此它不是加密或保密边界。路由检查
@@ -722,8 +743,8 @@ CI 与 Release 仍会分别从 wheel 和 sdist 运行零费用的三 mock 评委
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.9.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.9.0.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.10.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.10.0.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。

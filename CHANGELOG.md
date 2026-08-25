@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-25
+
 - 为锦标赛补齐 checkpoint/resume：SQLite v10 新增
   `championship_checkpoints` / `championship_checkpoint_series` /
   `championship_runner_leases`，通过 additive migration 从 v9 升级。锦标赛串行执行，
@@ -12,6 +14,9 @@
   保证同一时刻只有一个执行者；恢复时核对项目配置、选手描述与冻结评审团快照，
   只运行未完成轮次，完成后在最终事务内封存正式锦标赛档案与全部子双局赛（仍不计分）。
   锦标赛 checkpoint 暂未接入 Web 控制面与实时直播。
+- 修复多人浏览器席位高并发时，Web 输入 sidecar 的 schema 校验或取消清理可能因瞬时
+  SQLite `BUSY` / `LOCKED` 直接失败的问题；现在仅对此类争用做有界重试，并在每次连接
+  失败后正确关闭连接。
 
 ## [0.9.0] - 2026-08-19
 

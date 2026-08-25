@@ -242,6 +242,7 @@ def _connect(path: Path, *, create: bool, timeout: float = 1.0) -> sqlite3.Conne
         _create_private_file(path)
     else:
         _check_regular_file(path, missing_code="participation_not_found")
+    connection: sqlite3.Connection | None = None
     try:
         uri = f"{path.as_uri()}?mode=rw"
         connection = sqlite3.connect(uri, uri=True, timeout=timeout)
@@ -252,6 +253,11 @@ def _connect(path: Path, *, create: bool, timeout: float = 1.0) -> sqlite3.Conne
         connection.execute("PRAGMA busy_timeout = 1000")
         return connection
     except sqlite3.Error as exc:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
         raise HumanInputError("input_unavailable") from exc
 
 
@@ -580,14 +586,37 @@ class InputSessionStore:
         ):
             raise HumanInputError("input_invalid")
         prompt = _validate_text(prompt, maximum=INPUT_MAX_PROMPT_CHARS)
-        request_id = await asyncio.to_thread(
-            self._retry_sqlite_contention,
-            lambda: self._create_request(
-                prompt,
-                timeout_seconds,
-                match_event_seq,
-            ),
+        create_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._retry_sqlite_contention,
+                lambda: self._create_request(
+                    prompt,
+                    timeout_seconds,
+                    match_event_seq,
+                ),
+            )
         )
+        cancelled_error: asyncio.CancelledError | None = None
+        while True:
+            try:
+                request_id = await asyncio.shield(create_task)
+                break
+            except asyncio.CancelledError as exc:
+                if create_task.cancelled():
+                    raise cancelled_error or exc
+                cancelled_error = exc
+            except Exception:
+                if cancelled_error is not None:
+                    raise cancelled_error from None
+                raise
+
+        if cancelled_error is not None:
+            cancelled_error = await self._finish_cancelled_request(
+                request_id,
+                cancelled_error,
+            )
+            raise cancelled_error
+
         try:
             while True:
                 outcome = await asyncio.to_thread(
@@ -602,9 +631,34 @@ class InputSessionStore:
                 f"{self.player_name} 超时未作答",
                 details={"timeout_seconds": timeout_seconds},
             ) from exc
-        except asyncio.CancelledError:
-            await asyncio.to_thread(self._cancel_request, request_id)
-            raise
+        except asyncio.CancelledError as exc:
+            cancelled_error = await self._finish_cancelled_request(request_id, exc)
+            raise cancelled_error
+
+    async def _finish_cancelled_request(
+        self,
+        request_id: str,
+        cancelled_error: asyncio.CancelledError,
+    ) -> asyncio.CancelledError:
+        """Finish best-effort cleanup before propagating the latest cancellation."""
+
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._retry_sqlite_contention,
+                lambda: self._cancel_request(request_id),
+            )
+        )
+        while True:
+            try:
+                await asyncio.shield(cleanup_task)
+                return cancelled_error
+            except asyncio.CancelledError as exc:
+                if cleanup_task.cancelled():
+                    return exc
+                cancelled_error = exc
+            except HumanInputError:
+                # Cleanup is best-effort and must not replace cancellation.
+                return cancelled_error
 
     def _create_request(
         self,
@@ -833,10 +887,7 @@ class InputSessionStore:
             _secure_file(self.path)
 
     def _cancel_request(self, request_id: str) -> None:
-        try:
-            connection = self._owner_connection()
-        except HumanInputError:
-            return
+        connection = self._owner_connection()
         now = float(self._clock())
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -856,8 +907,9 @@ class InputSessionStore:
                 ),
             )
             connection.commit()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             connection.rollback()
+            raise HumanInputError("input_unavailable") from exc
         finally:
             connection.close()
             try:
@@ -945,13 +997,23 @@ class WebSubmissionStore:
         self._clock = clock
 
     def _connection(self) -> sqlite3.Connection:
-        connection = _connect(self.path, create=False)
-        try:
-            _validate_schema(connection)
-        except HumanInputError:
-            connection.close()
-            raise
-        return connection
+        for attempt in range(_SQLITE_CONTENTION_ATTEMPTS):
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = _connect(self.path, create=False)
+                _validate_schema(connection)
+                return connection
+            except HumanInputError as exc:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                if not _is_sqlite_contention(exc) or attempt + 1 == _SQLITE_CONTENTION_ATTEMPTS:
+                    raise
+                time.sleep(_SQLITE_CONTENTION_RETRY_SECONDS * (2**attempt))
+
+        raise AssertionError("unreachable")
 
     def load(self, session_id: str, seat_id: str, *, capability: str) -> InputSnapshot:
         if _SAFE_ID_RE.fullmatch(session_id) is None or _SAFE_ID_RE.fullmatch(seat_id) is None:
