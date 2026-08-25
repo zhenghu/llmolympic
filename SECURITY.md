@@ -4,11 +4,11 @@
 
 | 版本 | 安全修复 |
 | --- | --- |
-| `0.9.x` | 支持 |
+| `0.10.x` | 支持 |
 | `main` | 支持（下一版本开发线） |
-| `<0.9.0`、历史提交和其他功能分支 | 不支持 |
+| `<0.10.0`、历史提交和其他功能分支 | 不支持 |
 
-`0.9.x` 发布线和 `main` 分支会接收安全修复。发布线以最新补丁版本为准；历史提交和
+`0.10.x` 发布线和 `main` 分支会接收安全修复。发布线以最新补丁版本为准；历史提交和
 未合并功能分支不单独维护。
 
 LLM Olympics 以本地 CLI 为主，并提供仅绑定回环地址的观战页及 capability 限定的人类参与页。模型服务返回值、
@@ -50,9 +50,9 @@ worker 运行；FastAPI 不直接调用 Provider，也不写正式档案/ELO。p
 checkpoint，或者只含命名 Profile、并已有冻结硬预算的 checkpoint。旧式直接 Provider
 checkpoint 不具备可绑定的 Profile 配置身份，只能继续从 CLI 恢复。
 
-当前 `main` 的 `[Unreleased]` 锦标赛 checkpoint/resume 只提供 CLI 入口；阶段 4.5b 的
-Web 控制面尚不接受 `championship`，实时直播 sidecar 也尚未扩展到该模式。这不会改变现有
-loopback、admin capability、Profile 冻结与正式档案事务边界。
+自 v0.10.0 起，锦标赛 checkpoint/resume 只提供 CLI 入口；阶段 4.5b 的 Web 控制面尚不
+接受 `championship`，实时直播 sidecar 也尚未扩展到该模式。这不会改变现有 loopback、
+admin capability、Profile 冻结与正式档案事务边界。
 
 React 页面把选手名、题面、提交和失败原因作为纯文本渲染；页面 CSP 只允许同源静态资源和
 精确同源 WebSocket，API 响应继续禁止加载任何内容。若未来需要远程访问，

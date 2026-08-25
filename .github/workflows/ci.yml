@@ -56,7 +56,7 @@ jobs:
 
       - name: Validate macOS command files
         run: |
-          for script in play.command start_web.command stop_web.command; do
+          for script in play.command championship.command start_web.command stop_web.command; do
             bash -n "$script"
             test -x "$script"
           done
@@ -202,6 +202,12 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-creative-round-robin-smoke.db"
+          "${smoke_venv}/bin/llmolympic" championship \
+            --game math_quiz \
+            --players mock:random,mock:fixed,mock:illegal,mock:balanced \
+            --rounds 1 \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-wheel-championship-smoke.db"
 
           # The base wheel stays usable without Web dependencies; installing its
           # optional extra must then expose the app factory and lazy CLI command.
@@ -260,6 +266,12 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-creative-round-robin-smoke.db"
+          "${smoke_venv}/bin/llmolympic" championship \
+            --game math_quiz \
+            --players mock:random,mock:fixed,mock:illegal,mock:balanced \
+            --rounds 1 \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-championship-smoke.db"
 
           # The sdist must build a wheel containing the same self-hosted observer UI.
           "${smoke_venv}/bin/python" -c \

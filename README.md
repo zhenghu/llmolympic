@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.9.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.10.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.9.0/llmolympic-0.9.0-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.9.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.10.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command`、`championship.command`、
 `start_web.command` 和 `stop_web.command` 随源码仓库和 GitHub 自动生成的源码归档提供，不包含在
 wheel 中。
@@ -294,7 +294,7 @@ llmolympic audit-tournament <TOURNAMENT_ID> --db ~/.llmolympic/llmolympic.db --j
 llmolympic championship --game knowledge_quiz \
   --players mock:random,mock:fixed,mock:illegal,mock:balanced --rounds 5 --seed 42
 
-# 当前 main / [Unreleased]：从最后完成的整轮边界恢复中断的锦标赛
+# 自 v0.10.0 起：从最后完成的整轮边界恢复中断的锦标赛
 llmolympic championship --resume <CHAMPIONSHIP_ID> --db ~/.llmolympic/llmolympic.db
 
 # 国际象棋：第一个选手执白；接受 SAN（e4、O-O）或 UCI（e2e4）
@@ -324,7 +324,7 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_OR_CHAMPIONSHIP_ID>
 
 ```bash
 python -m pip install \
-  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.9.0/llmolympic-0.9.0-py3-none-any.whl"
+  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl"
 ```
 
 安装后可以打开本机 Web 服务。正式存档和实时 sidecar 对 Web 进程始终只读；只有持席位
@@ -562,7 +562,7 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 完成两局，平局依次按较少技术负和较小 `entrant_id` 确定晋级者。锦标赛及其子双局赛会
 完整存档，但不更新 ELO。
 
-当前 main 的 `[Unreleased]` 实现会在首次 Provider 调用前创建 SQLite v10 checkpoint 并
+自 v0.10.0 起，`championship` 会在首次 Provider 调用前创建 SQLite v10 checkpoint 并
 显示锦标赛 ID 与恢复命令。每完成一整轮才原子追加该轮全部双局赛；若进程在一轮中途退出，
 未完成轮次不会形成可见前缀，`championship --resume <CHAMPIONSHIP_ID>` 会从上一完整轮边界
 重新运行整轮。恢复时不能覆盖开赛时冻结的项目配置、选手描述、seed、超时或创意评审团，
@@ -743,8 +743,8 @@ CI 与 Release 仍会分别从 wheel 和 sdist 运行零费用的三 mock 评委
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.9.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.9.0.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.10.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.10.0.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。

@@ -346,7 +346,7 @@ CLI                  Web / WebSocket
    play/series 中断后不自动重跑。
    4.6（v0.9.0）以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
    先后手双局赛、确定性平局打破、SQLite v9 只存档不计分的锦标赛档案；串行执行。
-   4.6 后续增量（当前 `[Unreleased]`）追加锦标赛 checkpoint/resume ✅：SQLite v10 新增
+   4.6 后续增量（v0.10.0）追加锦标赛 checkpoint/resume ✅：SQLite v10 新增
    `championship_checkpoints` /
    `championship_checkpoint_series` / `championship_runner_leases`，每完成一整轮
    原子追加已完成的子双局赛 prefix；`llmolympic championship --resume` 从最后完整

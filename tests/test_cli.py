@@ -331,6 +331,46 @@ def test_play_persists_once_and_query_commands_read_same_database(tmp_path) -> N
     assert "match_finished" in archive.output
 
 
+def test_championship_archive_output_is_valid_json_at_narrow_width(tmp_path) -> None:
+    path = tmp_path / "championship-archive.db"
+    result = runner.invoke(
+        app,
+        [
+            "championship",
+            "--game",
+            "math_quiz",
+            "--players",
+            "mock:random,mock:fixed,mock:illegal,mock:balanced",
+            "--rounds",
+            "1",
+            "--seed",
+            "42",
+            "--db",
+            str(path),
+        ],
+        env={"COLUMNS": "20"},
+    )
+    assert result.exit_code == 0, result.output
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT championship_id FROM championship_archives"
+        ).fetchone()
+    assert row is not None
+    championship_id = row[0]
+
+    archive = runner.invoke(
+        app,
+        ["archive", championship_id, "--db", str(path)],
+        env={"COLUMNS": "20"},
+    )
+    assert archive.exit_code == 0, archive.output
+    payload = json.loads(archive.output)
+    assert payload["championship_id"] == championship_id
+    assert payload["format"] == "single_elimination_two_leg"
+    assert len(payload["pairings"]) == 3
+
+
 def test_live_publisher_failure_warns_once_without_affecting_match_or_archive(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

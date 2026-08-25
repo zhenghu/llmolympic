@@ -180,6 +180,12 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-wheel-creative-round-robin-smoke.db"
+          "${smoke_venv}/bin/llmolympic" championship \
+            --game math_quiz \
+            --players mock:random,mock:fixed,mock:illegal,mock:balanced \
+            --rounds 1 \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-wheel-championship-smoke.db"
 
           wheel_files=("${GITHUB_WORKSPACE}"/dist/*.whl)
           "${smoke_venv}/bin/python" -m pip install "${wheel_files[0]}[web]"
@@ -230,6 +236,12 @@ jobs:
             --judge mock:lenient \
             --seed 42 \
             --db "${RUNNER_TEMP}/llmolympic-sdist-creative-round-robin-smoke.db"
+          "${smoke_venv}/bin/llmolympic" championship \
+            --game math_quiz \
+            --players mock:random,mock:fixed,mock:illegal,mock:balanced \
+            --rounds 1 \
+            --seed 42 \
+            --db "${RUNNER_TEMP}/llmolympic-sdist-championship-smoke.db"
 
           sdist_files=("${GITHUB_WORKSPACE}"/dist/*.tar.gz)
           "${smoke_venv}/bin/python" -m pip install "${sdist_files[0]}[web]"

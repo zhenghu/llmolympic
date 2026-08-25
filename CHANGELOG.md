@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-25
+
 - 为锦标赛补齐 checkpoint/resume：SQLite v10 新增
   `championship_checkpoints` / `championship_checkpoint_series` /
   `championship_runner_leases`，通过 additive migration 从 v9 升级。锦标赛串行执行，
