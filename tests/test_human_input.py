@@ -1255,8 +1255,31 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
     archive = tmp_path / "archive.db"
     session = _session(archive)
     web = _web(archive)
+    original_create_request = InputSessionStore._create_request
     original_cancel_request = InputSessionStore._cancel_request
+    request_committed = threading.Event()
+    allow_create_return = threading.Event()
+    create_attempts = 0
     cancel_attempts = 0
+
+    def delayed_create_request(
+        current: InputSessionStore,
+        prompt: str,
+        timeout_seconds: float,
+        match_event_seq: int,
+    ) -> str:
+        nonlocal create_attempts
+        create_attempts += 1
+        request_id = original_create_request(
+            current,
+            prompt,
+            timeout_seconds,
+            match_event_seq,
+        )
+        if create_attempts == 1:
+            request_committed.set()
+            assert allow_create_return.wait(timeout=5.0)
+        return request_id
 
     def contended_cancel_request(
         current: InputSessionStore,
@@ -1270,14 +1293,25 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
 
     monkeypatch.setattr(
         InputSessionStore,
+        "_create_request",
+        delayed_create_request,
+    )
+    monkeypatch.setattr(
+        InputSessionStore,
         "_cancel_request",
         contended_cancel_request,
     )
 
     async def scenario() -> None:
         cancelled = asyncio.create_task(session.resolve("first", timeout_seconds=1.0))
-        first = await _wait_for_request(web, session)
+        assert await asyncio.to_thread(request_committed.wait, 2.0)
+        snapshot = _load(web, session)
+        assert snapshot.request is not None
+        first = snapshot.request
         cancelled.cancel()
+        await asyncio.sleep(0)
+        assert not cancelled.done()
+        allow_create_return.set()
         with pytest.raises(asyncio.CancelledError):
             await cancelled
         assert cancel_attempts == 2
@@ -1305,6 +1339,61 @@ def test_cancelled_resolve_rejects_old_request_and_allows_a_fresh_one(
     try:
         asyncio.run(scenario())
     finally:
+        allow_create_return.set()
+        session.close()
+
+
+def test_cancelled_failed_creation_is_drained_and_latest_cancellation_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session(tmp_path / "cancel-create-failure.db", heartbeat_seconds=59.0)
+    creation_entered = threading.Event()
+    allow_creation_failure = threading.Event()
+
+    def failing_create_request(
+        _current: InputSessionStore,
+        _prompt: str,
+        _timeout_seconds: float,
+        _match_event_seq: int,
+    ) -> str:
+        creation_entered.set()
+        assert allow_creation_failure.wait(timeout=5.0)
+        raise HumanInputError("input_unavailable")
+
+    monkeypatch.setattr(
+        InputSessionStore,
+        "_create_request",
+        failing_create_request,
+    )
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+        try:
+            cancelled = asyncio.create_task(
+                session.resolve("first", timeout_seconds=1.0)
+            )
+            assert await asyncio.to_thread(creation_entered.wait, 2.0)
+            cancelled.cancel("first")
+            await asyncio.sleep(0)
+            cancelled.cancel("second")
+            await asyncio.sleep(0)
+            allow_creation_failure.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await cancelled
+            assert caught.value.args == ("second",)
+            await asyncio.sleep(0)
+            assert unhandled == []
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        allow_creation_failure.set()
         session.close()
 
 

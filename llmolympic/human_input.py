@@ -586,14 +586,37 @@ class InputSessionStore:
         ):
             raise HumanInputError("input_invalid")
         prompt = _validate_text(prompt, maximum=INPUT_MAX_PROMPT_CHARS)
-        request_id = await asyncio.to_thread(
-            self._retry_sqlite_contention,
-            lambda: self._create_request(
-                prompt,
-                timeout_seconds,
-                match_event_seq,
-            ),
+        create_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._retry_sqlite_contention,
+                lambda: self._create_request(
+                    prompt,
+                    timeout_seconds,
+                    match_event_seq,
+                ),
+            )
         )
+        cancelled_error: asyncio.CancelledError | None = None
+        while True:
+            try:
+                request_id = await asyncio.shield(create_task)
+                break
+            except asyncio.CancelledError as exc:
+                if create_task.cancelled():
+                    raise cancelled_error or exc
+                cancelled_error = exc
+            except Exception:
+                if cancelled_error is not None:
+                    raise cancelled_error from None
+                raise
+
+        if cancelled_error is not None:
+            cancelled_error = await self._finish_cancelled_request(
+                request_id,
+                cancelled_error,
+            )
+            raise cancelled_error
+
         try:
             while True:
                 outcome = await asyncio.to_thread(
@@ -608,16 +631,34 @@ class InputSessionStore:
                 f"{self.player_name} 超时未作答",
                 details={"timeout_seconds": timeout_seconds},
             ) from exc
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            cancelled_error = await self._finish_cancelled_request(request_id, exc)
+            raise cancelled_error
+
+    async def _finish_cancelled_request(
+        self,
+        request_id: str,
+        cancelled_error: asyncio.CancelledError,
+    ) -> asyncio.CancelledError:
+        """Finish best-effort cleanup before propagating the latest cancellation."""
+
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._retry_sqlite_contention,
+                lambda: self._cancel_request(request_id),
+            )
+        )
+        while True:
             try:
-                await asyncio.to_thread(
-                    self._retry_sqlite_contention,
-                    lambda: self._cancel_request(request_id),
-                )
+                await asyncio.shield(cleanup_task)
+                return cancelled_error
+            except asyncio.CancelledError as exc:
+                if cleanup_task.cancelled():
+                    return exc
+                cancelled_error = exc
             except HumanInputError:
-                # Cleanup remains best-effort and must not replace cancellation.
-                pass
-            raise
+                # Cleanup is best-effort and must not replace cancellation.
+                return cancelled_error
 
     def _create_request(
         self,
