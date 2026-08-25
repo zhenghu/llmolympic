@@ -20,7 +20,7 @@ const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
 const ADMIN_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
 const ADMIN_STORAGE_KEY = "llmolympic.control.admin";
-const CONTROL_MODES = ["play", "series", "round_robin"];
+const CONTROL_MODES = ["play", "series", "round_robin", "championship"];
 const CONTROL_ACTIVE_STATUSES = new Set([
   "prepared",
   "starting",
@@ -95,7 +95,7 @@ const ERROR_COPY = {
   large_tournament_confirmation_required: "循环赛规模超过默认保护门槛；请勾选规模确认后重新生成预览。",
   profile_unavailable: "所选 Provider Profile 当前不可用，请检查服务环境后重试。",
   preview_stale: "这份准备态预览已经失效，请重新创建任务。",
-  resume_unavailable: "无法从这份循环赛 checkpoint 恢复，请刷新任务状态或检查本机存档。",
+  resume_unavailable: "无法从这份赛事 checkpoint 恢复，请刷新任务状态或检查本机存档。",
   controller_restarted: "本机控制服务曾重启；为避免重复调用或计费，这项任务不会自动重跑。",
   worker_failed: "比赛进程异常退出，未完成的结果不会写入正式存档或 ELO。",
   worker_interrupted: "比赛进程被系统中断，未完成的结果不会写入正式存档或 ELO。",
@@ -836,6 +836,7 @@ function Leaderboard({ data, loading, error, onRetry }) {
 function modeLabel(mode) {
   if (mode === "series") return "双局赛";
   if (mode === "round_robin") return "循环赛";
+  if (mode === "championship") return "淘汰锦标赛";
   return "单场对局";
 }
 
@@ -846,7 +847,9 @@ function liveStatusLabel(status) {
 }
 
 function LiveMatchCard({ match }) {
-  const context = match.mode === "round_robin" && match.pairing_number
+  const context = match.mode === "championship" && match.round_number
+    ? `第 ${match.round_number}/${match.round_count || "?"} 轮 · 对阵 ${match.round_pairing_number || "?"}/${match.round_pairing_count || "?"} · 第 ${match.leg_number || "?"} 局`
+    : match.mode === "round_robin" && match.pairing_number
     ? `第 ${match.pairing_number}/${match.pairing_count || "?"} 组 · 第 ${match.leg_number || "?"} 局`
     : match.mode === "series" && match.leg_number
       ? `第 ${match.leg_number}/2 局`
@@ -884,7 +887,7 @@ function LiveMatches({ data, loading, error, onRetry }) {
   } else if (!matches.length) {
     body = h(StateCard, {
       title: "当前没有运行中的比赛",
-      copy: "启动 play、series 或 round-robin 后，公开事件会自动出现在这里；比赛进程不依赖观战页。",
+      copy: "启动 play、series、round-robin 或 championship 后，公开事件会自动出现在这里；比赛进程不依赖观战页。",
     });
   } else {
     body = h("div", { className: "live-list" }, ...matches.map((match) => h(LiveMatchCard, {
@@ -1123,7 +1126,17 @@ function normalizeControlJob(payload) {
     && SAFE_PUBLIC_ID.test(configuration.resume_tournament_id)
     ? configuration.resume_tournament_id
     : null;
-  const isResume = mode === "round_robin" && resumeTournamentId !== null;
+  const resumeChampionshipId = typeof configuration.resume_championship_id === "string"
+    && SAFE_PUBLIC_ID.test(configuration.resume_championship_id)
+    ? configuration.resume_championship_id
+    : null;
+  if (resumeTournamentId && resumeChampionshipId) throw new PublicError("protocol_error");
+  const isResume = (mode === "round_robin" && resumeTournamentId !== null)
+    || (mode === "championship" && resumeChampionshipId !== null);
+  if ((resumeTournamentId && mode !== "round_robin")
+    || (resumeChampionshipId && mode !== "championship")) {
+    throw new PublicError("protocol_error");
+  }
   const configuredGame = safeControlText(value.game, 64)
     || safeControlText(configuration.game, 64)
     || "";
@@ -1233,7 +1246,7 @@ function normalizeControlJob(payload) {
     finalId: typeof value.final_id === "string" && SAFE_PUBLIC_ID.test(value.final_id)
       ? value.final_id
       : null,
-    finalKind: ["match", "series", "tournament"].includes(value.final_kind)
+    finalKind: ["match", "series", "tournament", "championship"].includes(value.final_kind)
       ? value.final_kind
       : null,
     finalMatchIds,
@@ -1256,6 +1269,9 @@ function normalizeControlJob(payload) {
     startedAt: validTimestamp(value.started_at) ? value.started_at : null,
     status,
     total,
+    championshipId: [value.championship_id, resumeChampionshipId,
+      value.final_kind === "championship" ? value.final_id : null]
+      .find((candidate) => typeof candidate === "string" && SAFE_PUBLIC_ID.test(candidate)) || null,
     tournamentId: [value.tournament_id, resumeTournamentId,
       value.final_kind === "tournament" ? value.final_id : null]
       .find((candidate) => typeof candidate === "string" && SAFE_PUBLIC_ID.test(candidate)) || null,
@@ -1276,9 +1292,9 @@ function controlStatusLabel(status) {
 function controlJobCanResume(job) {
   return Boolean(
     job
-    && job.mode === "round_robin"
+    && ["round_robin", "championship"].includes(job.mode)
     && job.resumable
-    && job.tournamentId
+    && (job.mode === "round_robin" ? job.tournamentId : job.championshipId)
     && ["cancelled", "failed", "interrupted"].includes(job.status)
   );
 }
@@ -1478,10 +1494,18 @@ function validateControlForm(form, catalog) {
   const errors = {};
   const game = catalog.games.find((item) => item.name === form.game);
   if (!game || !game.supportedModes.includes(form.mode)) errors.game = "所选项目不支持这个比赛模式。";
-  const minimumPlayers = form.mode === "round_robin" ? 3 : game ? game.minPlayers : 2;
-  const maximumPlayers = form.mode === "round_robin" ? MAX_CONTROL_PLAYERS : game ? game.maxPlayers : 2;
+  const minimumPlayers = form.mode === "championship"
+    ? 4
+    : form.mode === "round_robin"
+      ? 3
+      : game ? game.minPlayers : 2;
+  const maximumPlayers = ["round_robin", "championship"].includes(form.mode)
+    ? MAX_CONTROL_PLAYERS
+    : game ? game.maxPlayers : 2;
   if (form.mode === "series" && form.players.length !== 2) {
     errors.players = "双局赛必须正好有两位选手。";
+  } else if (form.mode === "championship" && ![4, 8, 16].includes(form.players.length)) {
+    errors.players = "淘汰锦标赛必须正好有 4、8 或 16 位选手。";
   } else if (form.players.length < minimumPlayers || form.players.length > maximumPlayers) {
     errors.players = `${modeLabel(form.mode)}需要 ${minimumPlayers}–${maximumPlayers} 位选手。`;
   }
@@ -1602,6 +1626,7 @@ function controlRequestBody(form, catalog) {
       ? formNumber(form.rounds, { maximum: 100, minimum: 1 })
       : null,
     seed: form.seed.trim(),
+    resume_championship_id: null,
     resume_tournament_id: null,
   };
 }
@@ -1854,8 +1879,14 @@ function NewJobPage({ adminToken, onAuthLost }) {
 
   const currentGame = catalog.games.find((item) => item.name === form.game);
   const availableGames = catalog.games.filter((item) => item.supportedModes.includes(form.mode));
-  const minimumPlayers = form.mode === "round_robin" ? 3 : currentGame ? currentGame.minPlayers : 2;
-  const maximumPlayers = form.mode === "round_robin" ? MAX_CONTROL_PLAYERS : currentGame ? currentGame.maxPlayers : 2;
+  const minimumPlayers = form.mode === "championship"
+    ? 4
+    : form.mode === "round_robin"
+      ? 3
+      : currentGame ? currentGame.minPlayers : 2;
+  const maximumPlayers = ["round_robin", "championship"].includes(form.mode)
+    ? MAX_CONTROL_PLAYERS
+    : currentGame ? currentGame.maxPlayers : 2;
 
   const changeMode = (mode) => {
     const fallbackGame = catalog.games.find((item) => item.supportedModes.includes(mode));
@@ -1864,8 +1895,10 @@ function NewJobPage({ adminToken, onAuthLost }) {
       const selectedGame = catalog.games.find((item) => (
         item.name === previous.game && item.supportedModes.includes(mode)
       )) || fallbackGame;
-      const desiredCount = mode === "round_robin"
-        ? 3
+      const desiredCount = mode === "championship"
+        ? 4
+        : mode === "round_robin"
+          ? 3
         : mode === "series"
           ? 2
           : Math.max(2, selectedGame.minPlayers);
@@ -2034,6 +2067,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
           h("option", { value: "play" }, "单场对局（play）"),
           h("option", { value: "series" }, "双局交换先后手（series）"),
           h("option", { value: "round_robin" }, "双循环赛（round-robin）"),
+          h("option", { value: "championship" }, "淘汰锦标赛（championship）"),
           )),
           h(ControlField, { error: errors.game, id: "control-game", label: "比赛项目" }, (attributes) => h("select", {
             ...attributes,
@@ -2066,7 +2100,9 @@ function NewJobPage({ adminToken, onAuthLost }) {
         h("div", { className: "panel-head" },
           h("div", null,
             h("h2", { id: "players-heading" }, "2. 参赛者"),
-            h("span", { className: "panel-kicker" }, `${minimumPlayers}–${maximumPlayers} 位`),
+            h("span", { className: "panel-kicker" }, form.mode === "championship"
+              ? "4 / 8 / 16 位"
+              : `${minimumPlayers}–${maximumPlayers} 位`),
           ),
           form.mode !== "series" && form.players.length < maximumPlayers
             ? h("button", {
@@ -2197,6 +2233,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
 }
 
 function resumeControlRequest(job) {
+  const championship = job.mode === "championship";
   return {
     allow_large_tournament: false,
     budget: {
@@ -2210,9 +2247,10 @@ function resumeControlRequest(job) {
     human_timeout_seconds: 120,
     judges: [],
     llm_timeout_seconds: null,
-    mode: "round_robin",
+    mode: championship ? "championship" : "round_robin",
     players: [],
-    resume_tournament_id: job.tournamentId,
+    resume_championship_id: championship ? job.championshipId : null,
+    resume_tournament_id: championship ? null : job.tournamentId,
     rounds: null,
     seed: "0",
   };
@@ -2336,7 +2374,7 @@ function JobDetailPage({ adminToken, jobId, onAuthLost }) {
     }
   };
   const prepareResume = async () => {
-    if (!job || !job.tournamentId) return;
+    if (!job || (job.mode === "round_robin" ? !job.tournamentId : !job.championshipId)) return;
     setBusyAction("resume");
     setMutationError(null);
     try {
@@ -2400,9 +2438,9 @@ function JobDetailPage({ adminToken, jobId, onAuthLost }) {
     return h("main", { className: "page control-page", id: "main-content", tabIndex: -1 },
       h("button", { className: "breadcrumb breadcrumb-button", onClick: discardResume, type: "button" }, "← 取消恢复预览并返回原任务"),
       h("section", { className: "control-hero", "aria-labelledby": "resume-title" },
-        h("p", { className: "eyebrow" }, "ROUND-ROBIN RESUME · REVIEW"),
+        h("p", { className: "eyebrow" }, `${job.mode === "championship" ? "CHAMPIONSHIP" : "ROUND-ROBIN"} RESUME · REVIEW`),
         h("h1", { className: "detail-title", id: "resume-title" }, "核对恢复任务"),
-        h("p", { className: "hero-copy" }, "服务端会从已存储的循环赛 checkpoint 恢复冻结配置；此时仍未启动。"),
+        h("p", { className: "hero-copy" }, `服务端会从已存储的${job.mode === "championship" ? "淘汰锦标赛" : "循环赛"} checkpoint 恢复冻结配置；此时仍未启动。`),
       ),
       h(PreparedJobPreview, {
         busy: busyAction !== null,
@@ -2523,7 +2561,7 @@ function JobDetailPage({ adminToken, jobId, onAuthLost }) {
           ) : null,
           canResume ? h("div", { className: "job-link-group resume-callout" },
             h("div", null,
-              h("strong", null, "可以从循环赛 checkpoint 恢复"),
+              h("strong", null, `可以从${job.mode === "championship" ? "淘汰锦标赛" : "循环赛"} checkpoint 恢复`),
               h("p", null, "先生成新的准备态任务，再次确认后才会继续未完成赛程。"),
             ),
             h("button", {
@@ -2741,14 +2779,69 @@ function validateSummary(summary, matchId) {
     && isObject(summary.scores);
 }
 
+const SIGNED_64_JSON_LIMIT = 2 ** 63;
+
+function validSigned64JsonNumber(value) {
+  // Public seeds are SQLite signed 64-bit integers. JSON numbers above
+  // Number.MAX_SAFE_INTEGER lose low-bit precision in browsers, but remain
+  // finite integers suitable for display and event validation.
+  return Number.isInteger(value)
+    && value >= -SIGNED_64_JSON_LIMIT
+    && value <= SIGNED_64_JSON_LIMIT;
+}
+
 function validatePublicEvent(event, expectedSeq) {
-  return isObject(event)
+  if (!(isObject(event)
     && Number.isInteger(event.seq)
     && event.seq === expectedSeq
     && Object.prototype.hasOwnProperty.call(EVENT_LABELS, event.type)
-    && typeof event.timestamp === "string"
+    && validTimestamp(event.timestamp)
     && (event.player === null || typeof event.player === "string")
-    && isObject(event.data);
+    && isObject(event.data))) return false;
+  const data = event.data;
+  if (event.type === "match_started") {
+    return exactKeys(data, ["game", "game_config", "players", "seed"])
+      && typeof data.game === "string"
+      && /^[a-z][a-z0-9_]{0,63}$/.test(data.game)
+      && validSigned64JsonNumber(data.seed)
+      && isObject(data.game_config)
+      && Array.isArray(data.players)
+      && data.players.length >= 2
+      && data.players.every(validLivePlayer);
+  }
+  if (event.type === "turn_prompt") {
+    return exactKeys(data, ["prompt"]) && typeof data.prompt === "string";
+  }
+  if (event.type === "move_received") {
+    return exactKeys(data, ["move"]) && typeof data.move === "string";
+  }
+  if (event.type === "move_rejected") {
+    return exactKeys(data, ["forfeit", "move", "reason", "reason_code", "technical_loss"])
+      && (data.move === null || typeof data.move === "string")
+      && (data.reason === null || typeof data.reason === "string")
+      && (data.reason_code === null || typeof data.reason_code === "string")
+      && typeof data.forfeit === "boolean"
+      && typeof data.technical_loss === "boolean";
+  }
+  if (!exactKeys(data, [
+    "forfeited_by",
+    "judging",
+    "reason_code",
+    "scores",
+    "termination",
+  ])
+    || !isObject(data.scores)
+    || Object.values(data.scores).some((score) => typeof score !== "number" || !Number.isFinite(score))
+    || typeof data.termination !== "string"
+    || (data.reason_code !== null && typeof data.reason_code !== "string")
+    || (data.forfeited_by !== null && typeof data.forfeited_by !== "string")) return false;
+  return data.judging === null || (
+    isObject(data.judging)
+    && exactKeys(data.judging, ["panel_size", "quorum", "successful_judges"])
+    && ["panel_size", "quorum", "successful_judges"].every(
+      (key) => Number.isInteger(data.judging[key]) && data.judging[key] >= 0,
+    )
+  );
 }
 
 function websocketURL(matchId, fromSeq) {
@@ -2967,32 +3060,263 @@ function useArchiveReplay(matchId, reloadKey) {
   return state;
 }
 
+function validLivePlayer(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && Array.from(value).length <= 512
+    && !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(value);
+}
+
+const CHAMPIONSHIP_CONTEXT_KEYS = [
+  "round_number",
+  "round_count",
+  "round_pairing_number",
+  "round_pairing_count",
+  "pairing_number",
+  "pairing_count",
+  "leg_number",
+];
+
+function validateChampionshipContext(context, matchEvent = false) {
+  const keys = matchEvent
+    ? [...CHAMPIONSHIP_CONTEXT_KEYS, "match_event_seq"]
+    : CHAMPIONSHIP_CONTEXT_KEYS;
+  if (!isObject(context) || !exactKeys(context, keys)) return false;
+  if (keys.some((key) => !Number.isInteger(context[key]) || context[key] < (key === "match_event_seq" ? 0 : 1))) {
+    return false;
+  }
+  const playerCount = context.pairing_count + 1;
+  if (
+    ![4, 8, 16].includes(playerCount)
+    || context.round_count !== Math.log2(playerCount)
+    || context.round_number > context.round_count
+    || context.round_pairing_count !== playerCount / (2 ** context.round_number)
+    || context.round_pairing_number > context.round_pairing_count
+    || context.pairing_number
+      !== playerCount - (playerCount / (2 ** (context.round_number - 1)))
+        + context.round_pairing_number
+    || ![1, 2].includes(context.leg_number)
+  ) return false;
+  return true;
+}
+
+function championshipPairingPlayers(bracket, players, roundNumber, roundPairingNumber) {
+  if (roundNumber === 1) {
+    const offset = (roundPairingNumber - 1) * 2;
+    return players.slice(offset, offset + 2);
+  }
+  const priorRound = bracket.pairings
+    .filter((pairing) => pairing.round_number === roundNumber - 1)
+    .sort((left, right) => left.round_pairing_number - right.round_pairing_number);
+  const offset = (roundPairingNumber - 1) * 2;
+  return priorRound.slice(offset, offset + 2).map((pairing) => pairing.winner);
+}
+
+function validateChampionshipPairing(pairing, bracket, players, expectedPairingNumber) {
+  if (!isObject(pairing) || !exactKeys(pairing, [
+    "match_ids",
+    "pairing_number",
+    "players",
+    "round_number",
+    "round_pairing_number",
+    "series_id",
+    "status",
+    "winner",
+  ])) return false;
+  const context = {
+    round_number: pairing.round_number,
+    round_count: bracket.round_count,
+    round_pairing_number: pairing.round_pairing_number,
+    round_pairing_count: bracket.player_count / (2 ** pairing.round_number),
+    pairing_number: pairing.pairing_number,
+    pairing_count: bracket.pairing_count,
+    leg_number: 2,
+  };
+  const expectedPlayers = championshipPairingPlayers(
+    bracket,
+    players,
+    pairing.round_number,
+    pairing.round_pairing_number,
+  );
+  return validateChampionshipContext(context)
+    && pairing.pairing_number === expectedPairingNumber
+    && Array.isArray(pairing.players)
+    && pairing.players.length === 2
+    && pairing.players.every(validLivePlayer)
+    && new Set(pairing.players).size === 2
+    && expectedPlayers.length === 2
+    && pairing.players.every((player, index) => player === expectedPlayers[index])
+    && pairing.players.includes(pairing.winner)
+    && typeof pairing.series_id === "string"
+    && SAFE_PUBLIC_ID.test(pairing.series_id)
+    && Array.isArray(pairing.match_ids)
+    && pairing.match_ids.length === 2
+    && pairing.match_ids.every((matchId) => typeof matchId === "string" && SAFE_PUBLIC_ID.test(matchId))
+    && new Set(pairing.match_ids).size === 2
+    && ["provisional", "committed"].includes(pairing.status);
+}
+
+function validateChampionshipBracket(bracket, players) {
+  if (
+    !isObject(bracket)
+    || !exactKeys(bracket, [
+      "champion",
+      "championship_id",
+      "pairing_count",
+      "pairings",
+      "player_count",
+      "round_count",
+    ])
+    || typeof bracket.championship_id !== "string"
+    || !SAFE_PUBLIC_ID.test(bracket.championship_id)
+    || !Array.isArray(players)
+    || players.some((player) => !validLivePlayer(player))
+    || new Set(players).size !== players.length
+    || ![4, 8, 16].includes(bracket.player_count)
+    || bracket.player_count !== players.length
+    || bracket.round_count !== Math.log2(bracket.player_count)
+    || bracket.pairing_count !== bracket.player_count - 1
+    || !Array.isArray(bracket.pairings)
+    || bracket.pairings.length > bracket.pairing_count
+    || (bracket.champion !== null && !players.includes(bracket.champion))
+  ) return false;
+
+  const materialized = { ...bracket, pairings: [] };
+  const seriesIds = new Set();
+  const matchIds = new Set();
+  let committedCount = 0;
+  let provisionalSeen = false;
+  for (let index = 0; index < bracket.pairings.length; index += 1) {
+    const pairing = bracket.pairings[index];
+    if (!validateChampionshipPairing(pairing, materialized, players, index + 1)) return false;
+    if (seriesIds.has(pairing.series_id)
+      || pairing.match_ids.some((matchId) => matchIds.has(matchId))) return false;
+    seriesIds.add(pairing.series_id);
+    pairing.match_ids.forEach((matchId) => matchIds.add(matchId));
+    if (pairing.status === "committed") {
+      if (provisionalSeen) return false;
+      committedCount += 1;
+    } else {
+      provisionalSeen = true;
+    }
+    materialized.pairings.push(pairing);
+  }
+
+  const boundaries = [0];
+  let boundary = 0;
+  for (let round = 1; round <= bracket.round_count; round += 1) {
+    boundary += bracket.player_count / (2 ** round);
+    boundaries.push(boundary);
+  }
+  if (!boundaries.includes(committedCount)) return false;
+  const provisional = bracket.pairings.slice(committedCount);
+  const nextRound = boundaries.indexOf(committedCount) + 1;
+  if (provisional.some((pairing) => pairing.round_number !== nextRound)) return false;
+  if (bracket.champion !== null) {
+    return committedCount === bracket.pairing_count
+      && bracket.pairings.length === bracket.pairing_count
+      && bracket.pairings.at(-1).winner === bracket.champion;
+  }
+  return true;
+}
+
 function validateLiveSummary(summary, liveId) {
+  const allowedKeys = new Set([
+    "championship_bracket",
+    "event_count",
+    "final_id",
+    "final_kind",
+    "final_match_ids",
+    "game",
+    "leg_number",
+    "live_id",
+    "mode",
+    "pairing_count",
+    "pairing_number",
+    "players",
+    "round_count",
+    "round_number",
+    "round_pairing_count",
+    "round_pairing_number",
+    "started_at",
+    "status",
+    "updated_at",
+  ]);
   if (
     !isObject(summary)
+    || Object.keys(summary).some((key) => !allowedKeys.has(key))
     || summary.live_id !== liveId
-    || !["play", "series", "round_robin"].includes(summary.mode)
+    || !CONTROL_MODES.includes(summary.mode)
     || !["running", "completed", "interrupted"].includes(summary.status)
     || typeof summary.game !== "string"
     || !/^[a-z][a-z0-9_]{0,63}$/.test(summary.game)
     || !Array.isArray(summary.players)
     || summary.players.length < 2
-    || summary.players.some((player) => typeof player !== "string" || !player)
+    || summary.players.length > MAX_CONTROL_PLAYERS
+    || summary.players.some((player) => !validLivePlayer(player))
+    || new Set(summary.players).size !== summary.players.length
+    || !validTimestamp(summary.started_at)
+    || !validTimestamp(summary.updated_at)
+    || Date.parse(summary.updated_at) < Date.parse(summary.started_at)
     || !Number.isInteger(summary.event_count)
     || summary.event_count < 0
     || summary.event_count > 10000
   ) return false;
-  const placement = ["pairing_number", "pairing_count", "leg_number"];
+  const placement = [
+    "pairing_number",
+    "pairing_count",
+    "leg_number",
+    "round_number",
+    "round_count",
+    "round_pairing_number",
+    "round_pairing_count",
+  ];
   if (placement.some((key) => summary[key] !== null
     && summary[key] !== undefined
     && (!Number.isInteger(summary[key]) || summary[key] < 1))) return false;
-  if (summary.mode === "play" && placement.some((key) => summary[key] != null)) return false;
-  if (summary.mode === "series" && (summary.pairing_number != null || summary.pairing_count != null)) return false;
-  if (summary.mode === "round_robin" && !Number.isInteger(summary.pairing_count)) return false;
   if (summary.pairing_number != null
     && (summary.pairing_count == null || summary.pairing_number > summary.pairing_count)) return false;
 
+  const championshipPlacement = placement.slice(3);
+  if (summary.mode === "play" && placement.some((key) => summary[key] != null)) return false;
+  if (summary.mode === "series" && (
+    summary.pairing_number != null
+    || summary.pairing_count != null
+    || championshipPlacement.some((key) => summary[key] != null)
+  )) return false;
+  if (summary.mode === "round_robin" && (
+    !Number.isInteger(summary.pairing_count)
+    || championshipPlacement.some((key) => summary[key] != null)
+  )) return false;
+  if (summary.mode !== "championship" && summary.championship_bracket != null) return false;
+
+  let bracket = null;
+  if (summary.mode === "championship") {
+    const context = Object.fromEntries(CHAMPIONSHIP_CONTEXT_KEYS.map((key) => [key, summary[key]]));
+    bracket = summary.championship_bracket;
+    if (
+      !validateChampionshipContext(context)
+      || !validateChampionshipBracket(bracket, summary.players)
+      || bracket.player_count !== summary.players.length
+      || ![bracket.pairings.length, bracket.pairings.length + 1].includes(summary.pairing_number)
+    ) return false;
+    if (summary.pairing_number === bracket.pairings.length) {
+      const latest = bracket.pairings.at(-1);
+      if (!latest
+        || summary.leg_number !== 2
+        || summary.round_number !== latest.round_number
+        || summary.round_pairing_number !== latest.round_pairing_number) return false;
+    } else if (bracket.pairings.length
+      && bracket.pairings.at(-1).status === "provisional"
+      && (summary.round_number !== bracket.pairings.at(-1).round_number
+        || summary.round_pairing_number !== bracket.pairings.at(-1).round_pairing_number + 1)) {
+      return false;
+    }
+    if (summary.status !== "completed" && bracket.champion !== null) return false;
+  }
+
   const expectedFinalKind = {
+    championship: "championship",
     play: "match",
     round_robin: "tournament",
     series: "series",
@@ -3007,39 +3331,260 @@ function validateLiveSummary(summary, liveId) {
   if (
     summary.final_kind !== expectedFinalKind
     || typeof summary.final_id !== "string"
-    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(summary.final_id)
+    || !SAFE_PUBLIC_ID.test(summary.final_id)
     || !Array.isArray(ids)
     || !ids.length
-    || ids.some((id) => typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id))
+    || ids.some((id) => typeof id !== "string" || !SAFE_PUBLIC_ID.test(id))
     || new Set(ids).size !== ids.length
   ) return false;
   if (summary.mode === "play") return ids.length === 1 && ids[0] === summary.final_id;
   if (summary.mode === "series") return ids.length === 2;
-  return ids.length === summary.pairing_count * 2;
+  if (summary.mode === "round_robin") return ids.length === summary.pairing_count * 2;
+  const expectedIds = bracket.pairings.flatMap((pairing) => pairing.match_ids);
+  return summary.round_number === summary.round_count
+    && summary.round_pairing_number === 1
+    && summary.round_pairing_count === 1
+    && summary.pairing_number === summary.pairing_count
+    && summary.leg_number === 2
+    && summary.final_id === bracket.championship_id
+    && bracket.champion !== null
+    && bracket.pairings.length === bracket.pairing_count
+    && bracket.pairings.every((pairing) => pairing.status === "committed")
+    && JSON.stringify(ids) === JSON.stringify(expectedIds);
 }
 
-function validateLiveItem(item, expectedSeq) {
-  if (!(isObject(item)
-    && item.seq === expectedSeq
-    && isObject(item.context)
-    && Number.isInteger(item.context.match_event_seq)
-    && item.context.match_event_seq >= 0
-    && (item.context.leg_number == null
-      || (Number.isInteger(item.context.leg_number) && item.context.leg_number >= 1))
-    && (item.context.pairing_number == null
-      || (Number.isInteger(item.context.pairing_number) && item.context.pairing_number >= 1))
-    && (item.context.pairing_number == null || item.context.leg_number != null)
-    && validatePublicEvent(item.event, item.context.match_event_seq))) return false;
-  const allowedContext = new Set(["leg_number", "match_event_seq", "pairing_number"]);
-  return Object.keys(item.context).every((key) => allowedContext.has(key));
+function validateChampionshipLifecycleItem(item, summary) {
+  if (!summary || summary.mode !== "championship" || !validateChampionshipContext(item.context)) {
+    return false;
+  }
+  const bracket = summary.championship_bracket;
+  const context = item.context;
+  if (
+    context.round_count !== bracket.round_count
+    || context.pairing_count !== bracket.pairing_count
+    || context.round_pairing_count !== bracket.player_count / (2 ** context.round_number)
+  ) return false;
+  if (item.kind === "pairing_completed") {
+    if (!exactKeys(item, ["context", "kind", "pairing", "seq"])
+      || context.leg_number !== 2
+      || !isObject(item.pairing)
+      || item.pairing.status !== "provisional"
+      || item.pairing.round_number !== context.round_number
+      || item.pairing.round_pairing_number !== context.round_pairing_number
+      || item.pairing.pairing_number !== context.pairing_number) return false;
+    const existing = bracket.pairings[context.pairing_number - 1];
+    if (existing) {
+      return JSON.stringify({ ...existing, status: "provisional" })
+        === JSON.stringify(item.pairing);
+    }
+    if (context.pairing_number !== bracket.pairings.length + 1) return false;
+    const candidate = {
+      ...bracket,
+      champion: null,
+      pairings: [...bracket.pairings, item.pairing],
+    };
+    return validateChampionshipBracket(candidate, summary.players);
+  }
+  if (item.kind === "round_committed") {
+    if (!exactKeys(item, ["context", "kind", "pairing_numbers", "seq"])
+      || !Array.isArray(item.pairing_numbers)
+      || context.leg_number !== 2
+      || context.round_pairing_number !== context.round_pairing_count) return false;
+    const first = context.pairing_number - context.round_pairing_number + 1;
+    const expected = Array.from(
+      { length: context.round_pairing_count },
+      (_value, index) => first + index,
+    );
+    if (JSON.stringify(item.pairing_numbers) !== JSON.stringify(expected)) return false;
+    return item.pairing_numbers.every((number) => {
+      const pairing = bracket.pairings[number - 1];
+      return pairing && pairing.round_number === context.round_number;
+    });
+  }
+  return false;
+}
+
+function validateLiveItem(item, expectedSeq, summary = null) {
+  if (!isObject(item) || item.seq !== expectedSeq) return false;
+  const kind = item.kind === undefined ? "match_event" : item.kind;
+  if (kind === "pairing_completed" || kind === "round_committed") {
+    return validateChampionshipLifecycleItem(item, summary);
+  }
+  if (kind !== "match_event"
+    || !exactKeys(item, item.kind === undefined
+      ? ["context", "event", "seq"]
+      : ["context", "event", "kind", "seq"])
+    || !isObject(item.context)) return false;
+
+  if (summary && summary.mode === "championship") {
+    if (!validateChampionshipContext(item.context, true)) return false;
+    const expectedPlayers = championshipPairingPlayers(
+      summary.championship_bracket,
+      summary.players,
+      item.context.round_number,
+      item.context.round_pairing_number,
+    );
+    const orderedPlayers = item.context.leg_number === 2
+      ? expectedPlayers.slice().reverse()
+      : expectedPlayers;
+    const finishedPlayers = item.event.type === "match_finished"
+      ? Object.keys(item.event.data.scores || {})
+      : [];
+    if (expectedPlayers.length !== 2
+      || (item.event.type === "match_started"
+        && (item.event.data.game !== summary.game
+          || JSON.stringify(item.event.data.players) !== JSON.stringify(orderedPlayers)))
+      || (item.event.type === "match_finished"
+        && (finishedPlayers.length !== expectedPlayers.length
+          || finishedPlayers.some((player) => !expectedPlayers.includes(player))
+          || (item.event.data.forfeited_by !== null
+            && !expectedPlayers.includes(item.event.data.forfeited_by))))
+      || (item.event.player !== null && !expectedPlayers.includes(item.event.player))) return false;
+  } else {
+    const allowedContext = new Set(["leg_number", "match_event_seq", "pairing_number"]);
+    if (
+      Object.keys(item.context).some((key) => !allowedContext.has(key))
+      || !Number.isInteger(item.context.match_event_seq)
+      || item.context.match_event_seq < 0
+      || (item.context.leg_number != null
+        && (!Number.isInteger(item.context.leg_number) || ![1, 2].includes(item.context.leg_number)))
+      || (item.context.pairing_number != null
+        && (!Number.isInteger(item.context.pairing_number) || item.context.pairing_number < 1))
+      || (item.context.pairing_number != null && item.context.leg_number == null)
+    ) return false;
+    if (summary && (
+      (summary.mode === "play"
+        && (item.context.pairing_number != null || item.context.leg_number != null))
+      || (summary.mode === "series" && item.context.pairing_number != null)
+      || (summary.mode === "round_robin"
+        && (item.context.pairing_number == null || item.context.leg_number == null))
+    )) return false;
+  }
+  return validatePublicEvent(item.event, item.context.match_event_seq);
 }
 
 function publicEventFromLiveItem(item) {
+  if ((item.kind || "match_event") !== "match_event") return null;
   return {
     ...item.event,
     context: item.context,
     match_event_seq: item.context.match_event_seq,
     seq: item.seq,
+  };
+}
+
+function cloneChampionshipBracket(bracket) {
+  return {
+    ...bracket,
+    pairings: bracket.pairings.map((pairing) => ({
+      ...pairing,
+      match_ids: pairing.match_ids.slice(),
+      players: pairing.players.slice(),
+    })),
+  };
+}
+
+function championshipReducer(state, action) {
+  if (action.type === "reset") return null;
+  if (action.type === "summary") {
+    const summary = action.summary;
+    if (!validateLiveSummary(summary, summary && summary.live_id)
+      || summary.mode !== "championship") throw new PublicError("protocol_error");
+    return {
+      bracket: cloneChampionshipBracket(summary.championship_bracket),
+      contextFromSeq: summary.event_count,
+      items: state ? state.items.slice() : [],
+      lifecycleItems: state ? state.lifecycleItems.slice() : [],
+      summary,
+    };
+  }
+  if (action.type === "terminal") {
+    if (!state || !["completed", "interrupted"].includes(action.status)) {
+      throw new PublicError("protocol_error");
+    }
+    let bracket = cloneChampionshipBracket(state.bracket);
+    if (action.status === "completed") {
+      if (bracket.pairings.length !== bracket.pairing_count
+        || !bracket.pairings.every((pairing) => pairing.status === "committed")) {
+        throw new PublicError("protocol_error");
+      }
+      bracket.champion = bracket.pairings.at(-1).winner;
+    }
+    const summary = {
+      ...state.summary,
+      championship_bracket: bracket,
+      event_count: action.eventCount,
+      final_id: action.status === "completed" ? action.finalId : null,
+      final_kind: action.status === "completed" ? action.finalKind : null,
+      final_match_ids: action.status === "completed" && Array.isArray(action.finalMatchIds)
+        ? action.finalMatchIds.slice()
+        : [],
+      status: action.status,
+    };
+    if (!validateLiveSummary(summary, summary.live_id)) {
+      throw new PublicError("protocol_error");
+    }
+    return {
+      ...state,
+      bracket,
+      contextFromSeq: summary.event_count,
+      summary,
+    };
+  }
+  if (action.type !== "item") throw new PublicError("protocol_error");
+  let current = state;
+  if (action.summary) current = championshipReducer(current, { type: "summary", summary: action.summary });
+  if (!current) throw new PublicError("protocol_error");
+  const item = action.item;
+  const prior = current.items.find((candidate) => candidate.seq === item.seq);
+  if (prior) {
+    if (JSON.stringify(prior) !== JSON.stringify(item)) throw new PublicError("protocol_error");
+    return current;
+  }
+  const expectedSeq = action.summary || !current.items.length
+    ? item.seq
+    : current.items.at(-1).seq + 1;
+  const summary = {
+    ...current.summary,
+    championship_bracket: current.bracket,
+  };
+  if (!validateLiveItem(item, expectedSeq, summary)) throw new PublicError("protocol_error");
+  const context = item.context;
+  let bracket = cloneChampionshipBracket(current.bracket);
+  if (item.kind === "pairing_completed") {
+    if (context.pairing_number === bracket.pairings.length + 1) {
+      bracket.pairings.push({
+        ...item.pairing,
+        match_ids: item.pairing.match_ids.slice(),
+        players: item.pairing.players.slice(),
+      });
+    }
+  } else if (item.kind === "round_committed") {
+    const committed = new Set(item.pairing_numbers);
+    bracket.pairings = bracket.pairings.map((pairing) => (
+      committed.has(pairing.pairing_number)
+        ? { ...pairing, status: "committed" }
+        : pairing
+    ));
+  }
+  const nextSummary = item.seq >= current.contextFromSeq
+    ? {
+      ...summary,
+      ...Object.fromEntries(CHAMPIONSHIP_CONTEXT_KEYS.map((key) => [key, context[key]])),
+      championship_bracket: bracket,
+    }
+    : { ...summary, championship_bracket: bracket };
+  if (!validateChampionshipBracket(bracket, summary.players)) {
+    throw new PublicError("protocol_error");
+  }
+  return {
+    bracket,
+    contextFromSeq: current.contextFromSeq,
+    items: [...current.items, item],
+    lifecycleItems: ["pairing_completed", "round_committed"].includes(item.kind)
+      ? [...current.lifecycleItems, item]
+      : current.lifecycleItems.slice(),
+    summary: nextSummary,
   };
 }
 
@@ -3050,6 +3595,7 @@ function liveWebsocketURL(liveId, fromSeq) {
 
 function useLiveStream(liveId, reloadKey) {
   const [state, setState] = useState({
+    championship: null,
     error: null,
     events: [],
     finalId: null,
@@ -3071,6 +3617,8 @@ function useLiveStream(liveId, reloadKey) {
     let summary = null;
     let nextSeq = 0;
     let events = [];
+    let streamItems = new Map();
+    let championship = null;
     let finalKind = null;
     let finalId = null;
     let finalMatchIds = [];
@@ -3085,6 +3633,7 @@ function useLiveStream(liveId, reloadKey) {
       setState((previous) => ({
         ...previous,
         ...patch,
+        championship,
         events: events.slice(),
         finalId,
         finalKind,
@@ -3116,6 +3665,9 @@ function useLiveStream(liveId, reloadKey) {
         throw new PublicError("protocol_error");
       }
       summary = candidate;
+      championship = candidate.mode === "championship"
+        ? championshipReducer(championship, { summary: candidate, type: "summary" })
+        : null;
       if (candidate.status === "completed") {
         finalKind = candidate.final_kind;
         finalId = candidate.final_id;
@@ -3129,14 +3681,20 @@ function useLiveStream(liveId, reloadKey) {
       if (!Array.isArray(items)) throw new PublicError("protocol_error");
       items.forEach((item) => {
         if (Number.isInteger(item && item.seq) && item.seq < nextSeq) {
-          const prior = events[item.seq];
-          if (JSON.stringify(prior) !== JSON.stringify(publicEventFromLiveItem(item))) {
+          const prior = streamItems.get(item.seq);
+          if (JSON.stringify(prior) !== JSON.stringify(item)) {
             throw new PublicError("protocol_error");
           }
           return;
         }
-        if (!validateLiveItem(item, nextSeq)) throw new PublicError("protocol_error");
-        events.push(publicEventFromLiveItem(item));
+        if (!validateLiveItem(item, nextSeq, summary)) throw new PublicError("protocol_error");
+        streamItems.set(item.seq, item);
+        if (summary.mode === "championship") {
+          championship = championshipReducer(championship, { item, type: "item" });
+          summary = championship.summary;
+        }
+        const publicEvent = publicEventFromLiveItem(item);
+        if (publicEvent) events.push(publicEvent);
         nextSeq += 1;
       });
     };
@@ -3222,13 +3780,27 @@ function useLiveStream(liveId, reloadKey) {
               || envelope.event_count !== nextSeq) {
               throw new PublicError("protocol_error");
             }
-            const completedSummary = {
-              ...summary,
-              final_id: envelope.final_id,
-              final_kind: envelope.final_kind,
-              final_match_ids: envelope.final_match_ids,
-              status: "completed",
-            };
+            let completedSummary;
+            if (summary.mode === "championship") {
+              championship = championshipReducer(championship, {
+                eventCount: envelope.event_count,
+                finalId: envelope.final_id,
+                finalKind: envelope.final_kind,
+                finalMatchIds: envelope.final_match_ids,
+                status: "completed",
+                type: "terminal",
+              });
+              completedSummary = championship.summary;
+            } else {
+              completedSummary = {
+                ...summary,
+                event_count: envelope.event_count,
+                final_id: envelope.final_id,
+                final_kind: envelope.final_kind,
+                final_match_ids: envelope.final_match_ids,
+                status: "completed",
+              };
+            }
             if (!validateLiveSummary(completedSummary, liveId)) {
               throw new PublicError("protocol_error");
             }
@@ -3245,7 +3817,25 @@ function useLiveStream(liveId, reloadKey) {
               throw new PublicError("protocol_error");
             }
             terminal = true;
-            if (summary) summary = { ...summary, status: "interrupted" };
+            if (summary) {
+              if (summary.mode === "championship") {
+                championship = championshipReducer(championship, {
+                  eventCount: envelope.event_count,
+                  status: "interrupted",
+                  type: "terminal",
+                });
+                summary = championship.summary;
+              } else {
+                summary = {
+                  ...summary,
+                  event_count: envelope.event_count,
+                  status: "interrupted",
+                };
+                if (!validateLiveSummary(summary, liveId)) {
+                  throw new PublicError("protocol_error");
+                }
+              }
+            }
             publish({ phase: "interrupted" }, true);
             return;
           }
@@ -3270,6 +3860,7 @@ function useLiveStream(liveId, reloadKey) {
     };
 
     setState({
+      championship: null,
       error: null,
       events: [],
       finalId: null,
@@ -3373,8 +3964,9 @@ function Timeline({ events, cursor }) {
         h("div", { className: "event-head" },
           h("strong", null,
             EVENT_LABELS[event.type],
-            event.context && (event.context.pairing_number || event.context.leg_number)
+            event.context && (event.context.round_number || event.context.pairing_number || event.context.leg_number)
               ? h("span", { className: "event-context" },
+                event.context.round_number ? ` · 第 ${event.context.round_number} 轮` : "",
                 event.context.pairing_number ? ` · 第 ${event.context.pairing_number} 组` : "",
                 event.context.leg_number ? ` · 第 ${event.context.leg_number} 局` : "",
               )
@@ -3671,6 +4263,115 @@ function MatchDetailPage({ matchId }) {
   );
 }
 
+function ChampionshipBracket({ championship, completed = false }) {
+  if (!championship) return null;
+  const { bracket, summary } = championship;
+  const currentPairing = summary.status === "running"
+    && summary.pairing_number === bracket.pairings.length + 1
+    ? summary.pairing_number
+    : null;
+  const rounds = Array.from({ length: bracket.round_count }, (_value, index) => index + 1);
+  const roundLabel = (round) => round === bracket.round_count
+    ? "决赛"
+    : round === bracket.round_count - 1
+      ? "半决赛"
+      : `第 ${round} 轮`;
+
+  const pairingCard = (pairing, globalNumber, round, roundPairingNumber) => {
+    const current = globalNumber === currentPairing;
+    if (!pairing && !current) {
+      return h("div", {
+        "aria-label": `${roundLabel(round)}第 ${roundPairingNumber} 组，等待晋级`,
+        className: "championship-slot",
+        key: globalNumber,
+      }, h("span", null, "等待晋级"));
+    }
+    const players = pairing
+      ? pairing.players
+      : championshipPairingPlayers(bracket, summary.players, round, roundPairingNumber);
+    const status = current ? "current" : pairing.status;
+    const statusCopy = status === "current"
+      ? "当前对阵"
+      : status === "committed"
+        ? "已写入整轮 checkpoint"
+        : "结果待整轮提交";
+    return h("article", {
+      "aria-label": `${roundLabel(round)}第 ${roundPairingNumber} 组，${statusCopy}`,
+      className: `championship-pairing${current ? " championship-current" : ""}`,
+      "data-status": status,
+      key: globalNumber,
+    },
+    h("div", { className: "championship-pairing-head" },
+      h("span", null, current ? "当前对阵" : `对阵 ${globalNumber}`),
+      h("strong", null, statusCopy),
+    ),
+    h("ol", { className: "championship-players" }, ...players.map((player) => h("li", {
+      className: pairing && pairing.winner === player ? "winner" : undefined,
+      key: player,
+    },
+    h("span", null, player),
+    pairing && pairing.winner === player
+      ? h("strong", { "aria-label": `${player} 晋级` }, "晋级")
+      : null,
+    ))),
+    pairing && completed ? h("div", {
+      "aria-label": `对阵 ${globalNumber} 存档`,
+      className: "championship-archives",
+    }, ...pairing.match_ids.map((matchId, index) => h(AppLink, {
+      className: "text-link",
+      href: `/matches/${encodeURIComponent(matchId)}`,
+      key: matchId,
+    }, `第 ${index + 1} 局`))) : null,
+    );
+  };
+
+  return h("section", {
+    className: "panel championship-bracket",
+    "aria-labelledby": "championship-bracket-heading",
+  },
+  h("div", { className: "panel-head" },
+    h("div", null,
+      h("p", { className: "panel-overline" }, "AUTHORITATIVE BRACKET"),
+      h("h2", { id: "championship-bracket-heading" }, "淘汰赛对阵"),
+    ),
+    h("span", { className: "panel-kicker" }, `${bracket.player_count} 人 · ${bracket.round_count} 轮`),
+  ),
+  bracket.champion ? h("div", {
+    "aria-live": "polite",
+    className: "championship-champion",
+  },
+  h("span", { "aria-hidden": "true" }, "★"),
+  h("div", null, h("small", null, "冠军"), h("strong", null, bracket.champion)),
+  ) : null,
+  h("div", { className: "championship-rounds", role: "list" }, ...rounds.map((round) => {
+    const roundPairingCount = bracket.player_count / (2 ** round);
+    const firstPairing = bracket.player_count - (bracket.player_count / (2 ** (round - 1))) + 1;
+    return h("section", {
+      "aria-labelledby": `championship-round-${round}`,
+      className: "championship-round",
+      key: round,
+      role: "listitem",
+    },
+    h("h3", { id: `championship-round-${round}` }, roundLabel(round)),
+    h("div", { className: "championship-round-pairings" },
+      ...Array.from({ length: roundPairingCount }, (_value, index) => {
+        const globalNumber = firstPairing + index;
+        return pairingCard(
+          bracket.pairings[globalNumber - 1],
+          globalNumber,
+          round,
+          index + 1,
+        );
+      }),
+    ),
+    );
+  })),
+  h("p", { className: "championship-note" },
+    "“待整轮提交”来自已完成的双局对阵；只有 CLI worker 原子写入整轮 checkpoint 后，状态才会变为已提交。",
+  ),
+  );
+}
+
 function LiveFacts({ stream, summary }) {
   const facts = [
     ["项目", gameLabel(summary.game)],
@@ -3682,6 +4383,9 @@ function LiveFacts({ stream, summary }) {
   ];
   if (summary.pairing_number) facts.push(["当前对阵", `${summary.pairing_number}/${summary.pairing_count || "?"}`]);
   if (summary.leg_number) facts.push(["当前局", String(summary.leg_number)]);
+  if (summary.mode === "championship") {
+    facts.splice(3, 0, ["当前轮次", `${summary.round_number}/${summary.round_count}`]);
+  }
   return h(
     "aside",
     { "aria-label": "运行中比赛信息" },
@@ -3698,7 +4402,7 @@ function LiveFacts({ stream, summary }) {
 function LiveDetailPage({ liveId }) {
   const [reloadKey, setReloadKey] = useState(0);
   const stream = useLiveStream(liveId, reloadKey);
-  const summary = stream.summary;
+  const summary = stream.championship ? stream.championship.summary : stream.summary;
 
   if (stream.phase === "error" && !summary) {
     return h(
@@ -3743,7 +4447,9 @@ function LiveDetailPage({ liveId }) {
     h("section", { className: "detail-hero live-detail-hero", "aria-labelledby": "live-detail-title" },
       h("div", null,
         h("p", { className: "eyebrow" }, `${gameLabel(summary.game)} · LIVE EVENTS`),
-        h("h1", { className: "detail-title", id: "live-detail-title" }, summary.players.join(" 对 ")),
+        h("h1", { className: "detail-title", id: "live-detail-title" }, summary.mode === "championship"
+          ? `${summary.players.length} 位选手淘汰锦标赛`
+          : summary.players.join(" 对 ")),
         h("p", { className: "id-line" }, summary.live_id),
       ),
       h("div", { className: `live-stage ${summary.status}` },
@@ -3763,6 +4469,10 @@ function LiveDetailPage({ liveId }) {
       copy: "比赛进程可能退出，或实时发布因本机资源限制而安全降级；已收到的公开事件仍可查看。",
       error: true,
     }) : null,
+    h(ChampionshipBracket, {
+      championship: stream.championship,
+      completed: stream.phase === "completed",
+    }),
     archiveLinks,
     h("div", { className: "replay-layout" },
       h(LiveViewer, { stream }),
@@ -4374,6 +5084,7 @@ function App() {
 if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
   globalThis.__LLMOLYMPIC_OBSERVER_TEST__ = Object.freeze({
     captureAdminToken,
+    championshipReducer,
     classifyReplayClose,
     clearAdminToken,
     controlJobCanResume,
@@ -4386,6 +5097,8 @@ if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
     participationKeepsCapability,
     playbackReducer,
     remainingCopy,
+    resumeControlRequest,
+    validateChampionshipBracket,
     validateControlForm,
     validateParticipationRequest,
     validateParticipationSnapshot,

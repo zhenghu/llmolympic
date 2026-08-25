@@ -319,11 +319,12 @@ llmolympic history
 llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_OR_CHAMPIONSHIP_ID>
 ```
 
-### 本机 React 比赛控制、参与与观战页（阶段四 4.4 / 4.5a / 4.5b）
+### 本机 React 比赛控制、参与与观战页（阶段四 4.4 / 4.5 / 4.6）
 
 阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；阶段 4.3/4.4 自 v0.6.0 起在此基础上加入
 运行中事件 broker 与单个本机浏览器人类输入；阶段 4.5a/4.5b 自 v0.7.0 起加入多席位
-本机浏览器参与与本机全 Web 控制台。Web 服务端依赖仍通过可选的
+本机浏览器参与与本机全 Web 控制台。当前 Unreleased 源码继续把 4/8/16 人单淘汰锦标赛的
+创建、恢复、实时赛程和冠军结果接入同一控制台。Web 服务端依赖仍通过可选的
 `web` extra 安装；若上面只安装了基础 wheel，可使用同一发布资产补齐依赖：
 
 ```bash
@@ -347,33 +348,39 @@ macOS 源码仓库也提供两个可双击脚本：`start_web.command` 通过项
 
 服务默认仅监听 `127.0.0.1:8000`，当前实现明确拒绝 `0.0.0.0`、局域网地址和公网地址；
 当前没有远程认证或 TLS，不能将它直接暴露到网络。启动后在浏览器打开
-`http://127.0.0.1:8000/`，可以看到同一数据库上正在运行的 `play`、`series` 或
-`round-robin`，也可按项目筛选最近对局和总体/分项目 ELO。实时详情支持跟随、暂停、逐条
-查看和回到最新；完成存档详情仍可播放、前后单步、拖动进度、切换速度或重新播放。五子棋
-和国际象棋暂时都使用通用事件时间线，不提供专用棋盘。
+`http://127.0.0.1:8000/`，可以看到同一数据库上正在运行的 `play`、`series`、
+`round-robin` 或 `championship`，也可按项目筛选最近对局和总体/分项目 ELO。普通实时详情
+支持跟随、暂停、逐条查看和回到最新；锦标赛详情另外显示响应式淘汰赛程、当前对阵、整轮
+落库前的 provisional 结果、已落库的 committed 结果和最终冠军，完成后可打开各场正式档案。
+完成存档详情仍可播放、前后单步、拖动进度、切换速度或重新播放。五子棋和国际象棋暂时都
+使用通用事件时间线，不提供专用棋盘。
 
 `llmolympic web` 会生成一条只显示给当前终端的 `/#admin=...` 本机管理链接；macOS 双击
 启动器会通过项目专属 `0700` 状态目录中的 `0600` 临时文件交付同一凭证，而不会把它写入
 launchd 日志。浏览器会立即从地址栏清除 fragment，并只在当前标签页会话保存凭证。管理页
-可选择 `play`、`series` 或 `round-robin`、内置 Human/mock 或已经配置的 Provider Profile，
-再设置 rounds、seed、超时和硬预算。创建操作只生成不可变的准备态与工作量预览；必须再次
-确认才会启动 worker 或产生 Provider 调用。当前同一数据库最多运行一个 Web 任务；重复请求
-使用幂等键返回原任务，不会因双击或响应丢失重复启动和计费。
+可选择 `play`、`series`、`round-robin` 或 `championship`、内置 Human/mock 或已经配置的
+Provider Profile，再设置 rounds、seed、超时和硬预算。锦标赛只接受恰好 4、8 或 16 名
+非人类选手；Human 仍只允许用于单场 `play`。创建操作只生成不可变的准备态与工作量预览；
+必须再次确认才会启动固定参数的独立 CLI worker 或产生 Provider 调用。当前同一数据库最多
+运行一个 Web 任务；重复请求使用幂等键返回原任务，不会因双击或响应丢失重复启动和计费。
 
 浏览器不能录入 API Key、环境变量、Provider endpoint、数据库路径、shell 命令或任意模型
 覆盖；Profile 必须先在本机 `config.toml` 配置，页面只显示脱敏名称、Provider 类型、固定默认
 模型和凭据是否就绪。由 macOS `launchd` 启动时不会把交互式终端中的云密钥复制进 plist，
 因此需要云 Profile 时应在已设置相应环境变量的可信终端运行 `llmolympic web`。Human 仍只
-允许用于 `play`；`series` 和 `round-robin` 保持既有非人类限制。prepare 会把受信
-Profile 的无凭据安全投影和配置摘要冻结在准备态；控制器与 child 在构造 Provider 前会再次核对，如果
+允许用于 `play`；`series`、`round-robin` 和 `championship` 保持既有非人类限制。
+prepare 会把受信 Profile 的无凭据安全投影和配置摘要冻结在准备态；控制器与 child 在构造
+Provider 前会再次核对，如果
 Profile 的 Provider、endpoint、默认模型或凭据环境变量名在确认前发生变化，任务会在任何
 Provider 调用前安全失败。
 
-中断的循环赛只能显式恢复；未过期的 runner lease 仍在活动时不会显示恢复入口。Web
-只允许恢复全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结 Provider
-预算的 checkpoint；旧式直接 Provider checkpoint 仍须从 CLI 恢复；
-含非 Mock Provider 却没有冻结预算的旧 checkpoint 仍可使用 CLI 按既有规则处理，但 Web 不会
-事后附加预算或启动它。`play` 与 `series` 不会自动重跑，以免重复 Provider 调用。
+中断的循环赛和锦标赛都只能显式恢复；未过期的对应 runner lease 仍在活动时不会显示恢复
+入口。Web 只允许恢复全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结
+Provider 预算的 checkpoint；恢复预览只展示检查点冻结的项目、选手、seed、超时、评审团和
+预算状态，不接受浏览器覆盖。循环赛的旧式直接 Provider checkpoint 仍须从 CLI 恢复；锦标赛
+缺少持久预算的历史 Profile checkpoint 则会在任何 Provider 重建前安全拒绝。锦标赛从最后
+完整整轮边界继续，页面以 committed 状态重建已落库赛程；`play` 与 `series` 不会自动重跑，
+以免重复 Provider 调用。
 
 要从浏览器真正参加一场比赛，可以在持管理凭证的 `/new` 页面直接创建含 Human 的单场
 `play`；也可以保持 Web 服务运行，再从另一个终端启动同一数据库上的 `play`：
@@ -412,9 +419,10 @@ Unicode 字符的文本提交给对应的 `HumanPlayer` 异步接口。提交成
 现有 ELO 更新。每个 capability 只允许读取并提交对应席位的当前 request；对局的
 公开题面和动作事件仍会进入同机的实时观战页，因此它不是隐藏题目或公开事件的保密通道。
 所有项目继续使用通用文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。
-4.5b 的管理页可以从安全目录选择既有 Profile 并控制三种现有比赛模式，但不会读取凭据、
-直接调用 Provider、写正式档案或任意修改 ELO；这些操作仍由固定参数启动的比赛 worker 通过
-现有事务执行。它也不开放局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
+管理页可以从安全目录选择既有 Profile 并控制四种现有比赛模式，包括新建或恢复锦标赛，
+但不会读取凭据、直接调用 Provider、写正式档案或任意修改 ELO；Provider 凭据只由受控 CLI
+worker 从其本机进程环境读取，正式档案、预算账本和 ELO 仍由该 worker 通过既有事务处理。
+它也不开放局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
 
 这是可信本机操作者场景，不是同一 macOS/Linux 账户内不同用户之间的保密边界：运行命令的
 终端会显示全部 capability 链接，拥有该操作系统账户文件访问权的人也不属于威胁模型。远程
@@ -449,9 +457,8 @@ owner fencing 与租约，Web 仅能凭对应 seat capability 对当前 request 
 子进程引用和最终档案引用。过期的未启动准备态会在 30 分钟后取消，终态记录在 24 小时后
 在服务重新启动或后续准备/启动任务时清理。`example.db.jobs.db.lock` 是权限同样收紧的独立
 manager lock，只用于防止同一数据库被两个 Web 控制器同时管理；它不是任务租约，也不替代
-循环赛 checkpoint 中的
-runner lease。Web 服务或受控 worker 运行时不要删除这两个文件；完全停止后可一并删除，
-之后会按需重建。它们都不是正式存档，不应代替主数据库备份。
+循环赛或锦标赛 checkpoint 中的 runner lease。Web 服务或受控 worker 运行时不要删除这两个
+文件；完全停止后可一并删除，之后会按需重建。它们都不是正式存档，不应代替主数据库备份。
 
 Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `query_only` 连接，不创建、
 迁移或修改它们，也不直接更新 ELO。参与写端点只能推进已有 input request；管理写端点只
@@ -459,9 +466,9 @@ Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `quer
 POST、Bearer capability、严格 JSON/体积上限和幂等标识。正式主库写入仅发生在受控比赛
 worker 的既有原子存档路径。jobs sidecar 和公开 DTO 只保留 Profile ID、脱敏显示名、Provider
 类型、默认模型与无凭据配置摘要，不包含 endpoint、凭据环境变量名或值、请求头或原始失败详情。
-旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样
-公开。带正式身份认证、资源授权和 TLS 的远程使用，以及锦标赛 Web 控制与实时直播，
-仍留给后续阶段四切片。
+旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样公开。当前锦标赛控制与
+直播和其他管理功能一样只面向可信本机操作者；带正式身份认证、资源授权和 TLS 的远程使用
+仍留给后续阶段。
 
 五子棋采用 15×15 自由规则：黑棋先行，横、竖或斜线连续 5 子或以上获胜，
 没有禁手；满盘无人获胜则和棋。坐标为 `A1` 到 `O15`，`A1` 在左上角，
@@ -578,8 +585,12 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 runner generation 同时 fencing 预算调用：接管时，旧执行者未调度的预留会释放，已经调度但
 无法确认用量的调用按完整上界计费。命名 Profile 参赛者或评委必须显式启用硬预算；历史上
 缺少预算账本的 Profile checkpoint 会在重建 Provider 前安全拒绝，全 Mock 无预算 checkpoint
-仍可恢复。锦标赛 checkpoint 当前仅支持 CLI，
-尚未接入 Web 控制面或实时直播。
+仍可恢复。当前 Unreleased 源码还可在本机 Web 管理页新建或显式恢复锦标赛；页面先生成
+不可变准备态和工作量预览，确认后才启动同一个 `llmolympic championship` CLI worker。
+Live schema v2 将每个双局对阵先显示为 provisional，只有整轮 checkpoint 事务成功后才把
+该轮标为 committed；浏览器重连时以服务端物化赛程为准，不从客户端可见名称猜测晋级者，
+最终事务成功后才显示冠军和正式档案链接。浏览器本身不持有 Provider 凭据、不发起 Provider
+请求，也不直接写主档案、预算或 ELO。
 
 ### 严格只读赛事审计
 

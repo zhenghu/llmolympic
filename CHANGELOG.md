@@ -14,6 +14,17 @@
   冻结值，不接受当前预算配置覆盖。历史上没有预算账本的 Profile checkpoint 会在重建
   Provider 前安全拒绝；全 Mock 无预算锦标赛继续兼容。预算 ID 升级为按赛事种类隔离的
   `budget:v2`，既有 `budget:v1` 仍可按持久化关联恢复。
+- 本机 Web 控制面升级至 control schema v2：管理页可准备、确认启动、停止 4/8/16 名
+  非人类选手的 `championship`，并为满足完整 checkpoint、runner lease、冻结 Profile 与
+  持久预算约束的中断锦标赛提供显式恢复。任务协议记录 `championship_id`，完成态严格核对
+  `final_kind=championship` 及全部规范赛程对局引用；重复 prepare/start 继续保持幂等。
+- 实时 sidecar 升级至 Live schema v2，并兼容迁移既有 v1 数据。锦标赛事件带规范轮次、
+  对阵和双局 leg 上下文；每组双局结束先发布 provisional 结果，整轮 checkpoint 事务成功后
+  才发布 committed 确认，最终档案事务成功后才公开冠军与档案链接。React 页面新增响应式、
+  可访问的淘汰赛程、当前对阵、提交状态和冠军视图，并保留断线续播、分页幂等与 REST 回退。
+- 锦标赛 Web 化不扩大信任边界：服务仍只监听回环地址并信任本机操作者；浏览器只能提交
+  严格控制 DTO、推进 jobs sidecar 和消费公开 Live DTO。Provider 凭据、Provider 调用、
+  主档案/预算写入与最终封存仍由固定参数的独立 CLI worker 持有，浏览器不能直接执行这些操作。
 
 ## [0.10.0] - 2026-08-25
 
@@ -24,7 +35,7 @@
   `llmolympic championship --resume` 从最后完整轮边界恢复，跨进程 runner lease
   保证同一时刻只有一个执行者；恢复时核对项目配置、选手描述与冻结评审团快照，
   只运行未完成轮次，完成后在最终事务内封存正式锦标赛档案与全部子双局赛（仍不计分）。
-  锦标赛 checkpoint 暂未接入 Web 控制面与实时直播。
+  在 v0.10.0 发布时，锦标赛 checkpoint 尚未接入 Web 控制面与实时直播。
 - 修复多人浏览器席位高并发时，Web 输入 sidecar 的 schema 校验或取消清理可能因瞬时
   SQLite `BUSY` / `LOCKED` 直接失败的问题；现在仅对此类争用做有界重试，并在每次连接
   失败后正确关闭连接。
@@ -40,7 +51,8 @@
   SQLite v9 的 `championship_archives` / `championship_entrants` /
   `championship_pairings` 关系表，通过 additive migration 从 v8 升级。锦标赛及
   其子双局赛只存档、不更新 ELO；`archive` 命令可输出完整锦标赛 JSON。
-- 当前锦标赛串行执行、无 checkpoint，暂未接入本机 Web 控制面与实时直播 sidecar。
+- 在 v0.9.0 发布时，锦标赛串行执行且没有 checkpoint，也尚未接入本机 Web 控制面与实时
+  直播 sidecar。
 
 ## [0.8.0] - 2026-08-16
 
@@ -123,8 +135,8 @@
   收紧权限的写入仓储。服务默认只监听回环地址，拒绝跨源请求；公开 DTO 会剔除 Provider
   路由、Profile、模型配置、凭据、请求头、原始失败详情和未知事件字段，并对档案大小、
   事件数量、语义与并发回放设定上限。
-- 当前 Web 切片只回放已完成且已存档的对局，不是运行中比赛的实时广播；运行中事件
-  broker、远程人类输入与锦标赛模式留给后续阶段四切片。
+- 在 v0.5.0 发布时，Web 切片只回放已完成且已存档的对局，不是运行中比赛的实时广播；
+  运行中事件 broker、浏览器人类输入与锦标赛模式当时留给后续阶段四切片。
 - 完成阶段四 4.2：`llmolympic web` 根地址新增随 wheel/sdist 离线分发的 React 观战页，
   提供项目筛选、最近对局、总体/分项目 ELO、对局详情和通用事件时间线；回放可播放、暂停、
   前后单步、拖动进度、切换速度并重新播放。
