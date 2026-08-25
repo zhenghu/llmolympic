@@ -1,4 +1,4 @@
-"""Complete SQLite v10 schema-manifest and fail-closed parser tests."""
+"""Complete SQLite v11 schema-manifest and fail-closed parser tests."""
 
 from __future__ import annotations
 
@@ -290,7 +290,7 @@ def test_fresh_database_passes_the_complete_manifest(tmp_path: Path) -> None:
     SQLiteStore(database, create=False)
     inspection = inspect_database(database)
 
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
     assert inspection.schema_version == SCHEMA_VERSION
     assert not inspection.migration_required
     with pytest.raises(TournamentAuditError) as caught:

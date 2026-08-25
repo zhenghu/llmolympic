@@ -26,13 +26,17 @@ from llmolympic.core._storage_types import (
     ChampionshipRunnerLeaseBusyError,
     ChampionshipRunnerLeaseLostError,
     MatchIdCollisionError,
+    ProviderBudgetCollisionError,
+    ProviderBudgetSnapshot,
     SaveResult,
     SeriesIdCollisionError,
     StorageError,
     _canonical_json,
     _EntrantRef,
     _runner_lease_token_digest,
+    _validate_durable_budget_definition,
     _validate_runner_lease_seconds,
+    _validate_usage_ledger_id,
 )
 from llmolympic.core.championship import (
     CHAMPIONSHIP_CHECKPOINT_SCHEMA_VERSION,
@@ -40,6 +44,7 @@ from llmolympic.core.championship import (
     ChampionshipCheckpoint,
 )
 from llmolympic.core.series import SeriesArchive
+from llmolympic.core.usage import BudgetLimits, ProviderBudgetPolicy
 
 
 class _ChampionshipCheckpointMixin:
@@ -255,6 +260,13 @@ class _ChampionshipCheckpointMixin:
                     "锦标赛 checkpoint 正由另一个执行者运行；请稍后重试"
                 )
 
+            if state is not None:
+                self._close_stale_championship_provider_attempts(
+                    connection,
+                    championship_id,
+                    state["generation"],
+                    finished_at_epoch=now,
+                )
             if state is not None and state["generation"] >= SQLITE_INT_MAX:
                 raise StorageError("锦标赛 runner lease generation 已达到 SQLite 整数上限")
             generation = 1 if state is None else state["generation"] + 1
@@ -570,6 +582,103 @@ class _ChampionshipCheckpointMixin:
             ),
         )
 
+    def create_championship_checkpoint_with_provider_budget(
+        self,
+        checkpoint: ChampionshipCheckpoint,
+        budget_id: str,
+        limits: BudgetLimits,
+        policy: ProviderBudgetPolicy,
+    ) -> tuple[ChampionshipCheckpointSaveResult, ProviderBudgetSnapshot]:
+        """Atomically create an empty checkpoint and its frozen Provider budget."""
+
+        checkpoint, _ = self._validate_championship_checkpoint(checkpoint)
+        if checkpoint.completed_series:
+            raise StorageError("new championship checkpoint must have empty progress")
+        budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
+        limits, policy = _validate_durable_budget_definition(limits, policy)
+        payload = checkpoint.model_dump(mode="json")
+        config_json = _canonical_json(
+            self._championship_checkpoint_config_payload(checkpoint)
+        )
+        pairing_count = len(checkpoint.schedule)
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._verify_entrant_descriptors(connection, checkpoint.players)
+            loaded = self._load_championship_checkpoint(
+                connection,
+                checkpoint.championship_id,
+            )
+            if loaded is None:
+                if connection.execute(
+                    "SELECT 1 FROM championship_archives WHERE championship_id = ?",
+                    (checkpoint.championship_id,),
+                ).fetchone():
+                    raise ChampionshipCheckpointCollisionError(
+                        f"championship_id {checkpoint.championship_id!r} "
+                        "已有正式锦标赛档案"
+                    )
+                if self._provider_budget_snapshot_in_transaction(connection, budget_id):
+                    raise ProviderBudgetCollisionError("budget_id is already present")
+                self._insert_empty_championship_checkpoint_in_transaction(
+                    connection,
+                    checkpoint,
+                    payload=payload,
+                    config_json=config_json,
+                )
+                budget = self._insert_provider_budget_in_transaction(
+                    connection,
+                    budget_id,
+                    limits,
+                    policy,
+                    tournament_id=None,
+                    championship_id=checkpoint.championship_id,
+                )
+                inserted = True
+            else:
+                stored, status = loaded
+                if (
+                    status != "in_progress"
+                    or stored.completed_series
+                    or _canonical_json(
+                        self._championship_checkpoint_config_payload(stored)
+                    )
+                    != config_json
+                ):
+                    raise ChampionshipCheckpointCollisionError(
+                        f"championship_id {checkpoint.championship_id!r} "
+                        "已对应另一份 checkpoint"
+                    )
+                budget = self._provider_budget_snapshot_in_transaction(
+                    connection,
+                    budget_id,
+                )
+                if (
+                    budget is None
+                    or budget.championship_id != checkpoint.championship_id
+                    or budget.limits != limits
+                    or budget.policy != policy
+                ):
+                    raise ProviderBudgetCollisionError(
+                        "checkpoint exists without the identical frozen Provider budget"
+                    )
+                inserted = False
+            connection.commit()
+            return (
+                ChampionshipCheckpointSaveResult(
+                    inserted=inserted,
+                    completed_pairing_count=0,
+                    pairing_count=pairing_count,
+                ),
+                budget,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def save_championship_checkpoint(
         self,
         checkpoint: ChampionshipCheckpoint,
@@ -788,6 +897,10 @@ class _ChampionshipCheckpointMixin:
                     lease,
                     renew_seconds=DEFAULT_TOURNAMENT_RUNNER_LEASE_SECONDS,
                 )
+            self._finalize_championship_provider_budgets(
+                connection,
+                championship_id,
+            )
             archive = self._championship_from_checkpoint(checkpoint)
             result = self._save_championship_in_transaction(
                 connection,

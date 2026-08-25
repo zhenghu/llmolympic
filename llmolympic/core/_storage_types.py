@@ -30,7 +30,7 @@ from llmolympic.core.usage import (
 if TYPE_CHECKING:
     from llmolympic.core.storage import SQLiteStore
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 RatingSource = Literal["engine", "imported"]
 
@@ -648,12 +648,17 @@ class ChampionshipRunnerLease:
     renewed_at_epoch: int
     expires_at_epoch: int
 
+
+ProviderRunnerLease = TournamentRunnerLease | ChampionshipRunnerLease
+
+
 @dataclass(frozen=True)
 class ChampionshipRunnerClaim:
     """A championship checkpoint reloaded atomically with its acquired lease."""
 
     checkpoint: ChampionshipCheckpoint
     lease: ChampionshipRunnerLease
+
 
 @dataclass(frozen=True)
 class ProviderBudgetSnapshot:
@@ -665,6 +670,7 @@ class ProviderBudgetSnapshot:
     spent: UsageTotals
     reserved: UsageTotals
     tournament_id: str | None
+    championship_id: str | None
     created_at_epoch: int
     finalized_at_epoch: int | None
     poison_reason_code: str | None
@@ -837,7 +843,7 @@ class SQLiteUsageBudget:
         store: SQLiteStore,
         budget_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> None:
         self._store = store
         self._budget_id = _validate_usage_ledger_id(budget_id, "budget_id")
@@ -1159,4 +1165,3 @@ def _sensitive_descriptor_path(value: object) -> str | None:
         elif isinstance(candidate, (list, tuple)):
             pending.extend((f"{path}[{index}]", nested) for index, nested in enumerate(candidate))
     return None
-

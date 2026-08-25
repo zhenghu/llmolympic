@@ -308,6 +308,19 @@ def _budget_players(
     return tuple(values)
 
 
+def _championship_checkpoint_uses_profiles(
+    checkpoint: ChampionshipCheckpoint,
+) -> bool:
+    """Return whether a durable championship can reconstruct any Profile route."""
+
+    if any(descriptor.get("profile_id") is not None for descriptor in checkpoint.players):
+        return True
+    snapshot = checkpoint.judge_panel
+    return snapshot is not None and any(
+        descriptor.profile_id is not None for descriptor in snapshot.panel
+    )
+
+
 def _bind_runtime_budget(
     players: list[Player],
     judge_panel: LLMJudgePanel | None,
@@ -2682,7 +2695,10 @@ def round_robin(
             if resolved_budget is None:
                 store.save_tournament_checkpoint(checkpoint)
             else:
-                budget_id = resolved_budget.budget_id_for(checkpoint.tournament_id)
+                budget_id = resolved_budget.budget_id_for(
+                    "tournament",
+                    checkpoint.tournament_id,
+                )
                 store.create_tournament_checkpoint_with_provider_budget(
                     checkpoint,
                     budget_id,
@@ -3112,6 +3128,7 @@ def championship(
 
     _validate_control_profile_snapshot()
     resumed = resume is not None
+    resolved_budget: ResolvedProviderBudget | None = None
     runtime_budget: _RuntimeBudget | None = None
     judge_panel: LLMJudgePanel | None = None
     store: SQLiteStore | None = None
@@ -3178,7 +3195,7 @@ def championship(
                 llm_timeout=llm_timeout,
                 no_llm_timeout=no_llm_timeout,
             )
-            runtime_budget = _prepare_in_memory_budget(
+            resolved_budget = _resolve_budget_definition(
                 selected_players,
                 judge_panel,
                 max_provider_calls=max_provider_calls,
@@ -3187,6 +3204,14 @@ def championship(
                 max_total_output_tokens=max_total_output_tokens,
                 max_estimated_cost_usd=max_estimated_cost_usd,
             )
+            if resolved_budget is None and any(
+                player.profile_id is not None
+                for player in _budget_players(selected_players, judge_panel)
+            ):
+                raise typer.BadParameter(
+                    "Profile 锦标赛必须显式启用 Provider 硬预算",
+                    param_hint="Provider budget",
+                )
             effective_seed = DEFAULT_TOURNAMENT_SEED if seed is None else seed
             checkpoint = prepare_championship(
                 selected_game,
@@ -3196,12 +3221,31 @@ def championship(
                 judge_panel=judge_panel,
             )
             store = _open_store(database)
-            store.save_championship_checkpoint(checkpoint)
+            if resolved_budget is None:
+                store.save_championship_checkpoint(checkpoint)
+            else:
+                budget_id = resolved_budget.budget_id_for(
+                    "championship",
+                    checkpoint.championship_id,
+                )
+                store.create_championship_checkpoint_with_provider_budget(
+                    checkpoint,
+                    budget_id,
+                    resolved_budget.limits,
+                    resolved_budget.policy,
+                )
     except typer.BadParameter:
         raise
     except typer.Exit:
         raise
-    except (OSError, sqlite3.Error, StorageError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        sqlite3.Error,
+        StorageError,
+        TypeError,
+        UsageError,
+        ValueError,
+    ) as exc:
         line = Text("无法创建或读取锦标赛检查点：", style="red")
         line.append(literal_text(exc))
         console.print(line)
@@ -3219,6 +3263,38 @@ def championship(
 
     checkpoint = claim.checkpoint
     lease = claim.lease
+
+    try:
+        stored_budget = store.load_championship_provider_budget(checkpoint.championship_id)
+        if stored_budget is None:
+            if _championship_checkpoint_uses_profiles(checkpoint):
+                raise StorageError(
+                    "旧锦标赛 Profile checkpoint 缺少冻结 Provider 预算，无法安全恢复"
+                )
+        else:
+            resolved_budget = ResolvedProviderBudget(
+                limits=stored_budget.limits,
+                policy=stored_budget.policy,
+            )
+            ledger = store.bind_championship_usage_budget(
+                checkpoint.championship_id,
+                lease=lease,
+            )
+            if ledger is None:  # pragma: no cover - load/bind transaction contract guard
+                raise StorageError("锦标赛 Provider 预算在绑定前消失")
+            runtime_budget = _RuntimeBudget(
+                resolved=resolved_budget,
+                ledger=ledger,
+            )
+    except (OSError, sqlite3.Error, StorageError, UsageError, ValueError) as exc:
+        line = Text("无法恢复锦标赛 Provider 预算：", style="red")
+        line.append(literal_text(exc))
+        console.print(line)
+        try:
+            store.release_championship_runner(lease)
+        except (OSError, sqlite3.Error, StorageError, TypeError, ValueError):
+            pass
+        raise typer.Exit(code=1) from exc
 
     try:
         _best_effort_render(
@@ -3250,6 +3326,13 @@ def championship(
                     f"无法从检查点恢复比赛配置: {exc}",
                     param_hint="--resume",
                 ) from exc
+        if runtime_budget is not None:
+            runtime_budget = _bind_runtime_budget(
+                selected_players,
+                judge_panel,
+                runtime_budget.resolved,
+                runtime_budget.ledger,
+            )
         _emit_control_event("running", tournament_id=checkpoint.championship_id)
         asyncio.run(
             _run_championship(

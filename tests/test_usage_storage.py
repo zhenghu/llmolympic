@@ -80,7 +80,7 @@ def test_fresh_v8_usage_schema_is_strict_and_credential_free(tmp_path: Path) -> 
     SQLiteStore(path)
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         table_flags = {
             row[1]: row[5]
             for row in connection.execute("PRAGMA table_list")

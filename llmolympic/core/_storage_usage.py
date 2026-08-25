@@ -9,11 +9,14 @@ from contextlib import closing
 from typing import Literal
 
 from llmolympic.core._storage_types import (
+    ChampionshipRunnerLease,
+    ChampionshipRunnerLeaseLostError,
     ProviderBudgetCollisionError,
     ProviderBudgetPendingError,
     ProviderBudgetSnapshot,
     ProviderCallAttempt,
     ProviderCallAttemptCollisionError,
+    ProviderRunnerLease,
     SQLiteUsageBudget,
     StorageError,
     TournamentRunnerLease,
@@ -254,6 +257,13 @@ class _ProviderUsageMixin:
             not isinstance(tournament_id, str) or not tournament_id.strip()
         ):
             raise StorageError("Provider budget ledger has invalid tournament scope")
+        championship_id = row["championship_id"]
+        if championship_id is not None and (
+            not isinstance(championship_id, str) or not championship_id.strip()
+        ):
+            raise StorageError("Provider budget ledger has invalid championship scope")
+        if tournament_id is not None and championship_id is not None:
+            raise StorageError("Provider budget ledger has multiple checkpoint scopes")
         poison_reason = row["poison_reason_code"]
         if poison_reason not in {
             None,
@@ -316,7 +326,8 @@ class _ProviderUsageMixin:
                     raise StorageError(
                         "Provider call attempt cost differs from its frozen price policy"
                     )
-                if (tournament_id is None) != (attempt.runner_generation is None):
+                scoped = tournament_id is not None or championship_id is not None
+                if scoped == (attempt.runner_generation is None):
                     raise StorageError(
                         "Provider call-attempt fencing does not match its budget scope"
                     )
@@ -358,6 +369,7 @@ class _ProviderUsageMixin:
             spent=stored_spent,
             reserved=stored_reserved,
             tournament_id=tournament_id,
+            championship_id=championship_id,
             created_at_epoch=created_at,
             finalized_at_epoch=finalized_at,
             poison_reason_code=poison_reason,
@@ -409,28 +421,53 @@ class _ProviderUsageMixin:
         ).fetchone()
         return None if row is None else _ProviderUsageMixin._provider_attempt_from_row(row)
 
+    def _require_provider_runner_generation(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: ProviderBudgetSnapshot,
+        lease: ProviderRunnerLease | None,
+    ) -> int | None:
+        if snapshot.tournament_id is not None:
+            active = self._require_active_tournament_runner(
+                connection,
+                snapshot.tournament_id,
+                lease,
+            )
+            return active.generation
+        if snapshot.championship_id is not None:
+            active = self._require_active_championship_runner(
+                connection,
+                snapshot.championship_id,
+                lease,
+            )
+            return active.generation
+        if lease is not None:
+            raise ValueError("standalone Provider budget does not accept a runner lease")
+        return None
+
     def _require_provider_attempt_fence(
         self,
         connection: sqlite3.Connection,
         snapshot: ProviderBudgetSnapshot,
         attempt: ProviderCallAttempt,
-        lease: TournamentRunnerLease | None,
+        lease: ProviderRunnerLease | None,
     ) -> None:
-        if snapshot.tournament_id is None:
-            if lease is not None:
-                raise ValueError("non-tournament Provider budget does not accept a runner lease")
-            if attempt.runner_generation is not None:
-                raise StorageError("Provider call-attempt fencing is invalid")
-            return
-        active = self._require_active_tournament_runner(
+        generation = self._require_provider_runner_generation(
             connection,
-            snapshot.tournament_id,
+            snapshot,
             lease,
         )
-        if attempt.runner_generation != active.generation:
+        if attempt.runner_generation == generation:
+            return
+        if snapshot.tournament_id is not None:
             raise TournamentRunnerLeaseLostError(
                 "Provider call attempt belongs to a stale runner generation"
             )
+        if snapshot.championship_id is not None:
+            raise ChampionshipRunnerLeaseLostError(
+                "Provider call attempt belongs to a stale runner generation"
+            )
+        raise StorageError("Provider call-attempt fencing is invalid")
 
     def _insert_provider_budget_in_transaction(
         self,
@@ -440,12 +477,13 @@ class _ProviderUsageMixin:
         policy: ProviderBudgetPolicy,
         *,
         tournament_id: str | None,
+        championship_id: str | None = None,
     ) -> ProviderBudgetSnapshot:
         now = self._database_epoch(connection)
         connection.execute(
             """
             INSERT INTO provider_budgets (
-                budget_id, tournament_id, policy_json, policy_digest,
+                budget_id, tournament_id, championship_id, policy_json, policy_digest,
                 limit_calls, limit_input_tokens,
                 limit_output_tokens, limit_estimated_cost_nanos,
                 spent_calls, spent_input_tokens, spent_output_tokens,
@@ -453,11 +491,12 @@ class _ProviderUsageMixin:
                 reserved_input_tokens, reserved_output_tokens,
                 reserved_estimated_cost_nanos, poison_reason_code,
                 created_at_epoch, finalized_at_epoch
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, NULL, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, NULL, ?, NULL)
             """,
             (
                 budget_id,
                 tournament_id,
+                championship_id,
                 policy.canonical_json(),
                 policy.digest,
                 limits.calls,
@@ -479,7 +518,8 @@ class _ProviderUsageMixin:
         policy: ProviderBudgetPolicy,
         *,
         tournament_id: str | None = None,
-        lease: TournamentRunnerLease | None = None,
+        championship_id: str | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderBudgetSnapshot:
         """Create one durable hard-budget scope, idempotently for identical inputs."""
 
@@ -489,6 +529,14 @@ class _ProviderUsageMixin:
             not isinstance(tournament_id, str) or not tournament_id.strip()
         ):
             raise ValueError("tournament_id must be a non-empty string")
+        if championship_id is not None and (
+            not isinstance(championship_id, str) or not championship_id.strip()
+        ):
+            raise ValueError("championship_id must be a non-empty string")
+        if tournament_id is not None and championship_id is not None:
+            raise ValueError(
+                "Provider budget cannot belong to both a tournament and a championship"
+            )
 
         connection = self._connect()
         try:
@@ -499,6 +547,7 @@ class _ProviderUsageMixin:
                     existing.limits != limits
                     or existing.policy != policy
                     or existing.tournament_id != tournament_id
+                    or existing.championship_id != championship_id
                 ):
                     raise ProviderBudgetCollisionError(
                         "budget_id is already attached to a different budget"
@@ -527,12 +576,35 @@ class _ProviderUsageMixin:
                     raise ProviderBudgetCollisionError(
                         "tournament checkpoint already has a Provider budget"
                     )
+            elif championship_id is not None:
+                checkpoint = connection.execute(
+                    "SELECT status FROM championship_checkpoints WHERE championship_id = ?",
+                    (championship_id,),
+                ).fetchone()
+                if checkpoint is None or checkpoint["status"] != "in_progress":
+                    raise StorageError(
+                        "championship Provider budget requires an in-progress checkpoint"
+                    )
+                self._require_active_championship_runner(
+                    connection,
+                    championship_id,
+                    lease,
+                )
+                collision = connection.execute(
+                    "SELECT 1 FROM provider_budgets WHERE championship_id = ?",
+                    (championship_id,),
+                ).fetchone()
+                if collision is not None:
+                    raise ProviderBudgetCollisionError(
+                        "championship checkpoint already has a Provider budget"
+                    )
             snapshot = self._insert_provider_budget_in_transaction(
                 connection,
                 budget_id,
                 limits,
                 policy,
                 tournament_id=tournament_id,
+                championship_id=championship_id,
             )
             connection.commit()
             return snapshot
@@ -590,11 +662,40 @@ class _ProviderUsageMixin:
                 raise
         return snapshot
 
+    def load_championship_provider_budget(
+        self,
+        championship_id: str,
+    ) -> ProviderBudgetSnapshot | None:
+        """Load the unique frozen budget policy owned by a championship checkpoint."""
+
+        if not isinstance(championship_id, str) or not championship_id.strip():
+            raise ValueError("championship_id must be a non-empty string")
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN")
+            try:
+                row = connection.execute(
+                    "SELECT budget_id FROM provider_budgets WHERE championship_id = ?",
+                    (championship_id,),
+                ).fetchone()
+                snapshot = (
+                    None
+                    if row is None
+                    else self._provider_budget_snapshot_in_transaction(
+                        connection,
+                        row["budget_id"],
+                    )
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return snapshot
+
     def bind_provider_usage_budget(
         self,
         budget_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> SQLiteUsageBudget:
         """Return the protocol adapter used by budget-aware Player calls."""
 
@@ -615,6 +716,21 @@ class _ProviderUsageMixin:
             raise ValueError("runner lease does not belong to this tournament")
         return SQLiteUsageBudget(self, snapshot.budget_id, lease=lease)
 
+    def bind_championship_usage_budget(
+        self,
+        championship_id: str,
+        *,
+        lease: ChampionshipRunnerLease,
+    ) -> SQLiteUsageBudget | None:
+        """Bind the frozen durable budget for one claimed championship, if configured."""
+
+        snapshot = self.load_championship_provider_budget(championship_id)
+        if snapshot is None:
+            return None
+        if lease.championship_id != championship_id:
+            raise ValueError("runner lease does not belong to this championship")
+        return SQLiteUsageBudget(self, snapshot.budget_id, lease=lease)
+
     def reserve_provider_call_batch(
         self,
         budget_id: str,
@@ -622,7 +738,7 @@ class _ProviderUsageMixin:
         *,
         route_ids: Iterable[str] | None = None,
         attempt_ids: Iterable[str] | None = None,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> tuple[ProviderCallAttempt, ...]:
         """Reserve an entire call batch under ``BEGIN IMMEDIATE``, or reserve none."""
 
@@ -700,19 +816,11 @@ class _ProviderUsageMixin:
                     raise UsageValidationError(
                         "call bound estimated_cost must match the frozen route price"
                     )
-            if snapshot.tournament_id is None:
-                if lease is not None:
-                    raise ValueError(
-                        "non-tournament Provider budget does not accept a runner lease"
-                    )
-                generation = None
-            else:
-                active = self._require_active_tournament_runner(
-                    connection,
-                    snapshot.tournament_id,
-                    lease,
-                )
-                generation = active.generation
+            generation = self._require_provider_runner_generation(
+                connection,
+                snapshot,
+                lease,
+            )
 
             committed = _checked_usage_add(snapshot.spent, snapshot.reserved)
             prospective = _checked_usage_add(committed, batch)
@@ -909,7 +1017,7 @@ class _ProviderUsageMixin:
         self,
         attempt_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderCallAttempt:
         """Durably mark a reservation dispatched before any network I/O."""
 
@@ -972,7 +1080,7 @@ class _ProviderUsageMixin:
         self,
         attempt_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderCallAttempt:
         """Conservatively charge the complete bound when actual usage is unknown."""
 
@@ -1026,7 +1134,7 @@ class _ProviderUsageMixin:
         self,
         attempt_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderCallAttempt:
         """Release only a reservation proven not to have reached network dispatch."""
 
@@ -1099,7 +1207,7 @@ class _ProviderUsageMixin:
         attempt_id: str,
         usage: UsageTotals | None,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderCallAttempt:
         """Settle reported usage, or charge the full bound when it is unknown."""
 
@@ -1271,7 +1379,7 @@ class _ProviderUsageMixin:
         self,
         budget_id: str,
         *,
-        lease: TournamentRunnerLease | None = None,
+        lease: ProviderRunnerLease | None = None,
     ) -> ProviderBudgetSnapshot:
         """Seal a budget only after every reservation reaches a terminal state."""
 
@@ -1285,17 +1393,11 @@ class _ProviderUsageMixin:
             if snapshot.finalized:
                 connection.commit()
                 return snapshot
-            if snapshot.tournament_id is None:
-                if lease is not None:
-                    raise ValueError(
-                        "non-tournament Provider budget does not accept a runner lease"
-                    )
-            else:
-                self._require_active_tournament_runner(
-                    connection,
-                    snapshot.tournament_id,
-                    lease,
-                )
+            self._require_provider_runner_generation(
+                connection,
+                snapshot,
+                lease,
+            )
             pending = connection.execute(
                 """
                 SELECT count(*) AS count
@@ -1330,25 +1432,36 @@ class _ProviderUsageMixin:
         finally:
             connection.close()
 
-    def _close_stale_provider_attempts(
+    def _close_stale_scoped_provider_attempts(
         self,
         connection: sqlite3.Connection,
-        tournament_id: str,
+        scope_id: str,
         generation: int,
         *,
+        scope: Literal["tournament", "championship"],
         finished_at_epoch: int,
     ) -> None:
         """Resolve every old-generation reservation before a lease takeover."""
 
-        budget_rows = connection.execute(
-            "SELECT budget_id FROM provider_budgets WHERE tournament_id = ?",
-            (tournament_id,),
-        ).fetchall()
+        if scope == "tournament":
+            scope_label = "Tournament"
+            budget_rows = connection.execute(
+                "SELECT budget_id FROM provider_budgets WHERE tournament_id = ?",
+                (scope_id,),
+            ).fetchall()
+        else:
+            scope_label = "Championship"
+            budget_rows = connection.execute(
+                "SELECT budget_id FROM provider_budgets WHERE championship_id = ?",
+                (scope_id,),
+            ).fetchall()
         for budget_row in budget_rows:
             budget_id = budget_row["budget_id"]
             snapshot = self._provider_budget_snapshot_in_transaction(connection, budget_id)
             if snapshot is None:
-                raise StorageError("Tournament Provider budget disappeared during takeover")
+                raise StorageError(
+                    f"{scope_label} Provider budget disappeared during takeover"
+                )
             attempt_rows = connection.execute(
                 """
                 SELECT * FROM provider_call_attempts
@@ -1365,7 +1478,9 @@ class _ProviderUsageMixin:
                     budget_id,
                 )
                 if snapshot is None:
-                    raise StorageError("Tournament Provider budget disappeared during takeover")
+                    raise StorageError(
+                        f"{scope_label} Provider budget disappeared during takeover"
+                    )
                 if attempt.state == "reserved":
                     reserved = _checked_usage_subtract(
                         snapshot.reserved,
@@ -1406,46 +1521,135 @@ class _ProviderUsageMixin:
                     )
             self._provider_budget_snapshot_in_transaction(connection, budget_id)
 
-    def _finalize_tournament_provider_budgets(
+    def _close_stale_provider_attempts(
         self,
         connection: sqlite3.Connection,
         tournament_id: str,
+        generation: int,
+        *,
+        finished_at_epoch: int,
+    ) -> None:
+        """Resolve one tournament's old-generation reservations before takeover."""
+
+        self._close_stale_scoped_provider_attempts(
+            connection,
+            tournament_id,
+            generation,
+            scope="tournament",
+            finished_at_epoch=finished_at_epoch,
+        )
+
+    def _close_stale_championship_provider_attempts(
+        self,
+        connection: sqlite3.Connection,
+        championship_id: str,
+        generation: int,
+        *,
+        finished_at_epoch: int,
+    ) -> None:
+        """Resolve one championship's old-generation reservations before takeover."""
+
+        self._close_stale_scoped_provider_attempts(
+            connection,
+            championship_id,
+            generation,
+            scope="championship",
+            finished_at_epoch=finished_at_epoch,
+        )
+
+    def _finalize_scoped_provider_budgets(
+        self,
+        connection: sqlite3.Connection,
+        scope_id: str,
+        *,
+        scope: Literal["tournament", "championship"],
     ) -> None:
         """Audit and seal all budgets owned by a checkpoint in the caller's transaction."""
 
-        budget_rows = connection.execute(
-            "SELECT budget_id FROM provider_budgets WHERE tournament_id = ? ORDER BY budget_id",
-            (tournament_id,),
-        ).fetchall()
+        if scope == "tournament":
+            scope_label = "Tournament"
+            budget_rows = connection.execute(
+                """
+                SELECT budget_id FROM provider_budgets
+                WHERE tournament_id = ? ORDER BY budget_id
+                """,
+                (scope_id,),
+            ).fetchall()
+        else:
+            scope_label = "Championship"
+            budget_rows = connection.execute(
+                """
+                SELECT budget_id FROM provider_budgets
+                WHERE championship_id = ? ORDER BY budget_id
+                """,
+                (scope_id,),
+            ).fetchall()
         for row in budget_rows:
             snapshot = self._provider_budget_snapshot_in_transaction(
                 connection,
                 row["budget_id"],
             )
             if snapshot is None:
-                raise StorageError("Tournament Provider budget disappeared during finalization")
+                raise StorageError(
+                    f"{scope_label} Provider budget disappeared during finalization"
+                )
             if snapshot.poisoned:
                 raise BudgetPoisonedError(
-                    f"Tournament Provider budget {row['budget_id']} is poisoned by "
+                    f"{scope_label} Provider budget {row['budget_id']} is poisoned by "
                     f"{snapshot.poison_reason_code}"
                 )
             if snapshot.reserved != UsageTotals.zero():
                 raise ProviderBudgetPendingError(
-                    "Tournament has unresolved Provider call attempts"
+                    f"{scope_label} has unresolved Provider call attempts"
                 )
         if budget_rows:
             now = self._database_epoch(connection)
-            connection.execute(
-                """
-                UPDATE provider_budgets
-                SET finalized_at_epoch = coalesce(finalized_at_epoch, ?)
-                WHERE tournament_id = ?
-                """,
-                (now, tournament_id),
-            )
+            if scope == "tournament":
+                connection.execute(
+                    """
+                    UPDATE provider_budgets
+                    SET finalized_at_epoch = coalesce(finalized_at_epoch, ?)
+                    WHERE tournament_id = ?
+                    """,
+                    (now, scope_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE provider_budgets
+                    SET finalized_at_epoch = coalesce(finalized_at_epoch, ?)
+                    WHERE championship_id = ?
+                    """,
+                    (now, scope_id),
+                )
             for row in budget_rows:
                 self._provider_budget_snapshot_in_transaction(
                     connection,
                     row["budget_id"],
                 )
 
+    def _finalize_tournament_provider_budgets(
+        self,
+        connection: sqlite3.Connection,
+        tournament_id: str,
+    ) -> None:
+        """Audit and seal every Provider budget owned by a tournament checkpoint."""
+
+        self._finalize_scoped_provider_budgets(
+            connection,
+            tournament_id,
+            scope="tournament",
+        )
+
+    def _finalize_championship_provider_budgets(
+        self,
+        connection: sqlite3.Connection,
+        championship_id: str,
+    ) -> None:
+        """Audit and seal every Provider budget owned by a championship checkpoint."""
+
+        self._finalize_scoped_provider_budgets(
+            connection,
+            championship_id,
+            scope="championship",
+        )

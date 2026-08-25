@@ -39,6 +39,7 @@ from llmolympic.core._storage_types import (
     ProviderBudgetCollisionError,
     ProviderBudgetPendingError,
     ProviderCallAttemptCollisionError,
+    ProviderRunnerLease,
     RatingChange,
     RatingEntry,
     SaveResult,
@@ -141,11 +142,14 @@ class SQLiteStore(
                 self._verify_foreign_keys(connection)
                 return
 
-            # Rebuilding the two archive parent tables into one canonical v7 shape
-            # requires foreign-key enforcement to be disabled before the transaction
-            # starts.  The migration still runs a full foreign_key_check before commit
-            # and enforcement is restored in ``finally`` on every path.
-            foreign_keys_disabled = 1 <= version < 7
+            # Parent-table rebuilds (archive tables through v7 and Provider budgets
+            # in v11) require foreign-key enforcement to be disabled before the
+            # transaction starts.  Disable it for every upgrade path so a version
+            # changed by another upgrader between the initial read and BEGIN cannot
+            # enter a parent rebuild with enforcement accidentally left on.  Every
+            # path still runs foreign_key_check before commit and restores enforcement
+            # in ``finally``.
+            foreign_keys_disabled = version < SCHEMA_VERSION
             if foreign_keys_disabled:
                 connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
@@ -179,6 +183,8 @@ class SQLiteStore(
                     self._verify_v8_schema(connection)
                 elif locked_version == 9:
                     self._verify_v9_schema_manifest(connection)
+                elif locked_version == 10:
+                    self._verify_v10_schema(connection)
                 if locked_version < 4:
                     self._create_tournament_schema(connection)
                 if locked_version < 5:
@@ -190,13 +196,15 @@ class SQLiteStore(
                         self._canonicalize_archive_tables(connection)
                     self._create_rating_operation_schema(connection)
                     self._backfill_rating_operations(connection)
-                if locked_version < 8:
-                    self._create_provider_usage_schema(connection)
                 if locked_version < 9:
                     self._create_championship_schema(connection)
                 if locked_version < 10:
                     self._create_championship_checkpoint_schema(connection)
                     self._create_championship_runner_lease_schema(connection)
+                if locked_version < 8:
+                    self._create_provider_usage_schema(connection)
+                elif locked_version < 11:
+                    self._migrate_provider_usage_to_v11(connection)
                 self._verify_schema(connection)
                 self._verify_foreign_keys(connection)
                 if 0 < locked_version < 7:
@@ -273,6 +281,12 @@ def inspect_database(path: str | Path | None = None) -> DatabaseInspection:
                 SQLiteStore._verify_v6_schema(connection)
             elif version == 7:
                 SQLiteStore._verify_v7_schema(connection)
+            elif version == 8:
+                SQLiteStore._verify_v8_schema(connection)
+            elif version == 9:
+                SQLiteStore._verify_v9_schema_manifest(connection)
+            elif version == 10:
+                SQLiteStore._verify_v10_schema(connection)
             else:
                 SQLiteStore._verify_schema(connection)
             SQLiteStore._verify_foreign_keys(connection)
@@ -522,6 +536,7 @@ __all__ = (
     'ProviderBudgetCollisionError',
     'ProviderBudgetPendingError',
     'ProviderCallAttemptCollisionError',
+    'ProviderRunnerLease',
     'RatingChange',
     'RatingEntry',
     'SQLiteStore',
