@@ -227,6 +227,21 @@ async function configureMathQuiz(page, { humanName = null } = {}) {
   await page.getByLabel("随机种子").fill("4242");
 }
 
+async function configureMathQuizChampionship(page) {
+  await expect(page.getByRole("heading", { name: "新建比赛 / 任务" })).toBeVisible();
+  await page.locator("#control-mode").selectOption("championship");
+  await page.getByLabel("比赛项目").selectOption("math_quiz");
+  await expect(page.locator(".roster-card")).toHaveCount(4);
+  const strategies = ["random", "fixed", "illegal", "balanced"];
+  for (const [index, strategy] of strategies.entries()) {
+    await expect(page.locator(`#player-${index}-kind option[value="human"]`)).toHaveCount(0);
+    await page.locator(`#player-${index}-kind`).selectOption("mock");
+    await page.locator(`#player-${index}-strategy`).selectOption(strategy);
+  }
+  await page.getByLabel("每场回合数").fill("1");
+  await page.getByLabel("随机种子").fill("5150");
+}
+
 async function prepareAndStart(page) {
   await page.getByRole("button", { name: "生成准备态预览" }).click();
   await expect(page.getByRole("heading", { name: "确认后才会启动" })).toBeVisible();
@@ -399,6 +414,82 @@ test("full Web control starts a browser Human seat in a second context and archi
     expect(participantErrors).toEqual([]);
   } finally {
     if (participantContext !== null) await participantContext.close();
+    await admin.context.close();
+  }
+});
+
+test("full Web control runs a four-player championship and exposes its final live bracket", async ({
+  browser,
+  controlServer,
+}) => {
+  test.setTimeout(CONTROL_TEST_TIMEOUT_MS);
+  const admin = await openAdminPage(browser, controlServer);
+  try {
+    await configureMathQuizChampionship(admin.page);
+    await expectNoWcagViolations(admin.page);
+    await prepareAndStart(admin.page);
+
+    await expect(admin.page.locator(".job-status.status-completed")).toBeVisible({
+      timeout: 40_000,
+    });
+    const archiveLinks = admin.page.locator(".archive-button-list a");
+    await expect(archiveLinks).toHaveCount(6);
+    const liveLink = admin.page.getByRole("link", { name: "打开实时观战" });
+    await expect(liveLink).toBeVisible();
+    const livePath = await liveLink.getAttribute("href");
+    if (!livePath || !/^\/live\/[A-Za-z0-9._:-]+$/.test(livePath)) {
+      throw new Error("completed championship did not expose a safe live path");
+    }
+
+    const jobId = new URL(admin.page.url()).pathname.split("/").pop();
+    const jobResponse = await admin.page.request.get(
+      `${controlServer.baseURL}/api/v1/control/jobs/${encodeURIComponent(jobId)}`,
+      { headers: { Authorization: `Bearer ${controlServer.adminToken}` } },
+    );
+    expect(jobResponse.ok()).toBeTruthy();
+    const { job } = await jobResponse.json();
+    expect(job).toEqual(expect.objectContaining({
+      championship_id: expect.any(String),
+      final_kind: "championship",
+      resumable: false,
+      status: "completed",
+    }));
+    expect(job.spec).toEqual(expect.objectContaining({
+      game: "math_quiz",
+      mode: "championship",
+      resume_championship_id: null,
+    }));
+    expect(job.spec.players).toHaveLength(4);
+    expect(job.final_match_ids).toHaveLength(6);
+
+    const liveResponse = await admin.page.request.get(`/api/v1${livePath}`);
+    expect(liveResponse.ok()).toBeTruthy();
+    const liveDetail = await liveResponse.json();
+    expect(liveDetail.match).toEqual(expect.objectContaining({
+      final_id: job.championship_id,
+      final_kind: "championship",
+      mode: "championship",
+      status: "completed",
+    }));
+    expect(liveDetail.match.championship_bracket).toEqual(expect.objectContaining({
+      champion: expect.any(String),
+      championship_id: job.championship_id,
+      pairing_count: 3,
+      player_count: 4,
+    }));
+    expect(liveDetail.match.championship_bracket.pairings).toHaveLength(3);
+
+    await liveLink.click();
+    await expect(admin.page).toHaveURL(new RegExp(`${livePath}$`));
+    await expect(admin.page.getByRole("heading", { name: "淘汰赛对阵" })).toBeVisible();
+    await expect(admin.page.locator(".championship-pairing")).toHaveCount(3);
+    await expect(admin.page.locator(".championship-champion")).toContainText(
+      liveDetail.match.championship_bracket.champion,
+    );
+    await expect(admin.page.locator(".archive-actions a")).toHaveCount(6);
+    await expectNoWcagViolations(admin.page);
+    expect(admin.errors).toEqual([]);
+  } finally {
     await admin.context.close();
   }
 });

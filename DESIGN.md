@@ -209,18 +209,19 @@ SAN/UCI、将军、易位、吃过路兵、升变和所有标准终局。状态�
 申请和棋自动执行；该策略及规则引擎版本会写入 `game_config`。双局赛交换完整
 玩家顺序，因此双方各执白一次。
 
-## 4. 事件驱动架构（为 Web / 手机端留路）
+## 4. 事件驱动架构（CLI / Web）
 
 Match 循环的每一步产出**结构化事件**（`match_started` / `turn_prompt` /
 `move_received` / `move_rejected` / `match_finished`），界面层只消费事件渲染：
 
 ```
-CLI                  Web / WebSocket
+CLI                  React / REST / WebSocket
         \            /
          Match 事件流 ── core 引擎（不含任何界面代码）
 ```
 
-- `HumanPlayer.get_move` 是异步接口：CLI 里是键盘输入，将来是 API/WebSocket 远端提交，引擎无感。
+- `HumanPlayer.get_move` 是异步接口：CLI 可从键盘读取，本机 Web 参与页则经 capability 隔离的
+  input sidecar 提交；两者复用同一引擎、超时、校验和存档流程。
 - `LLMPlayer` 通过 Provider 的原生异步 `achat()` 调用模型；OpenAI / Ollama
   请求可在单步截止时间到达时取消，不依赖无法强制停止的工作线程。
 - LLM 超时或 Provider 异常会产生 `move_rejected`，并以 `reason_code`、
@@ -228,9 +229,10 @@ CLI                  Web / WebSocket
   `match_finished`，失败方计 0 分，对手计 1 分。
 - 上述字段只保证出现在新档案中；读取没有 `termination` 的 schema v1 历史档案
   时按 `unknown` 处理，不能把缺失字段解释成 `completed`。
-- **手机端迁移路径**：后端（Python + FastAPI）不动，手机只是新客户端，
-  通过 WebSocket 消费同一批事件。客户端优先 React Native（与 Web 前端同源）。
-  API key 只存服务端，判分计时在服务端，天然防作弊。
+- **远程/手机端迁移路径**：公开事件协议可供新客户端复用，但当前服务只允许回环地址和
+  可信本机操作者。跨设备前必须加入正式身份认证、席位/赛事授权、TLS、限流与审计；不能
+  通过反向代理直接暴露当前控制面。Provider 凭据仍只由受控 CLI worker 从本机环境读取，
+  不下发到浏览器；判分、计时、预算与正式存档都留在服务端执行。
 
 ## 5. 题目来源与公平性
 
@@ -295,9 +297,13 @@ CLI                  Web / WebSocket
   锦标赛档案与全部子双局赛（仍不计分）。SQLite v11 为锦标赛增加持久 Provider 预算：
   checkpoint 与预算原子创建，调用尝试受 championship runner generation fencing，接管时
   保守清算旧 generation，最终事务同时封存档案、checkpoint、lease 与预算；命名 Profile
-  运行必须显式启用硬预算，历史无预算 Profile checkpoint 安全拒绝。锦标赛 checkpoint
-  暂不接入 Web 控制面，
-  实时直播 sidecar 也仍未扩展为锦标赛模式。
+  运行必须显式启用硬预算，历史无预算 Profile checkpoint 安全拒绝。控制 sidecar schema v2
+  把新建与恢复锦标赛接入本机 prepare/start/stop 协议；Web 只接受 4/8/16 名非人类选手，
+  恢复仍由主库 checkpoint、冻结预算和 championship runner lease 判定。Live sidecar schema v2
+  物化可重连赛程：双局对阵完成后先发布 provisional 结果，只有整轮 checkpoint 事务成功才
+  发布 round-committed 并把该轮转为 committed，最终档案事务成功后才公开冠军和档案引用。
+  浏览器的管理写操作只推进 jobs sidecar，其余状态均消费公开 DTO；Provider 构造、调用、
+  主档案/预算写入与最终封存都由固定参数的独立 CLI worker 完成。
 
 ## 7. 技术栈
 
@@ -326,14 +332,14 @@ CLI                  Web / WebSocket
    3–9 名评委多数 quorum、严格 JSON 与加权中位数聚合 ✅；双人档案与 ELO ✅；
    Provider 硬预算与参赛者/评委共享预算 ✅；SQLite v8 跨进程预算账本 ✅；冻结评审团的
    创意双局赛与循环赛 ✅；checkpoint/resume、runner lease、请求证据绑定及深度审计 ✅。
-4. **Web 化 + 锦标赛（进行中）**：4.1 以 FastAPI 提供仅限回环地址的只读 REST、
+4. **本机 Web 化 + 锦标赛（已完成）**：4.1 以 FastAPI 提供仅限回环地址的只读 REST、
    排行榜与已完成档案的 WebSocket 事件回放 ✅；4.2 提供随 Python 发行包离线分发的
    React 观战大厅、ELO 榜、对局详情和可控制事件时间线 ✅；4.3 以独立 SQLite sidecar
    提供跨进程运行中事件 broker、连续序号续播、租约中断判定与实时只读页面 ✅。Web 对
    主档案和直播 sidecar 都只使用 SQLite `mode=ro`，公开协议与内部档案模型隔离；比赛进程
    的后台发布失败不会拥有比赛、预算或存档控制流。4.4 以独立权限收紧的 input sidecar、
    capability 席位和幂等同源 POST，让 `play` 中一个本机浏览器 HumanPlayer 通过通用文本
-   页面真正参赛 ✅；Web 仍不能创建比赛、调用 Provider、读取凭据或修改正式存档/ELO。
+   页面真正参赛 ✅；4.4 本身不包含建赛、Provider 调用、凭据读取或正式存档/ELO 修改。
    建议编号 4.5a 将同一场 `play` 扩展为多个本机浏览器 HumanPlayer：每名 Human 使用独立的
    session、seat 和高熵 capability，复用 Match 的并发盲答、取消、超时与存档生命周期 ✅；
    双人对局沿用 ELO，三名及以上选手完整存档但不计分。总人数仍受 Game 和平台 2–16 人边界
@@ -362,7 +368,11 @@ CLI                  Web / WebSocket
    评审团快照，只运行未完成轮次，完成后在最终事务内封存正式档案与全部子双局赛（仍
    不计分）。4.6 预算增量（SQLite v11）再为锦标赛加入与 checkpoint 原子创建、跨进程恢复
    不重置、runner generation fencing、接管保守清算及最终事务封存的 Provider 硬预算 ✅；
-   命名 Profile 运行必须显式启用预算，历史无预算 Profile checkpoint 安全拒绝。锦标赛尚未
-   接入 Web 控制面与实时直播。
-   后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及锦标赛的
-   Web 控制面与直播；之后新增项目继续保持纯插件接入。
+   命名 Profile 运行必须显式启用预算，历史无预算 Profile checkpoint 安全拒绝。4.6 Web
+   增量再以 control schema v2 把 4/8/16 人锦标赛的新建、停止、显式恢复和最终档案引用接入
+   本机管理页 ✅；Live schema v2 提供带规范轮次/对阵上下文的公开事件、provisional 对阵、
+   整轮 committed 确认、可重连的服务端物化赛程和冠军结果 ✅。恢复预览只读核对 checkpoint、
+   活动 lease、冻结配置、Profile 安全投影与持久预算，浏览器不能覆盖赛事合同。控制面仍只
+   信任回环地址上的本机操作者；浏览器不持有 Provider 凭据、不直接调用 Provider，也不写
+   主档案、预算或 ELO，固定参数 CLI worker 继续拥有这些操作。
+   后续切片可加入正式认证、席位授权与 TLS 的远程多席位使用；之后新增项目继续保持纯插件接入。

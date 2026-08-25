@@ -235,6 +235,243 @@
     assert(!observer.validateLiveSummary(summary, liveId), `live summary rejects ${reason}`);
   });
 
+  const championshipPlayers = ["Alice", "Bob", "Carol", "Dora"];
+  const championshipPairingOne = {
+    round_number: 1,
+    round_pairing_number: 1,
+    pairing_number: 1,
+    players: ["Alice", "Bob"],
+    winner: "Alice",
+    series_id: "series-championship-1",
+    match_ids: ["championship-match-1", "championship-match-2"],
+    status: "committed",
+  };
+  const championshipPairingTwo = {
+    round_number: 1,
+    round_pairing_number: 2,
+    pairing_number: 2,
+    players: ["Carol", "Dora"],
+    winner: "Dora",
+    series_id: "series-championship-2",
+    match_ids: ["championship-match-3", "championship-match-4"],
+    status: "committed",
+  };
+  const championshipFinalPairing = {
+    round_number: 2,
+    round_pairing_number: 1,
+    pairing_number: 3,
+    players: ["Alice", "Dora"],
+    winner: "Alice",
+    series_id: "series-championship-3",
+    match_ids: ["championship-match-5", "championship-match-6"],
+    status: "committed",
+  };
+  const emptyChampionshipBracket = {
+    championship_id: "championship-43",
+    player_count: 4,
+    round_count: 2,
+    pairing_count: 3,
+    champion: null,
+    pairings: [],
+  };
+  const provisionalChampionshipBracket = {
+    ...emptyChampionshipBracket,
+    pairings: [{ ...championshipPairingOne, status: "provisional" }],
+  };
+  const committedFirstRoundBracket = {
+    ...emptyChampionshipBracket,
+    pairings: [championshipPairingOne, championshipPairingTwo],
+  };
+  const finalProvisionalBracket = {
+    ...emptyChampionshipBracket,
+    pairings: [
+      championshipPairingOne,
+      championshipPairingTwo,
+      { ...championshipFinalPairing, status: "provisional" },
+    ],
+  };
+  const completedChampionshipBracket = {
+    ...emptyChampionshipBracket,
+    champion: "Alice",
+    pairings: [championshipPairingOne, championshipPairingTwo, championshipFinalPairing],
+  };
+
+  [
+    emptyChampionshipBracket,
+    provisionalChampionshipBracket,
+    committedFirstRoundBracket,
+    finalProvisionalBracket,
+    completedChampionshipBracket,
+  ].forEach((bracket, index) => {
+    assert(
+      observer.validateChampionshipBracket(bracket, championshipPlayers),
+      `authoritative championship bracket lifecycle ${index} is accepted`,
+    );
+  });
+  [8, 16].forEach((playerCount) => {
+    const players = Array.from({ length: playerCount }, (_value, index) => `Player ${index + 1}`);
+    assert(
+      observer.validateChampionshipBracket({
+        championship_id: `championship-${playerCount}`,
+        player_count: playerCount,
+        round_count: Math.log2(playerCount),
+        pairing_count: playerCount - 1,
+        champion: null,
+        pairings: [],
+      }, players),
+      `an empty authoritative ${playerCount}-player bracket is accepted`,
+    );
+  });
+
+  const invalidChampionshipBrackets = [
+    [{ ...emptyChampionshipBracket, player_count: 5 }, "non-power-of-two player count"],
+    [{ ...emptyChampionshipBracket, round_count: 3 }, "inconsistent round count"],
+    [{ ...emptyChampionshipBracket, pairing_count: 4 }, "inconsistent pairing count"],
+    [{ ...emptyChampionshipBracket, entrant_ids: ["hidden-a"] }, "hidden entrant identifiers"],
+    [{ ...emptyChampionshipBracket, pairings: [championshipPairingTwo] }, "noncanonical pairing prefix"],
+    [{ ...emptyChampionshipBracket, pairings: [championshipPairingOne] }, "partial committed round"],
+    [{
+      ...emptyChampionshipBracket,
+      pairings: [
+        { ...championshipPairingOne, status: "provisional" },
+        championshipPairingTwo,
+      ],
+    }, "committed pairing after provisional pairing"],
+    [{
+      ...completedChampionshipBracket,
+      pairings: [
+        championshipPairingOne,
+        championshipPairingTwo,
+        { ...championshipFinalPairing, players: ["Bob", "Dora"] },
+      ],
+    }, "final pairing not sourced from prior winners"],
+    [{ ...committedFirstRoundBracket, champion: "Alice" }, "premature champion"],
+    [{ ...completedChampionshipBracket, champion: "Dora" }, "champion not equal to final winner"],
+    [{
+      ...provisionalChampionshipBracket,
+      pairings: [{ ...provisionalChampionshipBracket.pairings[0], winner: "Mallory" }],
+    }, "winner outside pairing"],
+    [{
+      ...provisionalChampionshipBracket,
+      pairings: [{ ...provisionalChampionshipBracket.pairings[0], entrant_ids: ["secret-a", "secret-b"] }],
+    }, "hidden pairing identifiers"],
+    [{
+      ...provisionalChampionshipBracket,
+      pairings: [{ ...provisionalChampionshipBracket.pairings[0], match_ids: ["same", "same"] }],
+    }, "duplicate match archives"],
+  ];
+  invalidChampionshipBrackets.forEach(([bracket, reason]) => {
+    assert(
+      !observer.validateChampionshipBracket(bracket, championshipPlayers),
+      `championship bracket rejects ${reason}`,
+    );
+  });
+  assert(
+    !observer.validateChampionshipBracket(emptyChampionshipBracket, ["Alice", "Alice", "Carol", "Dora"]),
+    "championship bracket rejects a duplicate public roster",
+  );
+
+  const startingChampionshipSummary = {
+    ...runningLiveSummary,
+    live_id: "live-championship-43",
+    mode: "championship",
+    players: championshipPlayers,
+    event_count: 0,
+    pairing_number: 1,
+    pairing_count: 3,
+    leg_number: 1,
+    round_number: 1,
+    round_count: 2,
+    round_pairing_number: 1,
+    round_pairing_count: 2,
+    championship_bracket: emptyChampionshipBracket,
+  };
+  const provisionalChampionshipSummary = {
+    ...startingChampionshipSummary,
+    event_count: 9,
+    leg_number: 2,
+    championship_bracket: provisionalChampionshipBracket,
+  };
+  const secondRoundChampionshipSummary = {
+    ...startingChampionshipSummary,
+    event_count: 18,
+    pairing_number: 3,
+    leg_number: 1,
+    round_number: 2,
+    round_pairing_number: 1,
+    round_pairing_count: 1,
+    championship_bracket: committedFirstRoundBracket,
+  };
+  const completedChampionshipSummary = {
+    ...secondRoundChampionshipSummary,
+    status: "completed",
+    event_count: 27,
+    leg_number: 2,
+    championship_bracket: completedChampionshipBracket,
+    final_kind: "championship",
+    final_id: "championship-43",
+    final_match_ids: completedChampionshipBracket.pairings.flatMap((pairing) => pairing.match_ids),
+  };
+  const finalProvisionalChampionshipSummary = {
+    ...secondRoundChampionshipSummary,
+    event_count: 26,
+    leg_number: 2,
+    championship_bracket: finalProvisionalBracket,
+  };
+  [
+    startingChampionshipSummary,
+    provisionalChampionshipSummary,
+    secondRoundChampionshipSummary,
+    finalProvisionalChampionshipSummary,
+    completedChampionshipSummary,
+  ].forEach((summary, index) => {
+    assert(
+      observer.validateLiveSummary(summary, "live-championship-43"),
+      `championship summary lifecycle ${index} is accepted`,
+    );
+  });
+
+  const invalidChampionshipSummaries = [
+    [{ ...startingChampionshipSummary, round_count: null }, "partial championship context"],
+    [{ ...startingChampionshipSummary, pairing_number: 3 }, "context skipping materialized bracket"],
+    [{ ...startingChampionshipSummary, championship_bracket: null }, "missing authoritative bracket"],
+    [{ ...startingChampionshipSummary, entrant_ids: ["hidden-a"] }, "hidden entrant identifiers"],
+    [{ ...startingChampionshipSummary, players: ["Alice", "Bob", "Alice", "Dora"] }, "duplicate roster"],
+    [{
+      ...startingChampionshipSummary,
+      championship_bracket: completedChampionshipBracket,
+    }, "champion before completion"],
+    [{ ...completedChampionshipSummary, final_id: "other-championship" }, "wrong final championship id"],
+    [{
+      ...completedChampionshipSummary,
+      final_match_ids: completedChampionshipSummary.final_match_ids.slice().reverse(),
+    }, "noncanonical archive order"],
+    [{
+      ...completedChampionshipSummary,
+      championship_bracket: { ...completedChampionshipBracket, champion: null },
+    }, "completed bracket without champion"],
+  ];
+  invalidChampionshipSummaries.forEach(([summary, reason]) => {
+    assert(
+      !observer.validateLiveSummary(summary, "live-championship-43"),
+      `championship summary rejects ${reason}`,
+    );
+  });
+  assert(
+    observer.validateLiveSummary({
+      ...startingChampionshipSummary,
+      championship_bracket: { ...emptyChampionshipBracket, championship_id: "independent-public-id" },
+    }, "live-championship-43"),
+    "an unfinished live ID is not falsely assumed to encode the independent championship ID",
+  );
+  assert(
+    !observer.validateLiveSummary({
+      ...runningLiveSummary,
+      championship_bracket: emptyChampionshipBracket,
+    }, "live-match-43"),
+    "non-championship summaries fail closed if a bracket appears",
+  );
+
   const liveItem = {
     seq: 7,
     context: {
@@ -287,6 +524,381 @@
       event: { ...liveItem.event, timestamp: null },
     }, 7),
     "a malformed public event is rejected",
+  );
+
+  assert(
+    observer.validateLiveItem({ ...liveItem, kind: "match_event" }, 7, {
+      ...runningLiveSummary,
+      live_id: "live-round-robin",
+      mode: "round_robin",
+      pairing_number: 2,
+      pairing_count: 3,
+      leg_number: 1,
+    }),
+    "old modes accept the discriminated match-event shape with an authoritative summary",
+  );
+  const championshipContext = {
+    round_number: 1,
+    round_count: 2,
+    round_pairing_number: 1,
+    round_pairing_count: 2,
+    pairing_number: 1,
+    pairing_count: 3,
+    leg_number: 1,
+    match_event_seq: 0,
+  };
+  const championshipMatchItem = {
+    kind: "match_event",
+    seq: 0,
+    context: championshipContext,
+    event: {
+      seq: 0,
+      type: "match_started",
+      timestamp: "2026-08-13T12:00:00.000000Z",
+      player: null,
+      data: {
+        game: "math_quiz",
+        seed: 43,
+        game_config: { rounds: 1 },
+        players: ["Alice", "Bob"],
+      },
+    },
+  };
+  assert(
+    observer.validateLiveItem(championshipMatchItem, 0, {
+      ...startingChampionshipSummary,
+      event_count: 1,
+    }),
+    "a championship match event is bound to its canonical public pairing",
+  );
+  assert(
+    observer.validateLiveItem({
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        data: {
+          ...championshipMatchItem.event.data,
+          seed: 5725006802337835000,
+        },
+      },
+    }, 0, {
+      ...startingChampionshipSummary,
+      event_count: 1,
+    }),
+    "a browser-rounded signed 64-bit championship seed remains a valid public event",
+  );
+  assert(
+    !observer.validateLiveItem({
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        data: {
+          ...championshipMatchItem.event.data,
+          seed: 2 ** 64,
+        },
+      },
+    }, 0, {
+      ...startingChampionshipSummary,
+      event_count: 1,
+    }),
+    "an out-of-range public seed is rejected",
+  );
+
+  const pairingCompletedItem = {
+    kind: "pairing_completed",
+    seq: 8,
+    context: {
+      ...championshipContext,
+      leg_number: 2,
+      match_event_seq: undefined,
+    },
+    pairing: { ...championshipPairingOne, status: "provisional" },
+  };
+  delete pairingCompletedItem.context.match_event_seq;
+  assert(
+    observer.validateLiveItem(pairingCompletedItem, 8, provisionalChampionshipSummary),
+    "a provisional pairing lifecycle item matches the authoritative bracket",
+  );
+
+  const roundCommittedItem = {
+    kind: "round_committed",
+    seq: 17,
+    context: {
+      round_number: 1,
+      round_count: 2,
+      round_pairing_number: 2,
+      round_pairing_count: 2,
+      pairing_number: 2,
+      pairing_count: 3,
+      leg_number: 2,
+    },
+    pairing_numbers: [1, 2],
+  };
+  assert(
+    observer.validateLiveItem(roundCommittedItem, 17, secondRoundChampionshipSummary),
+    "a whole-round commit lifecycle item matches the authoritative committed bracket",
+  );
+
+  const invalidChampionshipItems = [
+    [{ ...championshipMatchItem, kind: undefined }, startingChampionshipSummary, "missing discriminator"],
+    [{
+      ...championshipMatchItem,
+      context: { ...championshipMatchItem.context, round_pairing_number: 2 },
+    }, startingChampionshipSummary, "noncanonical event context"],
+    [{
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        data: { ...championshipMatchItem.event.data, players: ["Carol", "Dora"] },
+      },
+    }, startingChampionshipSummary, "match-start roster outside pairing"],
+    [{
+      ...championshipMatchItem,
+      event: { ...championshipMatchItem.event, player: "Mallory" },
+    }, startingChampionshipSummary, "event player outside pairing"],
+    [{
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        data: { ...championshipMatchItem.event.data, game: "gomoku" },
+      },
+    }, startingChampionshipSummary, "match project differing from authoritative summary"],
+    [{
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        type: "match_finished",
+        data: {
+          forfeited_by: null,
+          judging: null,
+          reason_code: null,
+          scores: { Alice: 1, Mallory: 0 },
+          termination: "completed",
+        },
+      },
+    }, startingChampionshipSummary, "finish scores outside authoritative pairing"],
+    [{
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        type: "match_finished",
+        data: {
+          forfeited_by: "Mallory",
+          judging: null,
+          reason_code: "forfeit",
+          scores: { Alice: 1, Bob: 0 },
+          termination: "technical_loss",
+        },
+      },
+    }, startingChampionshipSummary, "forfeit player outside authoritative pairing"],
+    [{
+      ...championshipMatchItem,
+      event: {
+        ...championshipMatchItem.event,
+        data: { ...championshipMatchItem.event.data, entrant_ids: ["secret-a", "secret-b"] },
+      },
+    }, startingChampionshipSummary, "hidden event entrant identifiers"],
+    [{
+      ...pairingCompletedItem,
+      pairing: { ...pairingCompletedItem.pairing, status: "committed" },
+    }, provisionalChampionshipSummary, "committed pairing in provisional lifecycle event"],
+    [{
+      ...pairingCompletedItem,
+      pairing: { ...pairingCompletedItem.pairing, series_id: "series-tampered" },
+    }, provisionalChampionshipSummary, "pairing payload differing from authoritative bracket"],
+    [{
+      ...roundCommittedItem,
+      pairing_numbers: [2, 1],
+    }, secondRoundChampionshipSummary, "noncanonical committed pairing order"],
+    [{
+      ...roundCommittedItem,
+      context: {
+        ...roundCommittedItem.context,
+        round_pairing_number: 1,
+        pairing_number: 1,
+      },
+      pairing_numbers: [1, 2],
+    }, secondRoundChampionshipSummary, "whole-round commit before the round's final pairing"],
+    [roundCommittedItem, provisionalChampionshipSummary, "commit before the authoritative round boundary"],
+    [{ ...pairingCompletedItem, entrant_id: "hidden" }, provisionalChampionshipSummary, "unknown lifecycle fields"],
+  ];
+  invalidChampionshipItems.forEach(([item, summary, reason]) => {
+    assert(
+      !observer.validateLiveItem(item, item.seq, summary),
+      `championship live item rejects ${reason}`,
+    );
+  });
+  assert(
+    !observer.validateLiveItem(pairingCompletedItem, 8),
+    "championship lifecycle items cannot be accepted without authoritative summary state",
+  );
+  assert(
+    !observer.validateLiveItem(pairingCompletedItem, 8, runningLiveSummary),
+    "old modes reject championship lifecycle items",
+  );
+  assert(
+    !observer.validateLiveItem(championshipMatchItem, 0, runningLiveSummary),
+    "old modes reject championship-only match context",
+  );
+
+  let championshipState = observer.championshipReducer(null, {
+    type: "summary",
+    summary: startingChampionshipSummary,
+  });
+  equal(championshipState.summary, startingChampionshipSummary, "the reducer keeps the authoritative summary");
+  equal(championshipState.bracket, emptyChampionshipBracket, "the reducer starts from the authoritative empty bracket");
+  equal(championshipState.lifecycleItems, [], "ordinary championship startup has no lifecycle item");
+
+  const forgedScoreItem = {
+    ...championshipMatchItem,
+    event: {
+      seq: 0,
+      type: "match_finished",
+      timestamp: "2026-08-13T12:00:01.000000Z",
+      player: null,
+      data: {
+        scores: { Alice: 999, Bob: 0 },
+        termination: "completed",
+        reason_code: null,
+        forfeited_by: null,
+        judging: null,
+      },
+    },
+  };
+  championshipState = observer.championshipReducer(championshipState, {
+    type: "item",
+    item: forgedScoreItem,
+    summary: { ...startingChampionshipSummary, event_count: 1 },
+  });
+  assert(
+    championshipState.bracket.champion === null && championshipState.bracket.pairings.length === 0,
+    "ordinary score events never infer pairing winners or a champion",
+  );
+  equal(championshipState.lifecycleItems, [], "ordinary match events are not lifecycle authority");
+
+  championshipState = observer.championshipReducer(championshipState, {
+    type: "item",
+    item: pairingCompletedItem,
+    summary: provisionalChampionshipSummary,
+  });
+  equal(
+    championshipState.bracket,
+    provisionalChampionshipBracket,
+    "a pairing lifecycle item uses the authoritative provisional bracket",
+  );
+  equal(championshipState.lifecycleItems, [pairingCompletedItem], "the provisional lifecycle item is recorded once");
+  const idempotentChampionshipState = observer.championshipReducer(championshipState, {
+    type: "item",
+    item: pairingCompletedItem,
+  });
+  equal(
+    idempotentChampionshipState,
+    championshipState,
+    "a repeated page or reconnect item is idempotent",
+  );
+  throwsCode(
+    () => observer.championshipReducer(championshipState, {
+      type: "item",
+      item: {
+        ...pairingCompletedItem,
+        pairing: { ...pairingCompletedItem.pairing, winner: "Bob" },
+      },
+    }),
+    "protocol_error",
+    "a conflicting duplicate broker sequence fails closed",
+  );
+
+  championshipState = observer.championshipReducer(championshipState, {
+    type: "item",
+    item: roundCommittedItem,
+    summary: secondRoundChampionshipSummary,
+  });
+  assert(
+    championshipState.bracket.pairings.every((pairing) => pairing.status === "committed"),
+    "a round commit exposes only the authoritative whole-round checkpoint",
+  );
+  equal(
+    championshipState.lifecycleItems,
+    [pairingCompletedItem, roundCommittedItem],
+    "lifecycle items remain ordered across paginated event batches",
+  );
+
+  const finalRoundCommittedItem = {
+    kind: "round_committed",
+    seq: 26,
+    context: {
+      round_number: 2,
+      round_count: 2,
+      round_pairing_number: 1,
+      round_pairing_count: 1,
+      pairing_number: 3,
+      pairing_count: 3,
+      leg_number: 2,
+    },
+    pairing_numbers: [3],
+  };
+  let terminalChampionshipState = observer.championshipReducer(null, {
+    type: "summary",
+    summary: finalProvisionalChampionshipSummary,
+  });
+  terminalChampionshipState = observer.championshipReducer(terminalChampionshipState, {
+    type: "item",
+    item: finalRoundCommittedItem,
+  });
+  assert(
+    terminalChampionshipState.bracket.pairings.every((pairing) => pairing.status === "committed")
+      && terminalChampionshipState.bracket.champion === null
+      && terminalChampionshipState.summary.status === "running",
+    "the final round checkpoint does not announce a champion before final archive commit",
+  );
+  assert(
+    observer.validateLiveSummary(
+      terminalChampionshipState.summary,
+      terminalChampionshipState.summary.live_id,
+    ),
+    "the final committed round remains a valid running summary without a champion",
+  );
+  const interruptedChampionshipState = observer.championshipReducer(terminalChampionshipState, {
+    eventCount: 27,
+    status: "interrupted",
+    type: "terminal",
+  });
+  assert(
+    interruptedChampionshipState.summary.status === "interrupted"
+      && interruptedChampionshipState.bracket.champion === null,
+    "an interrupted finalization synchronizes terminal state without exposing a champion",
+  );
+  const completedTerminalChampionshipState = observer.championshipReducer(
+    terminalChampionshipState,
+    {
+      eventCount: 27,
+      finalId: "championship-43",
+      finalKind: "championship",
+      finalMatchIds: completedChampionshipBracket.pairings.flatMap(
+        (pairing) => pairing.match_ids,
+      ),
+      status: "completed",
+      type: "terminal",
+    },
+  );
+  assert(
+    completedTerminalChampionshipState.summary.status === "completed"
+      && completedTerminalChampionshipState.bracket.champion === "Alice",
+    "only the completed terminal signal exposes the authoritative final pairing winner",
+  );
+
+  championshipState = observer.championshipReducer(championshipState, {
+    type: "summary",
+    summary: completedChampionshipSummary,
+  });
+  equal(
+    championshipState.bracket,
+    completedChampionshipBracket,
+    "a reconnect summary replaces provisional client state with the authoritative completed bracket",
+  );
+  assert(
+    championshipState.bracket.champion === "Alice",
+    "the champion is read only from the completed authoritative bracket",
   );
 
   const participationRequest = {
@@ -473,7 +1085,7 @@
       name: "math_quiz",
       requires_judge_panel: false,
       rounds_supported: true,
-      supported_modes: ["play", "series", "round_robin"],
+      supported_modes: ["play", "series", "round_robin", "championship"],
     }],
     mock_judge_strategies: ["strict", "balanced", "lenient"],
     mock_player_strategies: mockStrategies,
@@ -496,6 +1108,10 @@
   };
   const controlCatalog = observer.normalizeControlCatalog(controlCatalogPayload);
   assert(controlCatalog.games.length === 1, "a valid control catalog is normalized");
+  assert(
+    controlCatalog.games[0].supportedModes.includes("championship"),
+    "the control catalog retains the backend championship capability",
+  );
   assert(controlCatalog.profiles[0].available, "credential readiness becomes only a boolean capability");
   assert(
     !JSON.stringify(controlCatalog).includes("credential_ready"),
@@ -576,6 +1192,34 @@
   assert(
     observer.validateControlForm(makeForm({ mode: "round_robin", players: uniquePlayers(3) }), controlCatalog).players === undefined,
     "round robin accepts three distinct players",
+  );
+  [4, 8, 16].forEach((playerCount) => {
+    assert(
+      observer.validateControlForm(makeForm({
+        mode: "championship",
+        players: uniquePlayers(playerCount),
+      }), controlCatalog).players === undefined,
+      `championship accepts an exact ${playerCount}-player bracket`,
+    );
+  });
+  [2, 3, 5, 6, 7, 9, 15].forEach((playerCount) => {
+    assert(
+      observer.validateControlForm(makeForm({
+        mode: "championship",
+        players: uniquePlayers(playerCount),
+      }), controlCatalog).players,
+      `championship rejects a ${playerCount}-player non-bracket roster`,
+    );
+  });
+  assert(
+    observer.validateControlForm(makeForm({
+      mode: "championship",
+      players: [
+        { kind: "human", name: "Alice", profileId: "", strategy: "" },
+        ...uniquePlayers(3),
+      ],
+    }), controlCatalog)["player-0"],
+    "championship rejects browser-human seats",
   );
 
   const unavailableProfileForm = makeForm({
@@ -698,9 +1342,46 @@
       ],
       rounds: 2,
       seed: "-7",
+      resume_championship_id: null,
       resume_tournament_id: null,
     },
     "the browser emits only the canonical control request schema",
+  );
+
+  const championshipForm = makeForm({
+    mode: "championship",
+    players: uniquePlayers(4),
+    rounds: "2",
+    seed: "23",
+  });
+  equal(
+    observer.controlRequestBody(championshipForm, controlCatalog),
+    {
+      allow_large_tournament: false,
+      budget: {
+        max_estimated_cost_usd: "1.250000",
+        max_input_tokens: "200000",
+        max_output_tokens_per_call: "4096",
+        max_provider_calls: "64",
+        max_total_output_tokens: "65536",
+      },
+      game: "math_quiz",
+      human_timeout_seconds: 300,
+      judges: [],
+      llm_timeout_seconds: 120,
+      mode: "championship",
+      players: [
+        { kind: "mock", strategy: "strategy_0" },
+        { kind: "mock", strategy: "strategy_1" },
+        { kind: "mock", strategy: "strategy_2" },
+        { kind: "mock", strategy: "strategy_3" },
+      ],
+      rounds: 2,
+      seed: "23",
+      resume_championship_id: null,
+      resume_tournament_id: null,
+    },
+    "championship control emits the canonical fixed-bracket request without browser credentials",
   );
 
   const capability = "c".repeat(43);
@@ -929,6 +1610,217 @@
   assert(
     !observer.controlJobCanResume({ ...resumeJob, resumable: true, status: "running" }),
     "an active job never exposes checkpoint recovery",
+  );
+  equal(
+    observer.resumeControlRequest(resumeJob),
+    {
+      allow_large_tournament: false,
+      budget: {
+        max_estimated_cost_usd: null,
+        max_input_tokens: null,
+        max_output_tokens_per_call: null,
+        max_provider_calls: null,
+        max_total_output_tokens: null,
+      },
+      game: "",
+      human_timeout_seconds: 120,
+      judges: [],
+      llm_timeout_seconds: null,
+      mode: "round_robin",
+      players: [],
+      resume_championship_id: null,
+      resume_tournament_id: "tournament-23",
+      rounds: null,
+      seed: "0",
+    },
+    "round-robin recovery sends only its checkpoint identity",
+  );
+
+  const championshipJobBase = {
+    created_at: "2026-08-15T03:00:00.000000Z",
+    championship_id: "championship-43",
+    job_id: "championship-job-43",
+    live_id: "live-championship-43",
+    participation_links: [],
+    preview: {
+      human_count: 0,
+      match_count: 6,
+      pairing_count: 3,
+      player_count: 4,
+      rated: false,
+      requires_provider_budget: false,
+      uses_frozen_budget: false,
+      warnings: [],
+    },
+    spec: {
+      allow_large_tournament: false,
+      budget: {
+        max_estimated_cost_usd: null,
+        max_input_tokens: null,
+        max_output_tokens_per_call: null,
+        max_provider_calls: null,
+        max_total_output_tokens: null,
+      },
+      game: "math_quiz",
+      human_timeout_seconds: 120,
+      judges: [],
+      llm_timeout_seconds: 120,
+      mode: "championship",
+      players: [
+        { kind: "mock", strategy: "random" },
+        { kind: "mock", strategy: "fixed" },
+        { kind: "mock", strategy: "illegal" },
+        { kind: "mock", strategy: "balanced" },
+      ],
+      resume_championship_id: null,
+      resume_tournament_id: null,
+      rounds: 2,
+      seed: "23",
+    },
+    status: "running",
+    updated_at: "2026-08-15T03:00:01.000000Z",
+  };
+  const championshipJob = observer.normalizeControlJob({
+    api_version: "v1",
+    job: championshipJobBase,
+  });
+  equal(
+    {
+      championshipId: championshipJob.championshipId,
+      isResume: championshipJob.isResume,
+      mode: championshipJob.mode,
+      players: championshipJob.players,
+      tournamentId: championshipJob.tournamentId,
+    },
+    {
+      championshipId: "championship-43",
+      isResume: false,
+      mode: "championship",
+      players: ["Mock · random", "Mock · fixed", "Mock · illegal", "Mock · balanced"],
+      tournamentId: null,
+    },
+    "a championship control job exposes its public bracket identity without hidden entrant IDs",
+  );
+
+  const resumeChampionshipJob = observer.normalizeControlJob({
+    api_version: "v1",
+    job: {
+      ...championshipJobBase,
+      championship_id: "championship-checkpoint-43",
+      job_id: "resume-championship-job-43",
+      live_id: null,
+      preview: {
+        ...championshipJobBase.preview,
+        frozen_game: "math_quiz",
+        frozen_judges: [],
+        frozen_llm_timeout_seconds: 91.25,
+        frozen_players: ["Alice", "Bob", "Carol", "Dora"],
+        frozen_rounds: 2,
+        frozen_seed: "23",
+        uses_frozen_budget: true,
+        warnings: ["resume_uses_frozen_configuration"],
+      },
+      resumable: true,
+      spec: {
+        allow_large_tournament: false,
+        budget: {
+          max_estimated_cost_usd: null,
+          max_input_tokens: null,
+          max_output_tokens_per_call: null,
+          max_provider_calls: null,
+          max_total_output_tokens: null,
+        },
+        game: "",
+        human_timeout_seconds: 120,
+        judges: [],
+        llm_timeout_seconds: null,
+        mode: "championship",
+        players: [],
+        resume_championship_id: "championship-checkpoint-43",
+        resume_tournament_id: null,
+        rounds: null,
+        seed: "0",
+      },
+      status: "interrupted",
+    },
+  });
+  equal(
+    {
+      championshipId: resumeChampionshipJob.championshipId,
+      game: resumeChampionshipJob.game,
+      isResume: resumeChampionshipJob.isResume,
+      players: resumeChampionshipJob.players,
+      rounds: resumeChampionshipJob.rounds,
+      seed: resumeChampionshipJob.seed,
+    },
+    {
+      championshipId: "championship-checkpoint-43",
+      game: "math_quiz",
+      isResume: true,
+      players: ["Alice", "Bob", "Carol", "Dora"],
+      rounds: 2,
+      seed: "23",
+    },
+    "championship recovery hydrates only the validated frozen checkpoint summary",
+  );
+  assert(
+    observer.controlJobCanResume(resumeChampionshipJob),
+    "an interrupted resumable championship exposes checkpoint recovery",
+  );
+  assert(
+    !observer.controlJobCanResume({ ...resumeChampionshipJob, status: "running" }),
+    "an active championship never exposes checkpoint recovery",
+  );
+  equal(
+    observer.resumeControlRequest(resumeChampionshipJob),
+    {
+      allow_large_tournament: false,
+      budget: {
+        max_estimated_cost_usd: null,
+        max_input_tokens: null,
+        max_output_tokens_per_call: null,
+        max_provider_calls: null,
+        max_total_output_tokens: null,
+      },
+      game: "",
+      human_timeout_seconds: 120,
+      judges: [],
+      llm_timeout_seconds: null,
+      mode: "championship",
+      players: [],
+      resume_championship_id: "championship-checkpoint-43",
+      resume_tournament_id: null,
+      rounds: null,
+      seed: "0",
+    },
+    "championship recovery sends only its checkpoint identity",
+  );
+
+  const completedChampionshipJob = observer.normalizeControlJob({
+    api_version: "v1",
+    job: {
+      ...championshipJobBase,
+      final_id: "championship-43",
+      final_kind: "championship",
+      final_match_ids: completedChampionshipSummary.final_match_ids,
+      finished_at: "2026-08-15T03:01:00.000000Z",
+      status: "completed",
+    },
+  });
+  equal(
+    {
+      championshipId: completedChampionshipJob.championshipId,
+      finalId: completedChampionshipJob.finalId,
+      finalKind: completedChampionshipJob.finalKind,
+      finalMatchIds: completedChampionshipJob.finalMatchIds,
+    },
+    {
+      championshipId: "championship-43",
+      finalId: "championship-43",
+      finalKind: "championship",
+      finalMatchIds: completedChampionshipSummary.final_match_ids,
+    },
+    "a completed championship job preserves its canonical archive links",
   );
   throwsCode(
     () => observer.normalizeControlJob({ job: { ...controlJobPayload.job, job_id: "../job" } }),
