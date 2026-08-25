@@ -50,6 +50,10 @@ worker 运行；FastAPI 不直接调用 Provider，也不写正式档案/ELO。p
 checkpoint，或者只含命名 Profile、并已有冻结硬预算的 checkpoint。旧式直接 Provider
 checkpoint 不具备可绑定的 Profile 配置身份，只能继续从 CLI 恢复。
 
+当前 `main` 的 `[Unreleased]` 锦标赛 checkpoint/resume 只提供 CLI 入口；阶段 4.5b 的
+Web 控制面尚不接受 `championship`，实时直播 sidecar 也尚未扩展到该模式。这不会改变现有
+loopback、admin capability、Profile 冻结与正式档案事务边界。
+
 React 页面把选手名、题面、提交和失败原因作为纯文本渲染；页面 CSP 只允许同源静态资源和
 精确同源 WebSocket，API 响应继续禁止加载任何内容。若未来需要远程访问，
 应在项目正式提供身份认证、授权、TLS、限流和安全日志后再启用，不能用反向代理简单转发
