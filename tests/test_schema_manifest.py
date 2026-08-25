@@ -283,8 +283,8 @@ SCHEMA_TAMPERS: tuple[tuple[str, SchemaTamper, str], ...] = (
 )
 
 
-def test_fresh_v8_database_passes_the_complete_manifest(tmp_path: Path) -> None:
-    database = tmp_path / "fresh-v8.db"
+def test_fresh_database_passes_the_complete_manifest(tmp_path: Path) -> None:
+    database = tmp_path / "fresh.db"
 
     SQLiteStore(database)
     SQLiteStore(database, create=False)

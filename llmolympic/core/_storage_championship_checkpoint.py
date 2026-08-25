@@ -654,10 +654,12 @@ class _ChampionshipCheckpointMixin:
                     f"championship_id {checkpoint.championship_id!r} 的 checkpoint 已封存"
                 )
 
-            # Append exactly one whole round (or the exact remaining prefix for
-            # the final round): the incoming prefix must extend the stored prefix
-            # by the number of series in the next unplayed round.
-            round_size = len(checkpoint.players) >> 1
+            # Append exactly one whole round: the incoming prefix must extend
+            # the stored prefix by the number of series in the next unplayed
+            # round.  Round sizes shrink as 2^n -> 2^(n-1) -> ... -> 1, so the
+            # next round's size is derived from how many rounds are already
+            # stored, not from the opening-round size.
+            count = len(checkpoint.players)
             if completed_count > pairing_count or completed_count <= stored_count:
                 raise ChampionshipCheckpointCollisionError(
                     "锦标赛 checkpoint 只能按整轮连续追加双局赛"
@@ -667,16 +669,11 @@ class _ChampionshipCheckpointMixin:
                     "锦标赛 checkpoint 只能保留既有 prefix 并追加新双局赛"
                 )
             appended = completed_count - stored_count
-            if appended > round_size:
-                raise ChampionshipCheckpointCollisionError(
-                    "锦标赛 checkpoint 每次最多追加一轮双局赛"
-                )
-            is_final_round = completed_count == pairing_count
-            if not is_final_round and appended != round_size:
+            round_size = count >> (stored.completed_rounds + 1)
+            if appended != round_size:
                 raise ChampionshipCheckpointCollisionError(
                     "锦标赛 checkpoint 只能按整轮连续追加双局赛"
                 )
-            del is_final_round
 
             new_series = checkpoint.completed_series[stored_count:]
 

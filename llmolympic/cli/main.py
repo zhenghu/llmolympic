@@ -81,6 +81,7 @@ from llmolympic.core.storage import (
     SQLITE_INT_MAX,
     SQLITE_INT_MIN,
     ChampionshipRunnerLease,
+    ChampionshipRunnerLeaseLostError,
     SaveResult,
     SQLiteStore,
     StorageError,
@@ -1903,6 +1904,54 @@ async def _runner_lease_heartbeat(
         current = await _renew_runner_lease_with_retry(store, current, stop)
 
 
+async def _renew_championship_runner_lease_with_retry(
+    store: SQLiteStore,
+    lease: ChampionshipRunnerLease,
+    stop: asyncio.Event,
+) -> ChampionshipRunnerLease:
+    while True:
+        try:
+            return await asyncio.to_thread(store.renew_championship_runner, lease)
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy_or_locked(exc):
+                raise
+            remaining = lease.expires_at_epoch - time.time()
+            if remaining <= 0:
+                raise ChampionshipRunnerLeaseLostError(
+                    "锦标赛 runner lease 心跳未能在过期前取得 SQLite 写锁"
+                ) from exc
+            if stop.is_set():
+                return lease
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=min(TOURNAMENT_RUNNER_BUSY_RETRY_SECONDS, remaining),
+                )
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                return lease
+
+
+async def _championship_runner_lease_heartbeat(
+    store: SQLiteStore,
+    lease: ChampionshipRunnerLease,
+    stop: asyncio.Event,
+) -> None:
+    current = lease
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=TOURNAMENT_RUNNER_HEARTBEAT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+        if stop.is_set():
+            return
+        current = await _renew_championship_runner_lease_with_retry(store, current, stop)
+
+
 async def _run_round_robin(
     game: Game,
     players: list[Player],
@@ -2920,14 +2969,41 @@ async def _run_championship(
             store.save_championship_checkpoint(updated, lease=lease)
         _best_effort_render(_render_championship_checkpoint_saved, updated)
 
-    championship = await resume_championship(
-        game,
-        players,
-        checkpoint,
-        on_event=on_event,
-        on_checkpoint=save_checkpoint,
-        judge_panel=judge_panel,
-    )
+    async def _play() -> ChampionshipArchive:
+        return await resume_championship(
+            game,
+            players,
+            checkpoint,
+            on_event=on_event,
+            on_checkpoint=save_checkpoint,
+            judge_panel=judge_panel,
+        )
+
+    if lease is not None:
+        championship_task = asyncio.create_task(_play())
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            _championship_runner_lease_heartbeat(store, lease, heartbeat_stop)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {championship_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                heartbeat_error = heartbeat_task.exception()
+                if heartbeat_error is None:
+                    raise StorageError("锦标赛 runner lease 心跳意外停止")
+                raise heartbeat_error
+            championship = championship_task.result()
+        finally:
+            heartbeat_stop.set()
+            if not championship_task.done():
+                championship_task.cancel()
+            await asyncio.gather(championship_task, heartbeat_task, return_exceptions=True)
+    else:
+        championship = await _play()
+
     if lease is not None:
         result = store.finalize_championship_checkpoint(
             championship.championship_id,

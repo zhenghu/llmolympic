@@ -361,3 +361,50 @@ def test_championship_checkpoint_rejects_partial_round(tmp_path) -> None:
     with pytest.raises(Exception):  # noqa: B017 - validation raises StorageError subclasses
         store.save_championship_checkpoint(partial, lease=lease)
 
+
+def test_eight_player_championship_checkpoint_per_round(tmp_path) -> None:
+    game = create_game("knowledge_quiz", rounds=1)
+    players = _players(8)
+
+    store = SQLiteStore(tmp_path / "champ-8.db")
+    checkpoint = prepare_championship(
+        game,
+        players,
+        seed=23,
+        championship_id="champ-8-player-1",
+    )
+    store.save_championship_checkpoint(checkpoint)
+    lease = store.claim_championship_runner("champ-8-player-1").lease
+
+    # Each round shrink the pairing count: 4 -> 2 -> 1.  Persisting every round
+    # under the lease must succeed for all three round sizes.
+    saved_rounds: list[int] = []
+
+    def save(updated: object) -> None:
+        store.save_championship_checkpoint(updated, lease=lease)
+        saved_rounds.append(updated.completed_rounds)
+
+    archive = asyncio.run(
+        resume_championship(
+            game,
+            players,
+            checkpoint,
+            on_checkpoint=save,
+        )
+    )
+    assert archive.championship_id == "champ-8-player-1"
+    assert archive.champion in [descriptor["name"] for descriptor in archive.players]
+    assert saved_rounds == [1, 2, 3]
+
+    loaded = store.get_championship_checkpoint("champ-8-player-1")
+    assert loaded is not None
+    assert loaded.is_complete
+    assert len(loaded.completed_series) == 7
+
+    result = store.finalize_championship_checkpoint("champ-8-player-1", lease=lease)
+    assert result.inserted and not result.rated
+    formal = store.get_championship("champ-8-player-1")
+    assert formal is not None
+    assert formal.model_dump(mode="json") == archive.model_dump(mode="json")
+
+
