@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+import llmolympic.human_input as human_input_module
 from llmolympic.core.player import HumanPlayer, PlayerTimeoutError
 from llmolympic.core.storage import SQLiteStore
 from llmolympic.human_input import (
@@ -502,6 +503,154 @@ def test_sixteen_seats_retry_contention_across_heartbeat_and_polling(
     finally:
         for session in sessions:
             session.close()
+
+
+@pytest.mark.parametrize(
+    ("sqlite_code", "sqlite_message"),
+    [
+        (None, "database is locked"),
+        (sqlite3.SQLITE_BUSY, "database is busy"),
+    ],
+)
+def test_web_connection_retries_transient_schema_contention_and_closes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_code: int | None,
+    sqlite_message: str,
+) -> None:
+    archive = tmp_path / "web-schema-contention.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    web = _web(archive)
+    original_connect = human_input_module._connect
+    original_validate_schema = human_input_module._validate_schema
+    connections: list[sqlite3.Connection] = []
+    attempts = 0
+
+    def recording_connect(*args, **kwargs) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    def contended_validate_schema(connection: sqlite3.Connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError(sqlite_message)
+            if sqlite_code is not None:
+                error.sqlite_errorcode = sqlite_code
+            raise HumanInputError("input_unavailable") from error
+        original_validate_schema(connection)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(human_input_module, "_connect", recording_connect)
+            patch.setattr(
+                human_input_module,
+                "_validate_schema",
+                contended_validate_schema,
+            )
+            connection = web._connection()
+            try:
+                assert attempts == 2
+                assert connection is connections[1]
+                with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                    connections[0].execute("SELECT 1")
+                assert connection.execute("SELECT 1").fetchone()[0] == 1
+            finally:
+                connection.close()
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "sqlite_message"),
+    [
+        ("input_invalid", None),
+        ("input_unavailable", "malformed database schema"),
+    ],
+)
+def test_web_connection_does_not_retry_non_contention_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    sqlite_message: str | None,
+) -> None:
+    archive = tmp_path / f"web-schema-{error_code}.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    web = _web(archive)
+    original_connect = human_input_module._connect
+    connections: list[sqlite3.Connection] = []
+    attempts = 0
+
+    def recording_connect(*args, **kwargs) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    def failing_validate_schema(_connection: sqlite3.Connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if sqlite_message is None:
+            raise HumanInputError(error_code)
+        try:
+            raise sqlite3.OperationalError(sqlite_message)
+        except sqlite3.OperationalError as exc:
+            raise HumanInputError(error_code) from exc
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(human_input_module, "_connect", recording_connect)
+            patch.setattr(
+                human_input_module,
+                "_validate_schema",
+                failing_validate_schema,
+            )
+            with pytest.raises(HumanInputError) as caught:
+                web._connection()
+            assert caught.value.code == error_code
+            if sqlite_message is not None:
+                assert str(caught.value.__cause__) == sqlite_message
+            assert attempts == 1
+            assert len(connections) == 1
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                connections[0].execute("SELECT 1")
+    finally:
+        session.close()
+
+
+def test_connect_closes_connection_when_a_setup_pragma_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "connect-pragma-contention.db"
+    session = _session(archive, heartbeat_seconds=59.0)
+    input_path = derive_human_input_database_path(archive)
+
+    class FailingConnection:
+        row_factory = None
+        closed = False
+
+        def execute(self, _statement: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                human_input_module.sqlite3,
+                "connect",
+                lambda *_args, **_kwargs: connection,
+            )
+            with pytest.raises(HumanInputError) as caught:
+                human_input_module._connect(input_path, create=False)
+            assert caught.value.code == "input_unavailable"
+            assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+            assert connection.closed
+    finally:
+        session.close()
 
 
 def test_heartbeat_contention_exhaustion_becomes_explicit_session_failure(

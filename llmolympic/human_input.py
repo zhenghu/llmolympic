@@ -242,6 +242,7 @@ def _connect(path: Path, *, create: bool, timeout: float = 1.0) -> sqlite3.Conne
         _create_private_file(path)
     else:
         _check_regular_file(path, missing_code="participation_not_found")
+    connection: sqlite3.Connection | None = None
     try:
         uri = f"{path.as_uri()}?mode=rw"
         connection = sqlite3.connect(uri, uri=True, timeout=timeout)
@@ -252,6 +253,11 @@ def _connect(path: Path, *, create: bool, timeout: float = 1.0) -> sqlite3.Conne
         connection.execute("PRAGMA busy_timeout = 1000")
         return connection
     except sqlite3.Error as exc:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
         raise HumanInputError("input_unavailable") from exc
 
 
@@ -945,13 +951,23 @@ class WebSubmissionStore:
         self._clock = clock
 
     def _connection(self) -> sqlite3.Connection:
-        connection = _connect(self.path, create=False)
-        try:
-            _validate_schema(connection)
-        except HumanInputError:
-            connection.close()
-            raise
-        return connection
+        for attempt in range(_SQLITE_CONTENTION_ATTEMPTS):
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = _connect(self.path, create=False)
+                _validate_schema(connection)
+                return connection
+            except HumanInputError as exc:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                if not _is_sqlite_contention(exc) or attempt + 1 == _SQLITE_CONTENTION_ATTEMPTS:
+                    raise
+                time.sleep(_SQLITE_CONTENTION_RETRY_SECONDS * (2**attempt))
+
+        raise AssertionError("unreachable")
 
     def load(self, session_id: str, seat_id: str, *, capability: str) -> InputSnapshot:
         if _SAFE_ID_RE.fullmatch(session_id) is None or _SAFE_ID_RE.fullmatch(seat_id) is None:
