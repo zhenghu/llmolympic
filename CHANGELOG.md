@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+- 为锦标赛补齐 checkpoint/resume：SQLite v10 新增
+  `championship_checkpoints` / `championship_checkpoint_series` /
+  `championship_runner_leases`，通过 additive migration 从 v9 升级。锦标赛串行执行，
+  每完成一整轮就把已完成的子双局赛 prefix 原子追加到 checkpoint；
+  `llmolympic championship --resume` 从最后完整轮边界恢复，跨进程 runner lease
+  保证同一时刻只有一个执行者；恢复时核对项目配置、选手描述与冻结评审团快照，
+  只运行未完成轮次，完成后在最终事务内封存正式锦标赛档案与全部子双局赛（仍不计分）。
+  锦标赛 checkpoint 暂未接入 Web 控制面与实时直播。
+
 ## [0.9.0] - 2026-08-19
 
 - 完成路线图锦标赛模式（4.6）：新增 `llmolympic championship` 命令，提供

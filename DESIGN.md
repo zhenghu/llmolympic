@@ -280,8 +280,14 @@ CLI                  Web / WebSocket
   依次按较少技术负、较小 `entrant_id` 确定性打破，保证永不僵持。锦标赛及子双局赛
   只存档、不更新 ELO——淘汰赛名次不是独立的二人对局序列；`llmolympic championship`
   命令入口与 `championship_archives` / `championship_entrants` /
-  `championship_pairings` SQLite v9 表随本次实现。当前锦标赛串行执行、无 checkpoint，
-  且暂不接入 Web 控制面或实时直播 sidecar。
+  `championship_pairings` SQLite v9 表随本次实现。SQLite v10 增加
+  `championship_checkpoints` / `championship_checkpoint_series` /
+  `championship_runner_leases`，锦标赛串行执行，每完成一整轮就把已完成的子双局赛
+  prefix 原子追加到 checkpoint；`--resume` 从最后完整轮边界恢复，跨进程 runner lease
+  保证同一时刻只有一个执行者。恢复时核对 `Game.describe_config()`、完整 Player
+  descriptor 与冻结评审团快照，只运行未完成轮次；全部完成时才在最终事务内封存正式
+  锦标赛档案与全部子双局赛（仍不计分）。锦标赛 checkpoint 暂不接入 Web 控制面，
+  实时直播 sidecar 也仍未扩展为锦标赛模式。
 
 ## 7. 技术栈
 
@@ -337,7 +343,12 @@ CLI                  Web / WebSocket
    该控制面仍只信任回环地址上的本机操作者，同一数据库最多一个活动 Web 任务，
    play/series 中断后不自动重跑。
    4.6 以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
-   先后手双局赛、确定性平局打破、SQLite v9 只存档不计分的锦标赛档案；串行执行、
-   无 checkpoint，尚未接入 Web 控制面与实时直播。
+   先后手双局赛、确定性平局打破、SQLite v9 只存档不计分的锦标赛档案；串行执行。
+   4.6 追加锦标赛 checkpoint/resume ✅：SQLite v10 新增 `championship_checkpoints` /
+   `championship_checkpoint_series` / `championship_runner_leases`，每完成一整轮
+   原子追加已完成的子双局赛 prefix；`llmolympic championship --resume` 从最后完整
+   轮边界恢复，跨进程 runner lease 单写者互斥，恢复时校验项目配置、选手描述与冻结
+   评审团快照，只运行未完成轮次，完成后在最终事务内封存正式档案与全部子双局赛（仍
+   不计分）。锦标赛尚未接入 Web 控制面与实时直播。
    后续切片再加入正式认证、席位授权与 TLS 的远程多席位使用，以及锦标赛的
-   checkpoint/resume、Web 控制面与直播；之后新增项目继续保持纯插件接入。
+   Web 控制面与直播；之后新增项目继续保持纯插件接入。

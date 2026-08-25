@@ -15,6 +15,7 @@ from llmolympic.core._storage_types import (
     _V5_REQUIRED_COLUMNS,
     _V6_REQUIRED_COLUMNS,
     _V9_REQUIRED_COLUMNS,
+    _V10_REQUIRED_COLUMNS,
     SQLITE_INT_MAX,
     RatingSource,
     StorageError,
@@ -476,6 +477,107 @@ class _SchemaMixin:
                     REFERENCES championship_entrants(championship_id, entrant_id)
                     ON DELETE RESTRICT
             )
+            """
+        )
+
+    @staticmethod
+    def _create_championship_checkpoint_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_checkpoints (
+                championship_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+                source TEXT NOT NULL CHECK (source = 'local_engine'),
+                format TEXT NOT NULL CHECK (format = 'single_elimination_two_leg'),
+                pairing_policy TEXT NOT NULL
+                    CHECK (pairing_policy = 'power_of_two_bracket_v1'),
+                seed_policy TEXT NOT NULL
+                    CHECK (seed_policy = 'round_seed_sha256_v1'),
+                tiebreak_policy TEXT NOT NULL
+                    CHECK (tiebreak_policy = 'deterministic_v1'),
+                game TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                players_json TEXT NOT NULL,
+                game_config_json TEXT NOT NULL,
+                schedule_json TEXT NOT NULL,
+                max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+                pairing_count INTEGER NOT NULL CHECK (pairing_count >= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'finalized')),
+                finalized_at TEXT,
+                final_championship_id TEXT UNIQUE
+                    REFERENCES championship_archives(championship_id) ON DELETE RESTRICT,
+                config_json TEXT NOT NULL,
+                CHECK (
+                    (status = 'in_progress'
+                     AND finalized_at IS NULL
+                     AND final_championship_id IS NULL)
+                    OR
+                    (status = 'finalized'
+                     AND finalized_at IS NOT NULL
+                     AND final_championship_id = championship_id)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS championship_checkpoints_updated_at_idx
+            ON championship_checkpoints(status, updated_at DESC)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_checkpoint_series (
+                championship_id TEXT NOT NULL
+                    REFERENCES championship_checkpoints(championship_id) ON DELETE RESTRICT,
+                pairing_number INTEGER NOT NULL CHECK (pairing_number >= 1),
+                series_id TEXT NOT NULL UNIQUE,
+                match_1_id TEXT NOT NULL UNIQUE,
+                match_2_id TEXT NOT NULL UNIQUE,
+                completed_at TEXT NOT NULL,
+                series_json TEXT NOT NULL,
+                PRIMARY KEY (championship_id, pairing_number),
+                CHECK (match_1_id <> match_2_id)
+            )
+            """
+        )
+
+    @staticmethod
+    def _create_championship_runner_lease_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS championship_runner_leases (
+                championship_id TEXT PRIMARY KEY
+                    REFERENCES championship_checkpoints(championship_id) ON DELETE RESTRICT,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                token_digest BLOB UNIQUE,
+                acquired_at_epoch INTEGER,
+                renewed_at_epoch INTEGER,
+                expires_at_epoch INTEGER,
+                CHECK (
+                    (token_digest IS NULL
+                     AND acquired_at_epoch IS NULL
+                     AND renewed_at_epoch IS NULL
+                     AND expires_at_epoch IS NULL)
+                    OR
+                    (typeof(token_digest) = 'blob'
+                     AND length(token_digest) = 32
+                     AND acquired_at_epoch IS NOT NULL
+                     AND renewed_at_epoch IS NOT NULL
+                     AND expires_at_epoch IS NOT NULL
+                     AND acquired_at_epoch <= renewed_at_epoch
+                     AND renewed_at_epoch < expires_at_epoch)
+                )
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS championship_runner_leases_expires_at_idx
+            ON championship_runner_leases(expires_at_epoch)
+            WHERE token_digest IS NOT NULL
             """
         )
 
@@ -1451,26 +1553,49 @@ class _SchemaMixin:
         _SchemaMixin._verify_required_columns(connection, _V9_REQUIRED_COLUMNS)
 
     @staticmethod
-    def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
-        table_info = connection.execute("PRAGMA table_info(tournament_runner_leases)").fetchall()
-        primary_key = [row["name"] for row in table_info if row["pk"]]
-        if primary_key != ["tournament_id"]:
-            raise StorageError("SQLite 数据库结构不完整：tournament_runner_leases 主键无效")
+    def _verify_v10_schema(connection: sqlite3.Connection) -> None:
+        _SchemaMixin._verify_required_columns(connection, _V10_REQUIRED_COLUMNS)
+        _SchemaMixin._verify_one_runner_lease_schema(
+            connection,
+            table="championship_runner_leases",
+            owner_table="championship_checkpoints",
+            owner_column="championship_id",
+        )
 
-        foreign_keys = connection.execute(
-            "PRAGMA foreign_key_list(tournament_runner_leases)"
-        ).fetchall()
+    @staticmethod
+    def _verify_runner_lease_schema(connection: sqlite3.Connection) -> None:
+        _SchemaMixin._verify_one_runner_lease_schema(
+            connection,
+            table="tournament_runner_leases",
+            owner_table="tournament_checkpoints",
+            owner_column="tournament_id",
+        )
+
+    @staticmethod
+    def _verify_one_runner_lease_schema(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        owner_table: str,
+        owner_column: str,
+    ) -> None:
+        table_info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        primary_key = [row["name"] for row in table_info if row["pk"]]
+        if primary_key != [owner_column]:
+            raise StorageError(f"SQLite 数据库结构不完整：{table} 主键无效")
+
+        foreign_keys = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
         if not any(
-            row["table"] == "tournament_checkpoints"
-            and row["from"] == "tournament_id"
-            and row["to"] == "tournament_id"
+            row["table"] == owner_table
+            and row["from"] == owner_column
+            and row["to"] == owner_column
             and row["on_delete"].upper() == "RESTRICT"
             for row in foreign_keys
         ):
-            raise StorageError("SQLite 数据库结构不完整：tournament_runner_leases 外键无效")
+            raise StorageError(f"SQLite 数据库结构不完整：{table} 外键无效")
 
         has_unique_token = False
-        for index in connection.execute("PRAGMA index_list(tournament_runner_leases)").fetchall():
+        for index in connection.execute(f"PRAGMA index_list({table})").fetchall():
             if not index["unique"] or index["partial"]:
                 continue
             columns = [
@@ -1485,7 +1610,7 @@ class _SchemaMixin:
                 break
         if not has_unique_token:
             raise StorageError(
-                "SQLite 数据库结构不完整：tournament_runner_leases 缺少 token 唯一约束"
+                f"SQLite 数据库结构不完整：{table} 缺少 token 唯一约束"
             )
 
     @staticmethod
@@ -1516,6 +1641,8 @@ class _SchemaMixin:
             _SchemaMixin._create_rating_operation_schema(reference)
             _SchemaMixin._create_provider_usage_schema(reference)
             _SchemaMixin._create_championship_schema(reference)
+            _SchemaMixin._create_championship_checkpoint_schema(reference)
+            _SchemaMixin._create_championship_runner_lease_schema(reference)
             return introspect_schema(reference)
 
     @staticmethod
@@ -1548,11 +1675,34 @@ class _SchemaMixin:
             raise StorageError(f"SQLite 数据库结构与 v8 manifest 不一致：{exc}") from exc
 
     @staticmethod
+    @lru_cache(maxsize=1)
+    def _expected_v9_schema_manifest() -> SchemaManifest:
+        """Build the canonical pre-checkpoint v9 manifest for migration validation."""
+
+        with closing(sqlite3.connect(":memory:", isolation_level=None)) as reference:
+            _SchemaMixin._create_base_schema(reference)
+            _SchemaMixin._create_series_schema(reference)
+            _SchemaMixin._create_tournament_schema(reference)
+            _SchemaMixin._create_checkpoint_schema(reference)
+            _SchemaMixin._create_runner_lease_schema(reference)
+            _SchemaMixin._create_rating_operation_schema(reference)
+            _SchemaMixin._create_provider_usage_schema(reference)
+            _SchemaMixin._create_championship_schema(reference)
+            return introspect_schema(reference)
+
+    @staticmethod
+    def _verify_v9_schema_manifest(connection: sqlite3.Connection) -> None:
+        try:
+            verify_schema_manifest(connection, _SchemaMixin._expected_v9_schema_manifest())
+        except SchemaManifestError as exc:
+            raise StorageError(f"SQLite 数据库结构与 v9 manifest 不一致：{exc}") from exc
+
+    @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
         try:
             verify_schema_manifest(connection, _SchemaMixin._expected_schema_manifest())
         except SchemaManifestError as exc:
-            raise StorageError(f"SQLite 数据库结构与 v9 manifest 不一致：{exc}") from exc
+            raise StorageError(f"SQLite 数据库结构与 v10 manifest 不一致：{exc}") from exc
 
     @staticmethod
     def _verify_foreign_keys(connection: sqlite3.Connection) -> None:

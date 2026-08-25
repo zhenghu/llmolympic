@@ -123,7 +123,16 @@ class _EntrantsMixin:
     ) -> None:
         """Reject checkpoints that cannot become trusted tournament entrants."""
 
-        for descriptor in checkpoint.players:
+        self._verify_entrant_descriptors(connection, tuple(checkpoint.players))
+
+    def _verify_entrant_descriptors(
+        self,
+        connection: sqlite3.Connection,
+        descriptors: tuple[dict, ...],
+    ) -> None:
+        """Reject descriptors whose entrant identity conflicts with a trusted row."""
+
+        for descriptor in descriptors:
             entrant = self._entrant_ref(descriptor, legacy=False)
             existing = connection.execute(
                 """
@@ -744,6 +753,21 @@ class _EntrantsMixin:
             if checkpoint_owner is not None:
                 raise MatchIdCollisionError(
                     f"match_id {archive.match_id!r} 已由进行中的循环赛 checkpoint 保留"
+                )
+            championship_owner = connection.execute(
+                """
+                SELECT ccs.championship_id
+                FROM championship_checkpoint_series AS ccs
+                JOIN championship_checkpoints AS cc
+                  ON cc.championship_id = ccs.championship_id
+                WHERE cc.status = 'in_progress'
+                  AND (ccs.match_1_id = ? OR ccs.match_2_id = ?)
+                """,
+                (archive.match_id, archive.match_id),
+            ).fetchone()
+            if championship_owner is not None:
+                raise MatchIdCollisionError(
+                    f"match_id {archive.match_id!r} 已由进行中的锦标赛 checkpoint 保留"
                 )
             existing = connection.execute(
                 """
