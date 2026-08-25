@@ -27,7 +27,11 @@ from llmolympic.control import (
     validate_job_spec,
 )
 from llmolympic.control_runner import ControlJobManager
-from llmolympic.core.storage import SCHEMA_VERSION
+from llmolympic.core.championship import play_championship
+from llmolympic.core.player import LLMPlayer
+from llmolympic.core.storage import SCHEMA_VERSION, SQLiteStore
+from llmolympic.games import create_game
+from llmolympic.providers.mock import MockProvider
 
 
 def _spec(*, human_name: str | None = None) -> ControlJobSpec:
@@ -48,6 +52,19 @@ def _spec(*, human_name: str | None = None) -> ControlJobSpec:
             max_output_tokens_per_call="1024",
             max_total_output_tokens="8192",
         ),
+    )
+
+
+def _championship_spec() -> ControlJobSpec:
+    return ControlJobSpec(
+        mode="championship",
+        game="math_quiz",
+        players=tuple(
+            ControlPlayerSpec(kind="mock", strategy=strategy)
+            for strategy in ("random", "fixed", "illegal", "balanced")
+        ),
+        rounds=1,
+        seed="37",
     )
 
 
@@ -75,6 +92,34 @@ def _write_match_archive(path: Path, match_id: str) -> bytes:
             (match_id,),
         )
     return path.read_bytes()
+
+
+def _write_championship_archive(
+    path: Path,
+    championship_id: str,
+) -> tuple[str, ...]:
+    players = [
+        LLMPlayer(
+            name=f"Mock {strategy}",
+            provider=MockProvider(strategy=strategy),
+            model=strategy,
+        )
+        for strategy in ("random", "fixed", "illegal", "balanced")
+    ]
+    archive = asyncio.run(
+        play_championship(
+            create_game("math_quiz", mode="play", rounds=1),
+            players,
+            seed=37,
+            championship_id=championship_id,
+        )
+    )
+    SQLiteStore(path).save_championship(archive, rating_source="engine")
+    return tuple(
+        leg.match_id
+        for pairing in archive.pairings
+        for leg in pairing.series.legs
+    )
 
 
 async def _wait_for_job(
@@ -625,6 +670,97 @@ def test_invalid_final_shape_cannot_poison_the_persisted_job(tmp_path: Path) -> 
         b"different-match-id",
     ):
         assert forbidden not in raw_jobs
+
+
+def test_championship_protocol_and_archive_reconciliation_require_canonical_matches(
+    tmp_path: Path,
+) -> None:
+    archive_database = tmp_path / "championship.db"
+    championship_id = "managed-championship"
+    match_ids = _write_championship_archive(archive_database, championship_id)
+    assert len(match_ids) == 6
+    archive_before = archive_database.read_bytes()
+    fake_root = _write_fake_cli(
+        tmp_path / "fake-championship-cli",
+        f'''
+        import base64
+        import json
+        import os
+
+        prefix = "@@LLMOLYMPIC_CONTROL_V1:"
+        token = os.environ["LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN"]
+        job_id = os.environ["LLMOLYMPIC_CONTROL_JOB_ID"]
+        championship_id = {championship_id!r}
+        match_ids = {list(match_ids)!r}
+
+        def emit(payload):
+            raw = json.dumps(
+                {{"job_id": job_id, **payload}},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+            print(f"{{prefix}}{{token}}:{{encoded}}", flush=True)
+
+        emit({{"type": "running", "tournament_id": championship_id}})
+        emit({{"type": "running", "championship_id": championship_id}})
+        emit(
+            {{
+                "type": "finalizing",
+                "final_kind": "championship",
+                "final_id": championship_id,
+                "final_match_ids": match_ids,
+            }}
+        )
+        ''',
+    )
+    store = JobStore(archive_database)
+    prepared = _prepare(
+        store,
+        _championship_spec(),
+        key="prepare-championship-protocol",
+    )
+    manager = ControlJobManager(
+        store,
+        python_executable=sys.executable,
+        working_directory=fake_root,
+        environment={},
+    )
+
+    async def exercise() -> tuple[ControlJob, ControlJob]:
+        try:
+            started = await manager.start(
+                prepared.job_id,
+                idempotency_key="start-championship-protocol",
+                web_base_url="http://localhost:8765",
+            )
+            final = await _wait_for_job(
+                manager,
+                prepared.job_id,
+                statuses={"completed", "failed", "interrupted"},
+            )
+            return started, final
+        finally:
+            await manager.shutdown()
+
+    started, final = asyncio.run(exercise())
+
+    assert started.championship_id == championship_id
+    assert started.tournament_id is None
+    assert final.status == "completed"
+    assert final.final_kind == "championship"
+    assert final.final_id == championship_id
+    assert final.final_match_ids == match_ids
+    assert archive_database.read_bytes() == archive_before
+
+    forged_payload = final.model_dump(mode="json")
+    forged_payload["status"] = "finalizing"
+    forged_payload["finished_at"] = None
+    forged_payload["final_match_ids"] = list(reversed(match_ids))
+    forged = ControlJob.model_validate(forged_payload)
+    assert (
+        control_runner._formal_archive_status(forged, archive_database)
+        == "absent"
+    )
 
 
 @pytest.mark.parametrize(

@@ -152,7 +152,7 @@ def _safe_final_fields(
     raw_match_ids = payload.get("final_match_ids")
     if not required and raw_kind is None and raw_id is None and raw_match_ids is None:
         return None, None, None
-    if raw_kind not in {"match", "series", "tournament"}:
+    if raw_kind not in {"match", "series", "tournament", "championship"}:
         return None
     final_id = _safe_identifier(raw_id)
     if final_id is None or not isinstance(raw_match_ids, list) or len(raw_match_ids) > 4096:
@@ -257,7 +257,7 @@ def _formal_archive_status(job: ControlJob, archive_database: Path) -> _ArchiveC
                 "WHERE sm.series_id = ? ORDER BY sm.leg_number",
                 (job.final_id,),
             ).fetchall()
-        else:
+        elif job.final_kind == "tournament":
             exists = connection.execute(
                 "SELECT 1 FROM tournament_archives WHERE tournament_id = ?",
                 (job.final_id,),
@@ -268,6 +268,19 @@ def _formal_archive_status(job: ControlJob, archive_database: Path) -> _ArchiveC
                 "JOIN matches AS m ON m.match_id = sm.match_id "
                 "WHERE tp.tournament_id = ? "
                 "ORDER BY tp.pairing_number, sm.leg_number",
+                (job.final_id,),
+            ).fetchall()
+        else:
+            exists = connection.execute(
+                "SELECT 1 FROM championship_archives WHERE championship_id = ?",
+                (job.final_id,),
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT sm.match_id FROM championship_pairings AS cp "
+                "JOIN series_matches AS sm ON sm.series_id = cp.series_id "
+                "JOIN matches AS m ON m.match_id = sm.match_id "
+                "WHERE cp.championship_id = ? "
+                "ORDER BY cp.pairing_number, sm.leg_number",
                 (job.final_id,),
             ).fetchall()
         return (
@@ -599,7 +612,10 @@ class ControlJobManager:
             for item in (*job.spec.players, *job.spec.judges)
             if item.kind == "profile" and item.profile_id is not None
         }
-        if job.spec.resume_tournament_id is not None:
+        if (
+            job.spec.resume_tournament_id is not None
+            or job.spec.resume_championship_id is not None
+        ):
             profile_ids = {
                 item.profile_id for item in job.preview.prepared_profiles
             }
@@ -691,6 +707,7 @@ class ControlJobManager:
                 status="starting",
                 started_at=started_at,
                 tournament_id=job.spec.resume_tournament_id,
+                championship_id=job.spec.resume_championship_id,
             )
             if starting_job.started_at != started_at:
                 raise ControlError("job_conflict")
@@ -1026,7 +1043,13 @@ class ControlJobManager:
         if payload_job_id != job_id:
             return
         allowed = {
-            "running": {"type", "event", "job_id", "tournament_id"},
+            "running": {
+                "type",
+                "event",
+                "job_id",
+                "tournament_id",
+                "championship_id",
+            },
             "live_started": {"type", "event", "job_id", "live_id"},
             "participation": {"type", "event", "job_id", "player_name", "url"},
             "finalizing": {
@@ -1057,17 +1080,32 @@ class ControlJobManager:
                 running = self._running.get(job_id)
                 if event == "running":
                     tournament_id = payload.get("tournament_id")
+                    championship_id = payload.get("championship_id")
                     if tournament_id is not None and _safe_identifier(tournament_id) is None:
+                        return
+                    if (
+                        championship_id is not None
+                        and _safe_identifier(championship_id) is None
+                    ):
                         return
                     if current.status not in {"starting", "running"}:
                         return
-                    if current.spec.mode == "round_robin" and tournament_id is None:
-                        return
-                    if current.spec.mode != "round_robin" and tournament_id is not None:
+                    if current.spec.mode == "round_robin":
+                        valid_scope = tournament_id is not None and championship_id is None
+                    elif current.spec.mode == "championship":
+                        valid_scope = championship_id is not None and tournament_id is None
+                    else:
+                        valid_scope = tournament_id is None and championship_id is None
+                    if not valid_scope:
                         return
                     if (
                         current.tournament_id is not None
                         and current.tournament_id != tournament_id
+                    ):
+                        return
+                    if (
+                        current.championship_id is not None
+                        and current.championship_id != championship_id
                     ):
                         return
                     self.store.transition(
@@ -1075,6 +1113,7 @@ class ControlJobManager:
                         expected=(current.status,),
                         status="running",
                         tournament_id=tournament_id,
+                        championship_id=championship_id,
                     )
                     if running is not None:
                         running.running_received = True

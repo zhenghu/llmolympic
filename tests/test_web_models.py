@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
+import llmolympic.web.models as web_models
 from llmolympic import __version__
 from llmolympic.core.archive import MatchArchive, archive_from_events
 from llmolympic.core.events import EventType, MatchEvent
@@ -18,10 +19,15 @@ from llmolympic.web.models import (
     GameInfo,
     HealthResponse,
     LeaderboardResponse,
+    LiveChampionshipBracket,
+    LiveChampionshipContext,
+    LiveChampionshipPairing,
     LiveEventContext,
     LiveEventItem,
     LiveMatchDetail,
     LiveMatchSummary,
+    LivePairingCompletedItem,
+    LiveRoundCommittedItem,
     MatchDetail,
     MatchListResponse,
     MatchSummary,
@@ -448,7 +454,7 @@ def test_health_and_game_metadata_are_explicitly_versioned() -> None:
 
     assert health.api_version == "v1"
     assert health.service_version == __version__
-    assert game.supported_modes == ("play", "round_robin")
+    assert game.supported_modes == ("championship", "play", "round_robin")
     assert game.requires_judge_panel is True
 
 
@@ -482,12 +488,32 @@ def test_live_dtos_keep_broker_and_match_sequences_distinct() -> None:
     assert detail.events[0].seq == 7
     assert detail.events[0].event.seq == 0
     assert detail.events[0].context.match_event_seq == 0
+    serialized = detail.model_dump(mode="json")
+    assert set(serialized["events"][0]["context"]) == {
+        "leg_number",
+        "match_event_seq",
+        "pairing_number",
+    }
+    assert not {
+        "round_number",
+        "round_count",
+        "round_pairing_number",
+        "round_pairing_count",
+        "championship_bracket",
+    } & set(serialized["match"])
 
     with pytest.raises(ValidationError):
         LiveEventItem(
             seq=7,
             context=LiveEventContext(leg_number=2, match_event_seq=1),
             event=public,
+        )
+    with pytest.raises(ValidationError):
+        LiveEventContext(
+            pairing_number=1,
+            pairing_count=3,
+            leg_number=1,
+            match_event_seq=0,
         )
 
 
@@ -532,11 +558,266 @@ def test_live_completion_and_page_contracts_fail_closed() -> None:
             final_match_ids=("different-match",),
         )
     with pytest.raises(ValidationError):
+        WSLiveCompleteEnvelope(
+            live_id="live-championship",
+            event_count=1,
+            final_kind="championship",
+            final_id="championship-1",
+            final_match_ids=("match-1", "match-2"),
+        )
+    with pytest.raises(ValidationError):
         LiveMatchDetail(
             match=completed,
             events=(),
             next_seq=2,
             has_more=False,
+        )
+
+def test_championship_live_models_validate_authoritative_bracket_lifecycle() -> None:
+    assert {
+        "LiveChampionshipBracket",
+        "LiveChampionshipContext",
+        "LiveChampionshipPairing",
+        "LivePairingCompletedItem",
+        "LiveRoundCommittedItem",
+        "LiveStreamItem",
+    } <= set(web_models.__all__)
+    roster = ("Alice", "Bob", "Carol", "Dora")
+    pairings = (
+        LiveChampionshipPairing(
+            round_number=1,
+            round_pairing_number=1,
+            pairing_number=1,
+            players=("Alice", "Bob"),
+            winner="Alice",
+            series_id="series-1",
+            match_ids=("match-1", "match-2"),
+            status="committed",
+        ),
+        LiveChampionshipPairing(
+            round_number=1,
+            round_pairing_number=2,
+            pairing_number=2,
+            players=("Carol", "Dora"),
+            winner="Dora",
+            series_id="series-2",
+            match_ids=("match-3", "match-4"),
+            status="committed",
+        ),
+        LiveChampionshipPairing(
+            round_number=2,
+            round_pairing_number=1,
+            pairing_number=3,
+            players=("Alice", "Dora"),
+            winner="Alice",
+            series_id="series-3",
+            match_ids=("match-5", "match-6"),
+            status="committed",
+        ),
+    )
+    bracket = LiveChampionshipBracket(
+        championship_id="championship-1",
+        player_count=4,
+        round_count=2,
+        pairing_count=3,
+        champion="Alice",
+        pairings=pairings,
+    )
+    summary = LiveMatchSummary(
+        live_id="live-championship",
+        mode="championship",
+        status="completed",
+        game="math_quiz",
+        players=roster,
+        started_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=1),
+        event_count=25,
+        round_number=2,
+        round_count=2,
+        round_pairing_number=1,
+        round_pairing_count=1,
+        pairing_number=3,
+        pairing_count=3,
+        leg_number=2,
+        championship_bracket=bracket,
+        final_kind="championship",
+        final_id="championship-1",
+        final_match_ids=tuple(
+            match_id for pairing in pairings for match_id in pairing.match_ids
+        ),
+    )
+    context = LiveChampionshipContext(
+        round_number=1,
+        round_count=2,
+        round_pairing_number=1,
+        round_pairing_count=2,
+        pairing_number=1,
+        pairing_count=3,
+        leg_number=2,
+    )
+    pairing_event = LivePairingCompletedItem(
+        seq=8,
+        context=context,
+        pairing=pairings[0].model_copy(update={"status": "provisional"}),
+    )
+    committed_event = LiveRoundCommittedItem(
+        seq=17,
+        context=context.model_copy(update={"round_pairing_number": 2, "pairing_number": 2}),
+        pairing_numbers=(1, 2),
+    )
+
+    assert summary.championship_bracket.champion == "Alice"
+    assert pairing_event.kind == "pairing_completed"
+    assert committed_event.kind == "round_committed"
+
+    detail = LiveMatchDetail(
+        match=summary,
+        events=(pairing_event, committed_event.model_copy(update={"seq": 9})),
+        next_seq=10,
+        has_more=True,
+    )
+    assert detail.events[0].kind == "pairing_completed"
+
+    with pytest.raises(ValidationError):
+        LiveMatchSummary.model_validate(
+            summary.model_dump(mode="python")
+            | {
+                "championship_bracket": bracket.model_copy(
+                    update={
+                        "pairings": (
+                            *pairings[:2],
+                            pairings[2].model_copy(update={"players": ("Bob", "Dora")}),
+                        )
+                    }
+                )
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        LiveMatchSummary.model_validate(
+            summary.model_dump(mode="python")
+            | {
+                "status": "running",
+                "final_kind": None,
+                "final_id": None,
+                "final_match_ids": (),
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        LiveMatchSummary.model_validate(
+            summary.model_dump(mode="python")
+            | {
+                "round_number": 1,
+                "round_pairing_number": 1,
+                "round_pairing_count": 2,
+                "pairing_number": 1,
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        LiveMatchSummary(
+            live_id="live-skipped-bracket",
+            mode="championship",
+            status="running",
+            game="math_quiz",
+            players=roster,
+            started_at=STAMP,
+            updated_at=STAMP + timedelta(seconds=1),
+            event_count=1,
+            round_number=2,
+            round_count=2,
+            round_pairing_number=1,
+            round_pairing_count=1,
+            pairing_number=3,
+            pairing_count=3,
+            leg_number=2,
+            championship_bracket=LiveChampionshipBracket(
+                championship_id="championship-skipped",
+                player_count=4,
+                round_count=2,
+                pairing_count=3,
+            ),
+        )
+
+    wrong_start = PublicEvent.from_event(
+        _event(
+            EventType.MATCH_STARTED,
+            {
+                "game": "math_quiz",
+                "seed": 1,
+                "players": ({"name": "Carol"}, {"name": "Dora"}),
+                "game_config": {"rounds": 1},
+            },
+        )
+    )
+    with pytest.raises(ValidationError):
+        LiveMatchDetail(
+            match=summary,
+            events=(
+                LiveEventItem(
+                    seq=0,
+                    context=LiveEventContext(
+                        round_number=1,
+                        round_count=2,
+                        round_pairing_number=1,
+                        round_pairing_count=2,
+                        pairing_number=1,
+                        pairing_count=3,
+                        leg_number=1,
+                        match_event_seq=0,
+                    ),
+                    event=wrong_start,
+                ),
+            ),
+            next_seq=1,
+            has_more=True,
+        )
+
+    with pytest.raises(ValidationError):
+        LiveMatchDetail(
+            match=summary,
+            events=(
+                pairing_event.model_copy(
+                    update={
+                        "pairing": pairing_event.pairing.model_copy(
+                            update={"series_id": "series-tampered"}
+                        )
+                    }
+                ),
+            ),
+            next_seq=9,
+            has_more=True,
+        )
+
+    play_summary = LiveMatchSummary(
+        live_id="live-play",
+        mode="play",
+        status="running",
+        game="math_quiz",
+        players=("Alice", "Bob"),
+        started_at=STAMP,
+        updated_at=STAMP + timedelta(seconds=1),
+        event_count=10,
+    )
+    with pytest.raises(ValidationError):
+        LiveMatchDetail(
+            match=play_summary,
+            events=(committed_event.model_copy(update={"seq": 9}),),
+            next_seq=10,
+            has_more=False,
+        )
+
+    with pytest.raises(ValidationError):
+        LiveChampionshipPairing(
+            round_number=1,
+            round_pairing_number=1,
+            pairing_number=1,
+            players=("Alice", "Bob\u202e"),
+            winner="Alice",
+            series_id="series-unsafe",
+            match_ids=("match-safe-1", "match-safe-2"),
+            status="provisional",
         )
 
 

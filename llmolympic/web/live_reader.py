@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from llmolympic.live import (
     LIVE_DEFAULT_PAGE_LIMIT,
@@ -32,7 +32,12 @@ from llmolympic.live import (
     LIVE_SCHEMA_VERSION,
     derive_live_database_path,
 )
-from llmolympic.web.models import LiveEventItem, LiveMatchDetail, LiveMatchSummary
+from llmolympic.web.models import (
+    LiveChampionshipBracket,
+    LiveMatchDetail,
+    LiveMatchSummary,
+    LiveStreamItem,
+)
 
 _BUSY_TIMEOUT_MS = 250
 _PROGRESS_CALLBACK_STEPS = 1_000
@@ -40,14 +45,15 @@ _MAX_QUERY_VM_STEPS = 1_000_000
 _MAX_METADATA_BYTES = 1024 * 1024
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _SAFE_GAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-_VALID_MODES = frozenset({"play", "series", "round_robin"})
+_VALID_MODES = frozenset({"play", "series", "round_robin", "championship"})
 _VALID_STATUSES = frozenset({"running", "completed", "interrupted"})
-_VALID_FINAL_KINDS = frozenset({"match", "series", "tournament"})
+_VALID_FINAL_KINDS = frozenset({"match", "series", "tournament", "championship"})
+_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 _SAFE_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _BIDI_CONTROL_CHARACTERS = frozenset(
     "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 )
-_REQUIRED_COLUMNS = {
+_BASE_REQUIRED_COLUMNS = {
     "live_sessions": {
         "live_id",
         "schema_version",
@@ -77,6 +83,15 @@ _REQUIRED_COLUMNS = {
         "event_json",
     },
 }
+_REQUIRED_COLUMNS_BY_VERSION = {
+    1: _BASE_REQUIRED_COLUMNS,
+    2: {
+        **_BASE_REQUIRED_COLUMNS,
+        "live_sessions": _BASE_REQUIRED_COLUMNS["live_sessions"]
+        | {"championship_bracket_json"},
+    },
+}
+_LIVE_STREAM_ITEM_ADAPTER = TypeAdapter(LiveStreamItem)
 
 
 class LiveReadError(RuntimeError):
@@ -209,17 +224,22 @@ def _final_match_ids(raw: object) -> tuple[str, ...]:
 
 
 def _current_context(raw: object) -> dict[str, int | None]:
-    if raw is None:
-        return {"pairing_number": None, "pairing_count": None, "leg_number": None}
-    value = _json_value(raw)
-    if not isinstance(value, dict) or set(value) - {
+    fields = (
         "pairing_number",
         "pairing_count",
         "leg_number",
-    }:
+        "round_number",
+        "round_count",
+        "round_pairing_number",
+        "round_pairing_count",
+    )
+    if raw is None:
+        return dict.fromkeys(fields)
+    value = _json_value(raw)
+    if not isinstance(value, dict) or set(value) - set(fields):
         raise LiveReadError("live_invalid")
     result: dict[str, int | None] = {}
-    for field in ("pairing_number", "pairing_count", "leg_number"):
+    for field in fields:
         item = value.get(field)
         if item is not None and (
             isinstance(item, bool) or not isinstance(item, int) or item < 1
@@ -231,7 +251,22 @@ def _current_context(raw: object) -> dict[str, int | None]:
     return result
 
 
-def _summary_from_row(row: Mapping[str, object], *, now: float) -> LiveMatchSummary:
+def _championship_bracket(raw: object) -> LiveChampionshipBracket | None:
+    if raw is None:
+        return None
+    value = _json_value(raw)
+    try:
+        return LiveChampionshipBracket.model_validate(value)
+    except (TypeError, ValueError, ValidationError, RecursionError):
+        raise LiveReadError("live_invalid") from None
+
+
+def _summary_from_row(
+    row: Mapping[str, object],
+    *,
+    now: float,
+    database_schema_version: int,
+) -> LiveMatchSummary:
     live_id = _safe_identifier(row["live_id"])
     mode = row["mode"]
     status = row["status"]
@@ -261,7 +296,13 @@ def _summary_from_row(row: Mapping[str, object], *, now: float) -> LiveMatchSumm
         raise LiveReadError("live_invalid")
     if not created_at <= updated_at or not created_at <= heartbeat_at:
         raise LiveReadError("live_invalid")
-    if row["schema_version"] != LIVE_SCHEMA_VERSION:
+    row_schema_version = row["schema_version"]
+    if (
+        isinstance(row_schema_version, bool)
+        or not isinstance(row_schema_version, int)
+        or row_schema_version not in _SUPPORTED_SCHEMA_VERSIONS
+        or row_schema_version > database_schema_version
+    ):
         raise LiveReadError("live_invalid")
     owner_digest = row["owner_token_digest"]
     if not isinstance(owner_digest, bytes) or len(owner_digest) != 32:
@@ -273,6 +314,11 @@ def _summary_from_row(row: Mapping[str, object], *, now: float) -> LiveMatchSumm
     final_id = _safe_identifier(row["final_id"], nullable=True)
     final_match_ids = _final_match_ids(row["final_match_ids_json"])
     context = _current_context(row["current_context_json"])
+    bracket = (
+        _championship_bracket(row["championship_bracket_json"])
+        if row_schema_version == 2
+        else None
+    )
     interruption_code = row["interruption_code"]
     if interruption_code is not None and (
         not isinstance(interruption_code, str)
@@ -323,6 +369,11 @@ def _summary_from_row(row: Mapping[str, object], *, now: float) -> LiveMatchSumm
             pairing_number=context["pairing_number"],
             pairing_count=context["pairing_count"],
             leg_number=context["leg_number"],
+            round_number=context["round_number"],
+            round_count=context["round_count"],
+            round_pairing_number=context["round_pairing_number"],
+            round_pairing_count=context["round_pairing_count"],
+            championship_bracket=bracket,
             final_kind=final_kind,
             final_id=final_id,
             final_match_ids=final_match_ids,
@@ -383,12 +434,17 @@ class LiveSQLiteReader:
             raise LiveReadError(_sqlite_error_code(exc, "live_unavailable")) from None
 
     @staticmethod
-    def _verify_schema(connection: sqlite3.Connection) -> None:
+    def _verify_schema(connection: sqlite3.Connection) -> int:
         try:
             row = connection.execute("PRAGMA user_version").fetchone()
-            if row is None or row[0] != LIVE_SCHEMA_VERSION:
+            if (
+                row is None
+                or row[0] not in _SUPPORTED_SCHEMA_VERSIONS
+                or LIVE_SCHEMA_VERSION != 2
+            ):
                 raise LiveReadError("live_unavailable")
-            for table, expected_columns in _REQUIRED_COLUMNS.items():
+            version = int(row[0])
+            for table, expected_columns in _REQUIRED_COLUMNS_BY_VERSION[version].items():
                 object_row = connection.execute(
                     "SELECT type FROM sqlite_schema WHERE name = ?", (table,)
                 ).fetchone()
@@ -400,18 +456,19 @@ class LiveSQLiteReader:
                 }
                 if not expected_columns.issubset(columns):
                     raise LiveReadError("live_unavailable")
+            return version
         except LiveReadError:
             raise
         except sqlite3.Error as exc:
             raise LiveReadError(_sqlite_error_code(exc, "live_unavailable")) from None
 
     @contextmanager
-    def _snapshot(self) -> Iterator[sqlite3.Connection]:
+    def _snapshot(self) -> Iterator[tuple[sqlite3.Connection, int]]:
         connection = self._open()
         try:
             connection.execute("BEGIN")
-            self._verify_schema(connection)
-            yield connection
+            version = self._verify_schema(connection)
+            yield connection, version
         except LiveReadError:
             raise
         except sqlite3.Error as exc:
@@ -434,10 +491,17 @@ class LiveSQLiteReader:
             parameters.append(game)
         sql += " ORDER BY updated_at DESC, live_id DESC LIMIT ?"
         parameters.append(limit)
-        with self._snapshot() as connection:
+        with self._snapshot() as (connection, schema_version):
             rows = connection.execute(sql, parameters).fetchall()
         now = self._now()
-        return [_summary_from_row(row, now=now) for row in rows]
+        return [
+            _summary_from_row(
+                row,
+                now=now,
+                database_schema_version=schema_version,
+            )
+            for row in rows
+        ]
 
     def load_live(
         self,
@@ -451,13 +515,18 @@ class LiveSQLiteReader:
         limit = _validate_limit(limit, maximum=LIVE_MAX_PAGE_LIMIT)
         if not self._path.is_file():
             raise LiveReadError("live_not_found")
-        with self._snapshot() as connection:
+        with self._snapshot() as (connection, schema_version):
             row = connection.execute(
                 "SELECT * FROM live_sessions WHERE live_id = ?", (live_id,)
             ).fetchone()
             if row is None:
                 raise LiveReadError("live_not_found")
-            summary = _summary_from_row(row, now=self._now())
+            summary = _summary_from_row(
+                row,
+                now=self._now(),
+                database_schema_version=schema_version,
+            )
+            row_schema_version = int(row["schema_version"])
             if from_seq > summary.event_count:
                 raise LiveReadError("invalid_from_seq")
             event_rows = connection.execute(
@@ -489,7 +558,7 @@ class LiveSQLiteReader:
             or aggregate["total_bytes"] != row["event_bytes"]
         ):
             raise LiveReadError("live_invalid")
-        items: list[LiveEventItem] = []
+        items: list[LiveStreamItem] = []
         for expected_seq, event_row in enumerate(event_rows, start=from_seq):
             seq = _nonnegative_integer(event_row["seq"])
             created_at = _epoch_datetime(event_row["created_at"])
@@ -501,8 +570,12 @@ class LiveSQLiteReader:
             ):
                 raise LiveReadError("live_invalid")
             payload = _event_json_value(event_row["event_json"], expected_bytes=event_bytes)
+            if row_schema_version == 1 and isinstance(payload, dict):
+                if "kind" in payload:
+                    raise LiveReadError("live_invalid")
+                payload = {"kind": "match_event", **payload}
             try:
-                item = LiveEventItem.model_validate(payload)
+                item = _LIVE_STREAM_ITEM_ADAPTER.validate_python(payload)
             except (TypeError, ValueError, ValidationError, RecursionError):
                 raise LiveReadError("live_invalid") from None
             if item.seq != seq:
