@@ -244,7 +244,7 @@ function championshipPreview({ frozen }) {
     pairing_count: 3,
     player_count: 4,
     prepared_profiles: [],
-    rated: true,
+    rated: false,
     requires_provider_budget: false,
     uses_frozen_budget: false,
     warnings: frozen ? ["resume_uses_frozen_configuration"] : [],
