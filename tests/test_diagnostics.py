@@ -59,7 +59,7 @@ def test_version_has_one_literal_source_and_cli_matches_installed_metadata() -> 
     assert project["project"]["dynamic"] == ["version"]
     assert "version" not in project["project"]
     assert project["tool"]["hatch"]["version"]["path"] == "llmolympic/__init__.py"
-    assert metadata["Version"] == __version__ == "0.10.0"
+    assert metadata["Version"] == __version__ == "0.11.0"
     assert project["project"]["license"] == "MIT"
     assert project["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
     assert metadata["License-Expression"] == "MIT"
@@ -96,7 +96,7 @@ def test_release_documents_match_package_version() -> None:
     assert f"`llmolympic-{__version__}.tar.gz`" in readme
 
     changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
-    assert f"## [{__version__}] - 2026-08-25" in changelog
+    assert f"## [{__version__}] - 2026-08-26" in changelog
     assert changelog.index("## [Unreleased]") < changelog.index(f"## [{__version__}]")
 
     supported_series = ".".join(__version__.split(".")[:2])

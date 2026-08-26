@@ -366,10 +366,11 @@ CLI                  React / REST / WebSocket
    原子追加已完成的子双局赛 prefix；`llmolympic championship --resume` 从最后完整
    轮边界恢复，跨进程 runner lease 单写者互斥，恢复时校验项目配置、选手描述与冻结
    评审团快照，只运行未完成轮次，完成后在最终事务内封存正式档案与全部子双局赛（仍
-   不计分）。4.6 预算增量（SQLite v11）再为锦标赛加入与 checkpoint 原子创建、跨进程恢复
-   不重置、runner generation fencing、接管保守清算及最终事务封存的 Provider 硬预算 ✅；
-   命名 Profile 运行必须显式启用预算，历史无预算 Profile checkpoint 安全拒绝。4.6 Web
-   增量再以 control schema v2 把 4/8/16 人锦标赛的新建、停止、显式恢复和最终档案引用接入
+   不计分）。4.6 预算增量（v0.11.0 / SQLite v11）再为锦标赛加入与 checkpoint 原子创建、
+   跨进程恢复不重置、runner generation fencing、接管保守清算及最终事务封存的 Provider
+   硬预算 ✅；命名 Profile 运行必须显式启用预算，历史无预算 Profile checkpoint 安全拒绝。
+   同一版本的 4.6 Web 增量再以 control schema v2 把 4/8/16 人锦标赛的新建、停止、显式恢复
+   和最终档案引用接入
    本机管理页 ✅；Live schema v2 提供带规范轮次/对阵上下文的公开事件、provisional 对阵、
    整轮 committed 确认、可重连的服务端物化赛程和冠军结果 ✅。恢复预览只读核对 checkpoint、
    活动 lease、冻结配置、Profile 安全投影与持久预算，浏览器不能覆盖赛事合同。控制面仍只

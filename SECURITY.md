@@ -4,21 +4,23 @@
 
 | 版本 | 安全修复 |
 | --- | --- |
-| `0.10.x` | 支持 |
+| `0.11.x` | 支持 |
 | `main` | 支持（下一版本开发线） |
-| `<0.10.0`、历史提交和其他功能分支 | 不支持 |
+| `<0.11.0`、历史提交和其他功能分支 | 不支持 |
 
-`0.10.x` 发布线和 `main` 分支会接收安全修复。发布线以最新补丁版本为准；历史提交和
+`0.11.x` 发布线和 `main` 分支会接收安全修复。发布线以最新补丁版本为准；历史提交和
 未合并功能分支不单独维护。
 
-LLM Olympics 以本地 CLI 为主，并提供仅绑定回环地址的观战页及 capability 限定的人类参与页。模型服务返回值、
-模型名称、导入数据和存档内容都应视为不可信输入；不要以高权限账户运行，也不要把 CLI
-或当前没有认证与 TLS 的 Web API 直接暴露为局域网、公网或多租户网络服务。
+LLM Olympics 以本地 CLI 为主，并提供仅绑定回环地址的观战页、capability 限定的人类参与页
+及 admin capability 限定的比赛控制台。模型服务返回值、模型名称、导入数据和存档内容都应
+视为不可信输入；不要以高权限账户运行，也不要把 CLI 或当前没有认证与 TLS 的 Web API 直接
+暴露为局域网、公网或多租户网络服务。
 
-Web API 使用独立的 SQLite 只读连接，不创建或迁移主档案数据库或实时事件 sidecar。运行中
-事件由比赛进程以权限 `0600` 的独立 sidecar 后台发布；sidecar 在写入前即使用与 Web DTO
-相同的字段白名单，发布失败只会关闭直播，不会改变比赛、预算、ELO 或存档。Web 只公开
-白名单展示字段，并拒绝跨源 WebSocket。
+观战、回放和恢复预览对主档案数据库与实时事件 sidecar 只使用独立的 SQLite `mode=ro` /
+`query_only` 连接，不创建、迁移或修改它们；Web 可写状态严格限于下述 input/jobs sidecar，
+FastAPI 不直接打开主档案写连接。运行中事件由比赛进程以权限 `0600` 的独立 sidecar 后台发布；
+sidecar 在写入前即使用与 Web DTO 相同的字段白名单，发布失败只会关闭直播，不会改变比赛、
+预算、ELO 或存档。Web 只公开白名单展示字段，并拒绝跨源 WebSocket。
 
 阶段 4.4/4.5a 的 Web 写权限严格限于独立 `*.input.db`：比赛进程为每名浏览器 Human 显式
 创建独立的 `play` 席位，浏览器再用 URL fragment 交付的 256-bit capability 对对应席位的
@@ -36,23 +38,41 @@ Web API 使用独立的 SQLite 只读连接，不创建或迁移主档案数据�
 Bearer admin capability；改变状态的请求还要求精确同源 Origin、严格 JSON、体积上限和
 幂等键。jobs sidecar 只保存脱敏的不可变比赛配置、准备态摘要、任务状态、子进程引用和最终档案
 引用，不保存 jobs 租约。权限为 `0600` 的独立 manager lock 文件提供单控制器互斥；它不代表
-任务存活性，也不替代循环赛 checkpoint 的 runner lease。Web 服务或受控 worker 运行时不得删除
-jobs sidecar 或 manager lock；两者在服务和 worker 全部停止后可删除并按需重建，不是正式档案。
+任务存活性，也不替代循环赛或锦标赛 checkpoint 的 runner lease。Web 服务或受控 worker
+运行时不得删除 jobs sidecar 或 manager lock；两者在服务和 worker 全部停止后可删除并按需
+重建，不是正式档案。
 
 浏览器控制面只能选择内置 Human/mock 或预先配置的 Profile ID，不能提供 API Key、环境变量
-名、base URL、数据库路径、shell 命令或任意模型覆盖。比赛通过 `shell=False` 的固定参数受控
-worker 运行；FastAPI 不直接调用 Provider，也不写正式档案/ELO。prepare 会保存受信 Profile 的
-无凭据安全投影，并以配置摘要绑定 Profile ID、Provider、endpoint、默认模型和凭据环境变量名。
-控制器在生成 child 环境时复核摘要，child 又在构造 Provider 前独立复核；任一处变化都会在
-调用或计费前安全失败。Profile 还必须在启动前确认凭据就绪，并具备硬调用/Token/费用预算；
-准备态不会构造或调用 Provider。worker 中断后的 `play`/`series` 不自动重跑。循环赛只允许
-显式恢复：未过期的 runner lease 仍在活动时拒绝恢复；Web 只接受全 Mock 且无预算的
-checkpoint，或者只含命名 Profile、并已有冻结硬预算的 checkpoint。旧式直接 Provider
-checkpoint 不具备可绑定的 Profile 配置身份，只能继续从 CLI 恢复。
+名、base URL、数据库路径、shell 命令或任意模型覆盖。prepare 只验证请求并保存不可变准备态、
+工作量预览和受信 Profile 的无凭据安全投影，不构造或调用 Provider；配置摘要绑定 Profile ID、
+Provider、endpoint、默认模型和凭据环境变量名。start 必须经过第二次确认，重新核对精确预览与
+Profile 摘要，再以 `shell=False` 的固定参数和最小化环境启动独立 CLI worker。控制器在生成
+child 环境时复核摘要，child 又在构造 Provider 前独立复核；任一处变化都会在调用或计费前安全
+失败。Profile 还必须在启动前确认凭据就绪，并具备调用、输入 Token、单次输出、总输出和估算
+费用的完整硬上限。FastAPI 不直接调用 Provider，也不写正式档案、预算或 ELO。
 
-自 v0.10.0 起，锦标赛 checkpoint/resume 只提供 CLI 入口；阶段 4.5b 的 Web 控制面尚不
-接受 `championship`，实时直播 sidecar 也尚未扩展到该模式。这不会改变现有 loopback、
-admin capability、Profile 冻结与正式档案事务边界。
+worker 中断后的 `play`/`series` 不自动重跑。循环赛和锦标赛只允许显式恢复：resume 请求只能
+携带对应 checkpoint ID，不能携带新配置或预算；未过期的对应 runner lease 仍在活动时拒绝恢复。
+Web 只接受全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已有冻结硬预算的
+checkpoint；恢复只使用 SQLite 中冻结的 policy、路由价格和输出上限，当前配置不能覆盖。
+旧式直接 Provider checkpoint 不具备可绑定的 Profile 配置身份，只能继续从 CLI 恢复。
+
+自 v0.11.0 起，本机控制面可准备、确认启动、停止 4/8/16 名非人类选手的锦标赛，并显式恢复
+满足完整 checkpoint、runner lease、冻结 Profile 和持久预算约束的中断锦标赛。新建的 Profile
+锦标赛会在首次 Provider 调用前原子创建空 checkpoint 与冻结预算；恢复预览只读核对持久状态，
+浏览器不能覆盖项目、选手、seed、超时、评审团或预算。锦标赛 runner lease 以摘要、generation
+和到期时间提供排他所有权；心跳维持活动 generation，过期接管会提升 generation，checkpoint、
+预算与最终封存都拒绝旧 generation 写入。接管时释放旧执行者尚未调度的预留，已调度但无法确认
+用量的 Provider 请求按完整上界保守记账。
+
+stop 对准备态任务直接取消；对活动 worker，POSIX 上只终止该任务拥有的进程组，并按 SIGINT、
+SIGTERM、SIGKILL 做有界升级，其他平台则对直接子进程 best-effort terminate/kill。操作幂等但
+属于 best effort，不能撤回已经 dispatch 的 Provider 请求，也不保证停止后不会产生相应费用；
+中断锦标赛只保留最后完整整轮 checkpoint。Live schema v2 只把
+双局结果先发布为 provisional；整轮 checkpoint 事务成功后才发布 committed 确认，最终档案事务
+成功后才公开冠军和档案链接。比赛进程是 Live sidecar 的唯一写者，Web 只读；直播失败不会改变
+比赛、预算、ELO 或档案。浏览器仍不能直接调用 Provider，也不能直接写主档案、预算或 ELO；
+这些操作继续由显式 start 后的固定参数 CLI worker 持有。
 
 React 页面把选手名、题面、提交和失败原因作为纯文本渲染；页面 CSP 只允许同源静态资源和
 精确同源 WebSocket，API 响应继续禁止加载任何内容。若未来需要远程访问，
