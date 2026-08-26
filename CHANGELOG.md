@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-26
+
 - SQLite schema 升级至 v11：在通过 v10 精确 manifest 审计后，事务性重建
   `provider_budgets`，新增唯一 `championship_id` 外键，并保证一份预算至多属于循环赛或
   锦标赛中的一种。既有循环赛与独立预算、调用尝试及整数累计值原样保留；迁移失败会整体

@@ -7,12 +7,12 @@
 
 ### GitHub Release
 
-v0.10.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
+v0.11.0 通过 GitHub Release 提供 Python wheel，可直接从发布地址安装：
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install \
-  https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl
+  https://github.com/zhenghu/llmolympic/releases/download/v0.11.0/llmolympic-0.11.0-py3-none-any.whl
 ```
 
 安装后可核对版本并检查本地运行环境；`doctor` 不会连接模型服务或显示 API Key：
@@ -23,7 +23,7 @@ llmolympic doctor
 llmolympic games
 ```
 
-本次 v0.10.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
+本次 v0.11.0 的发布范围是 GitHub Release，不包含 PyPI 发布或独立 macOS 应用包。
 wheel 提供 `llmolympic` 命令；双击启动器 `play.command`、`championship.command`、
 `start_web.command` 和 `stop_web.command` 随源码仓库和 GitHub 自动生成的源码归档提供，不包含在
 wheel 中。
@@ -323,13 +323,13 @@ llmolympic archive <MATCH_OR_SERIES_OR_TOURNAMENT_OR_CHAMPIONSHIP_ID>
 
 阶段 4.2 自 v0.5.0 起随正式 wheel/sdist 发布；阶段 4.3/4.4 自 v0.6.0 起在此基础上加入
 运行中事件 broker 与单个本机浏览器人类输入；阶段 4.5a/4.5b 自 v0.7.0 起加入多席位
-本机浏览器参与与本机全 Web 控制台。当前 Unreleased 源码继续把 4/8/16 人单淘汰锦标赛的
-创建、恢复、实时赛程和冠军结果接入同一控制台。Web 服务端依赖仍通过可选的
+本机浏览器参与与本机全 Web 控制台。自 v0.11.0 起，4/8/16 人单淘汰锦标赛的创建、恢复、
+实时赛程和冠军结果也接入同一控制台。Web 服务端依赖仍通过可选的
 `web` extra 安装；若上面只安装了基础 wheel，可使用同一发布资产补齐依赖：
 
 ```bash
 python -m pip install \
-  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.10.0/llmolympic-0.10.0-py3-none-any.whl"
+  "llmolympic[web] @ https://github.com/zhenghu/llmolympic/releases/download/v0.11.0/llmolympic-0.11.0-py3-none-any.whl"
 ```
 
 安装后可以打开本机 Web 服务。正式存档和实时 sidecar 对 Web 进程始终只读；只有持席位
@@ -580,12 +580,12 @@ Provider 请求在线程中开始后无法被 Python 强制终止，因此极端
 跨进程 runner lease 会阻止两个执行者同时保存进度或封存同一锦标赛。全部轮次完成后，
 正式锦标赛、配对和子双局赛才在最终事务中一起封存。
 
-当前源码的 SQLite v11 还会把新锦标赛的冻结 Provider 预算与空 checkpoint 原子创建；
+自 v0.11.0 起，SQLite v11 还会把新锦标赛的冻结 Provider 预算与空 checkpoint 原子创建；
 参赛者和创意评委共享同一持久账本，恢复只读取数据库中的冻结限额、路由价格和单次输出上限。
 runner generation 同时 fencing 预算调用：接管时，旧执行者未调度的预留会释放，已经调度但
 无法确认用量的调用按完整上界计费。命名 Profile 参赛者或评委必须显式启用硬预算；历史上
 缺少预算账本的 Profile checkpoint 会在重建 Provider 前安全拒绝，全 Mock 无预算 checkpoint
-仍可恢复。当前 Unreleased 源码还可在本机 Web 管理页新建或显式恢复锦标赛；页面先生成
+仍可恢复。同一版本还可在本机 Web 管理页新建或显式恢复锦标赛；页面先生成
 不可变准备态和工作量预览，确认后才启动同一个 `llmolympic championship` CLI worker。
 Live schema v2 将每个双局对阵先显示为 provisional，只有整轮 checkpoint 事务成功后才把
 该轮标为 committed；浏览器重连时以服务端物化赛程为准，不从客户端可见名称猜测晋级者，
@@ -765,8 +765,8 @@ CI 与 Release 仍会分别从 wheel 和 sdist 运行零费用的三 mock 评委
 
 每个正式 GitHub Release 提供以下可校验资产：
 
-- `llmolympic-0.10.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
-- `llmolympic-0.10.0.tar.gz`：Python 源码发行包（sdist）。
+- `llmolympic-0.11.0-py3-none-any.whl`：Python 3.11 及以上版本的通用 wheel。
+- `llmolympic-0.11.0.tar.gz`：Python 源码发行包（sdist）。
 - `SHA256SUMS`：上述 wheel 与 sdist 的 SHA-256 校验和。
 
 GitHub 页面还会自动生成仓库源码的 zip/tar.gz 快照；它们与 Python sdist 是不同文件。
