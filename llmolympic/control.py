@@ -1,9 +1,9 @@
 """Local, capability-gated Web job control primitives.
 
 The control plane intentionally stores only normalized, disclosure-safe job
-specifications.  Provider credentials stay in the Web process environment and
-the official archive/ELO database remains owned by the existing competition
-commands executed in a fixed-argument child process.
+specifications.  Provider credentials remain volatile in controller memory and
+are copied only to the selected fixed-argument child process environment.  The
+official archive/ELO database remains owned by the existing competition commands.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import re
 import sqlite3
 import stat
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -28,6 +28,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -55,6 +56,7 @@ PREPARED_JOB_RETENTION_SECONDS = 30 * 60
 MAX_UNCONFIRMED_TOURNAMENT_MATCHES = 30
 MAX_UNCONFIRMED_TOURNAMENT_PROVIDER_CALLS = 5_000
 TOURNAMENT_MOVE_ATTEMPTS = 3
+MAX_PROFILE_API_KEY_BYTES = 8 * 1024
 
 ControlMode = Literal["play", "series", "round_robin", "championship"]
 ControlJobStatus = Literal[
@@ -69,6 +71,7 @@ ControlJobStatus = Literal[
     "interrupted",
 ]
 ControlFinalKind = Literal["match", "series", "tournament", "championship"]
+ProfileCredentialReady = Callable[[ProviderProfile], bool]
 ControlFailureCode = Literal[
     "controller_restarted",
     "worker_failed",
@@ -507,6 +510,24 @@ class ControlProfileInfo(_ControlModel):
     provider: Literal["openai", "ollama"]
     default_model: str | None
     credential_ready: bool
+
+
+class ControlProfileCredentialRequest(_ControlModel):
+    """One runtime-only credential accepted by the local admin control plane."""
+
+    api_key: SecretStr
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key(cls, value: SecretStr) -> SecretStr:
+        secret = value.get_secret_value()
+        if (
+            not secret
+            or len(secret.encode("utf-8")) > MAX_PROFILE_API_KEY_BYTES
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in secret)
+        ):
+            raise ValueError("api_key must contain printable ASCII without whitespace")
+        return value
 
 
 class ControlGameInfo(_ControlModel):
@@ -1255,11 +1276,16 @@ class JobStore:
         return self.get(job_id)
 
 
-def _profile_ready(profile: ProviderProfile) -> bool:
+def _profile_ready(
+    profile: ProviderProfile,
+    credential_ready: ProfileCredentialReady | None = None,
+) -> bool:
     if not profile.default_model:
         return False
     if profile.provider == "ollama":
         return True
+    if credential_ready is not None:
+        return bool(credential_ready(profile))
     return bool(profile.api_key_env and os.environ.get(profile.api_key_env))
 
 
@@ -1321,7 +1347,10 @@ def _prepared_profile(
         raise ControlError("profile_unavailable") from exc
 
 
-def control_catalog() -> ControlCatalogResponse:
+def control_catalog(
+    *,
+    credential_ready: ProfileCredentialReady | None = None,
+) -> ControlCatalogResponse:
     try:
         profiles = load_profiles()
     except (OSError, TypeError, ValueError) as exc:
@@ -1332,7 +1361,7 @@ def control_catalog() -> ControlCatalogResponse:
             display_name=profile.display_name or profile.profile_id,
             provider=profile.provider,
             default_model=profile.default_model,
-            credential_ready=_profile_ready(profile),
+            credential_ready=_profile_ready(profile, credential_ready),
         )
         for profile in sorted(profiles.values(), key=lambda item: item.profile_id)
     )
@@ -1369,6 +1398,8 @@ def _reject_nonfinite_json(value: str) -> None:
 def _resume_preview(
     archive_database: str | Path,
     tournament_id: str,
+    *,
+    credential_ready: ProfileCredentialReady | None = None,
 ) -> ControlPreview:
     """Read and validate a checkpoint summary without mutating the archive DB."""
 
@@ -1540,7 +1571,7 @@ def _resume_preview(
         prepared_profiles: list[ControlPreparedProfile] = []
         for profile_id in sorted(profile_ids):
             profile = profiles.get(profile_id)
-            if profile is None or not _profile_ready(profile):
+            if profile is None or not _profile_ready(profile, credential_ready):
                 raise ControlError("profile_unavailable")
             prepared_profiles.append(
                 _prepared_profile(
@@ -1579,6 +1610,8 @@ def _resume_preview(
 def _resume_championship_preview(
     archive_database: str | Path,
     championship_id: str,
+    *,
+    credential_ready: ProfileCredentialReady | None = None,
 ) -> ControlPreview:
     """Read and validate one knockout checkpoint without mutating the archive DB."""
 
@@ -1860,7 +1893,7 @@ def _resume_championship_preview(
         prepared_profiles: list[ControlPreparedProfile] = []
         for profile_id in sorted(profile_ids):
             profile = profiles.get(profile_id)
-            if profile is None or not _profile_ready(profile):
+            if profile is None or not _profile_ready(profile, credential_ready):
                 raise ControlError("profile_unavailable")
             prepared_profiles.append(
                 _prepared_profile(
@@ -1907,17 +1940,23 @@ def validate_job_spec(
     spec: ControlJobSpec,
     *,
     archive_database: str | Path | None = None,
+    credential_ready: ProfileCredentialReady | None = None,
 ) -> ControlPreview:
     if spec.resume_tournament_id is not None:
         if archive_database is None:
             raise ControlError("resume_unavailable")
-        return _resume_preview(archive_database, spec.resume_tournament_id)
+        return _resume_preview(
+            archive_database,
+            spec.resume_tournament_id,
+            credential_ready=credential_ready,
+        )
     if spec.resume_championship_id is not None:
         if archive_database is None:
             raise ControlError("resume_unavailable")
         return _resume_championship_preview(
             archive_database,
             spec.resume_championship_id,
+            credential_ready=credential_ready,
         )
     profile_ids = sorted(
         {
@@ -1933,7 +1972,7 @@ def validate_job_spec(
     prepared_profiles: list[ControlPreparedProfile] = []
     for profile_id in profile_ids:
         profile = profiles.get(profile_id)
-        if profile is None or not _profile_ready(profile):
+        if profile is None or not _profile_ready(profile, credential_ready):
             raise ControlError("profile_unavailable")
         prepared_profiles.append(_prepared_profile(profile))
     if profile_ids and not spec.budget.is_complete_hard_limit():

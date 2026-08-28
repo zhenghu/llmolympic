@@ -23,6 +23,10 @@
 - 命名 Provider Profile 使用 `profile:<id>[:model]`；省略模型时读取 Profile 的
   `default_model`，稳定身份为 `profile:<id>:<model>`。Profile 只保存 provider、
   端点、模型、展示名和 API Key 环境变量名，不把凭据值写入选手描述或档案。
+- 本机 Web 管理页可为已配置 `api_key_env` 和 `default_model` 的 OpenAI Profile 提交一份
+  运行时 Key。它以 Profile ID 及全部无凭据 Profile 配置的摘要为索引，保存在 Web 控制器的
+  非持久运行时凭据库；启动对应 worker 时按需复制到其环境。它不会在摘要不同的配置上复用，
+  服务重启会清空。Profile 中的 `api_key_env` 启动路径仍然支持。
 - 没有 Profile 或显式 `entrant_id` 的兼容 Provider 调用，会以 provider、模型、
   展示名和安全采样参数生成确定性摘要；这种兼容身份重命名后会变化，需要跨名称
   延续身份时应使用命名 Profile 或显式 ID。
@@ -231,8 +235,9 @@ CLI                  React / REST / WebSocket
   时按 `unknown` 处理，不能把缺失字段解释成 `completed`。
 - **远程/手机端迁移路径**：公开事件协议可供新客户端复用，但当前服务只允许回环地址和
   可信本机操作者。跨设备前必须加入正式身份认证、席位/赛事授权、TLS、限流与审计；不能
-  通过反向代理直接暴露当前控制面。Provider 凭据仍只由受控 CLI worker 从本机环境读取，
-  不下发到浏览器；判分、计时、预算与正式存档都留在服务端执行。
+  通过反向代理直接暴露当前控制面。Provider Key 可由启动环境提供，或由本机管理页
+  短暂提交给 Web 进程；只有对应的受控 CLI worker 才在启动时获得它的环境副本。判分、
+  计时、预算与正式存档都留在服务端执行。
 
 ## 5. 题目来源与公平性
 
@@ -265,7 +270,9 @@ CLI                  React / REST / WebSocket
   项目配置、顺序敏感的选手描述、seed、超时和赛程；每完成一个双局对阵便以不计分
   prefix 原子追加到 checkpoint。恢复时核对 `Game.describe_config()` 与完整 Player
   descriptor，只运行未完成后缀；Profile 仅从检查点取得 ID 和已解析模型，API Key
-  始终从当前进程的环境变量重新获取，不进入 checkpoint、哈希或档案。
+  始终从 worker 自身环境重新获取，不进入 checkpoint、哈希或档案。Web 恢复由控制器把
+  临时 Key 注入恢复 worker 的对应环境；CLI 恢复直接读取启动环境。服务重启后必须重新
+  录入 Web Key 或提供匹配的环境变量才能恢复。
   全部完成后才在最终封存事务开始时读取并冻结当前 ELO，批量计算所有贡献，再在
   同一事务中封存正式赛事、系列、对局和评分历史；中断期间先落库的其他计分对局
   会先进入该基准分。这样可避免
@@ -302,8 +309,12 @@ CLI                  React / REST / WebSocket
   恢复仍由主库 checkpoint、冻结预算和 championship runner lease 判定。Live sidecar schema v2
   物化可重连赛程：双局对阵完成后先发布 provisional 结果，只有整轮 checkpoint 事务成功才
   发布 round-committed 并把该轮转为 committed，最终档案事务成功后才公开冠军和档案引用。
-  浏览器的管理写操作只推进 jobs sidecar，其余状态均消费公开 DTO；Provider 构造、调用、
+  浏览器的任务管理写操作只推进 jobs sidecar，其余状态均消费公开 DTO；Provider 构造、调用、
   主档案/预算写入与最终封存都由固定参数的独立 CLI worker 完成。
+- 控制器的运行时凭据库不序列化：浏览器提交的 Key 不进入配置、SQLite/jobs、URL、
+  Web Storage 或应用日志，启动 worker 时才按完整 Profile 摘要将所需 Key 路由到其
+  `api_key_env`。清除或服务停止会丢弃 Web 进程的引用，但不承诺物理内存擦除；清除
+  也不影响已启动 worker 的环境副本。需要立即中断时必须停止任务或在 Provider 端撤销 Key。
 
 ## 7. 技术栈
 
@@ -355,7 +366,9 @@ CLI                  React / REST / WebSocket
    恢复仍依赖主库 checkpoint 中的 runner lease：活动租约未过期时不可恢复；Web 只恢复
    全 Mock 无预算 checkpoint，或只含命名 Profile 且已有冻结硬预算的 checkpoint，旧式直接
    Provider checkpoint 仍走 CLI。正式存档/ELO 仍仅由
-   比赛 worker 经既有事务写入，网页不能提交命令、路径、凭据、endpoint 或任意模型配置。
+   比赛 worker 经既有事务写入；网页不能提交命令、路径、endpoint 或任意模型配置，
+   但可为已配置的 OpenAI Profile 录入/清除当前进程内 Key。Key 绑定完整 Profile 摘要，
+   仅在启动对应 worker 时按需复制到 child 环境；环境变量启动方式继续支持。
    该控制面仍只信任回环地址上的本机操作者，同一数据库最多一个活动 Web 任务，
    play/series 中断后不自动重跑。
    4.6（v0.9.0）以 `llmolympic championship` 提供单淘汰制锦标赛 ✅：4/8/16 名选手、每场交换
@@ -374,6 +387,7 @@ CLI                  React / REST / WebSocket
    本机管理页 ✅；Live schema v2 提供带规范轮次/对阵上下文的公开事件、provisional 对阵、
    整轮 committed 确认、可重连的服务端物化赛程和冠军结果 ✅。恢复预览只读核对 checkpoint、
    活动 lease、冻结配置、Profile 安全投影与持久预算，浏览器不能覆盖赛事合同。控制面仍只
-   信任回环地址上的本机操作者；浏览器不持有 Provider 凭据、不直接调用 Provider，也不写
-   主档案、预算或 ELO，固定参数 CLI worker 继续拥有这些操作。
+   信任回环地址上的本机操作者；浏览器只在录入/提交时短暂处理 Provider Key，不直接调用
+   Provider，也不写主档案、预算或 ELO，固定参数 CLI worker 继续拥有这些操作。admin capability
+   在 Key 就绪时可启动有预算的 Provider 调用，因此必须像密钥一样只交给可信本机操作者。
    后续切片可加入正式认证、席位授权与 TLS 的远程多席位使用；之后新增项目继续保持纯插件接入。

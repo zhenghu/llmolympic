@@ -230,19 +230,20 @@ def test_rest_rejects_cross_origin_bad_host_and_invalid_inputs(tmp_path: Path) -
 
     openapi = client.get("/openapi.json").json()
     allowed_write_paths = {
-        "/api/v1/control/jobs",
-        "/api/v1/control/jobs/{job_id}/cancel",
-        "/api/v1/control/jobs/{job_id}/start",
+        "/api/v1/control/jobs": {"post"},
+        "/api/v1/control/jobs/{job_id}/cancel": {"post"},
+        "/api/v1/control/jobs/{job_id}/start": {"post"},
+        "/api/v1/control/profiles/{profile_id}/credential": {"delete", "put"},
         (
             "/api/v1/participation/{session_id}/{seat_id}/requests/"
             "{request_id}/submissions"
-        ),
+        ): {"post"},
     }
     for path, path_item in openapi["paths"].items():
         for operation in path_item.values():
             assert "422" not in operation.get("responses", {})
         writes = {"post", "put", "patch", "delete"} & set(path_item)
-        assert writes == ({"post"} if path in allowed_write_paths else set())
+        assert writes == allowed_write_paths.get(path, set())
     assert "HTTPValidationError" not in openapi.get("components", {}).get("schemas", {})
 
 

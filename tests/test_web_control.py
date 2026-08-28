@@ -18,6 +18,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from llmolympic import control
+from llmolympic.config import ProviderProfile
 from llmolympic.core.player import LLMPlayer
 from llmolympic.core.storage import SQLiteStore
 from llmolympic.core.tournament import prepare_round_robin
@@ -125,6 +126,222 @@ def _resume_payload(tournament_id: str) -> dict[str, object]:
         "rounds": None,
         "seed": "0",
     }
+
+
+def _profile_prepare_payload(profile_id: str) -> dict[str, object]:
+    payload = _valid_prepare_payload()
+    payload["players"][0] = {"kind": "profile", "profile_id": profile_id}
+    payload["budget"] = {
+        "max_estimated_cost_usd": "0",
+        "max_input_tokens": "200000",
+        "max_output_tokens_per_call": "4096",
+        "max_provider_calls": "64",
+        "max_total_output_tokens": "65536",
+    }
+    return payload
+
+
+def test_runtime_profile_credential_requires_admin_same_origin_and_never_echoes_secret(
+    tmp_path: Path,
+    client_factory: Callable[[Path], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "runtime-credential.db"
+    profile = ProviderProfile(
+        profile_id="browser-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="BROWSER_PROFILE_KEY",
+        display_name="Browser profile",
+    )
+    ollama = ProviderProfile(
+        profile_id="local-profile",
+        provider="ollama",
+        default_model="local-model",
+        base_url="http://127.0.0.1:11434",
+    )
+    profiles = {profile.profile_id: profile, ollama.profile_id: ollama}
+    monkeypatch.delenv(profile.api_key_env, raising=False)
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    monkeypatch.setattr("llmolympic.control_runner.load_profiles", lambda: profiles)
+    client = client_factory(database)
+    path = f"/api/v1/control/profiles/{profile.profile_id}/credential"
+    sensitive_marker = "runtime-only-secret-sentinel"
+    credential_model = control.ControlProfileCredentialRequest.model_validate(
+        {"api_key": sensitive_marker}
+    )
+    assert sensitive_marker not in repr(credential_model)
+    assert sensitive_marker not in credential_model.model_dump_json()
+
+    for headers in (
+        {"Origin": ORIGIN, "Sec-Fetch-Site": "same-origin"},
+        {
+            "Authorization": f"Bearer {WRONG_TOKEN}",
+            "Origin": ORIGIN,
+            "Sec-Fetch-Site": "same-origin",
+        },
+        {"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        {
+            "Authorization": f"Bearer {ADMIN_TOKEN}",
+            "Origin": "https://evil.example",
+            "Sec-Fetch-Site": "cross-site",
+        },
+    ):
+        response = client.put(path, headers=headers, json={"api_key": sensitive_marker})
+        assert response.status_code in {401, 403}
+        assert sensitive_marker not in response.text
+
+    stored = client.put(
+        path, headers=_admin_headers(), json={"api_key": sensitive_marker}
+    )
+    assert stored.status_code == 204
+    assert not stored.content
+
+    catalog = client.get(
+        "/api/v1/control/catalog",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    assert catalog.status_code == 200
+    item = next(
+        item for item in catalog.json()["profiles"] if item["profile_id"] == profile.profile_id
+    )
+    assert item["credential_ready"] is True
+    assert sensitive_marker not in catalog.text
+
+    prepared = client.post(
+        "/api/v1/control/jobs",
+        headers=_admin_headers(idempotency_key=_key("runtime-key-prepare")),
+        json=_profile_prepare_payload(profile.profile_id),
+    )
+    assert prepared.status_code == 201
+    assert sensitive_marker not in prepared.text
+    listed = client.get(
+        "/api/v1/control/jobs",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    assert sensitive_marker not in listed.text
+    jobs_database = control.derive_jobs_database_path(database)
+    for base in (jobs_database, database):
+        for candidate in (
+            base,
+            Path(f"{base}-journal"),
+            Path(f"{base}-shm"),
+            Path(f"{base}-wal"),
+        ):
+            if candidate.exists():
+                assert sensitive_marker.encode() not in candidate.read_bytes()
+
+    cleared = client.delete(path, headers=_admin_headers())
+    assert cleared.status_code == 204
+    assert not cleared.content
+    catalog = client.get(
+        "/api/v1/control/catalog",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+    item = next(
+        item for item in catalog.json()["profiles"] if item["profile_id"] == profile.profile_id
+    )
+    assert item["credential_ready"] is False
+    assert sensitive_marker not in catalog.text
+
+
+@pytest.mark.parametrize("profile_id", ["missing-profile", "local-profile"])
+def test_runtime_profile_credential_rejects_unknown_and_ollama_with_fixed_error(
+    tmp_path: Path,
+    client_factory: Callable[[Path], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+    profile_id: str,
+) -> None:
+    ollama = ProviderProfile(
+        profile_id="local-profile",
+        provider="ollama",
+        default_model="local-model",
+        base_url="http://127.0.0.1:11434",
+    )
+    monkeypatch.setattr(control, "load_profiles", lambda: {ollama.profile_id: ollama})
+    monkeypatch.setattr(
+        "llmolympic.control_runner.load_profiles", lambda: {ollama.profile_id: ollama}
+    )
+    client = client_factory(tmp_path / "credential-rejected.db")
+    sensitive_marker = "rejected-secret-sentinel"
+
+    response = client.put(
+        f"/api/v1/control/profiles/{profile_id}/credential",
+        headers=_admin_headers(),
+        json={"api_key": sensitive_marker},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "profile_unavailable"}}
+    assert sensitive_marker not in response.text
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"api_key": ""},
+        {"api_key": " leading-space"},
+        {"api_key": "line\nbreak"},
+        {"api_key": "a" * (control.MAX_PROFILE_API_KEY_BYTES + 1)},
+        {"api_key": "valid-looking-key", "unexpected": "field"},
+    ],
+)
+def test_runtime_profile_credential_rejects_invalid_secret_shapes(
+    tmp_path: Path,
+    client_factory: Callable[[Path], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, str],
+) -> None:
+    profile = ProviderProfile(
+        profile_id="strict-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="STRICT_PROFILE_KEY",
+    )
+    profiles = {profile.profile_id: profile}
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    monkeypatch.setattr("llmolympic.control_runner.load_profiles", lambda: profiles)
+    client = client_factory(tmp_path / "credential-invalid.db")
+    response = client.put(
+        f"/api/v1/control/profiles/{profile.profile_id}/credential",
+        headers=_admin_headers(),
+        json=payload,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    for value in payload.values():
+        if value:
+            assert value not in response.text
+
+
+def test_runtime_profile_credential_requires_json_content_type(
+    tmp_path: Path,
+    client_factory: Callable[[Path], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="json-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="JSON_PROFILE_KEY",
+    )
+    profiles = {profile.profile_id: profile}
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    monkeypatch.setattr("llmolympic.control_runner.load_profiles", lambda: profiles)
+    client = client_factory(tmp_path / "credential-content-type.db")
+    response = client.put(
+        f"/api/v1/control/profiles/{profile.profile_id}/credential",
+        headers=_admin_headers(),
+        content=b'{"api_key":"content-type-secret"}',
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    assert "content-type-secret" not in response.text
 
 
 def test_control_resume_prepare_persists_safe_frozen_summary(

@@ -19,6 +19,7 @@ import signal
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from collections.abc import Mapping
 from ctypes import wintypes
@@ -40,8 +41,13 @@ try:
 except ImportError:  # pragma: no cover - POSIX uses fcntl above.
     msvcrt = None  # type: ignore[assignment]
 
-from llmolympic.config import load_profiles
+from llmolympic.config import (
+    ProviderProfile,
+    is_profile_credential_environment_name,
+    load_profiles,
+)
 from llmolympic.control import (
+    MAX_PROFILE_API_KEY_BYTES,
     ControlError,
     ControlFinalKind,
     ControlJob,
@@ -455,6 +461,13 @@ class _RunningProcess:
     startup_waiting: bool = True
 
 
+@dataclass(slots=True, repr=False)
+class _RuntimeProfileCredential:
+    configuration_digest: str
+    environment_name: str
+    api_key: str
+
+
 class ControlJobManager:
     """Run at most one prepared job in a fixed-argument child process."""
 
@@ -476,6 +489,8 @@ class ControlJobManager:
             else Path(__file__).resolve().parent.parent
         )
         self._source_environment = dict(os.environ if environment is None else environment)
+        self._runtime_profile_credentials: dict[str, _RuntimeProfileCredential] = {}
+        self._credential_lock = threading.RLock()
         self._running: dict[str, _RunningProcess] = {}
         self._participation_links: dict[str, dict[str, ControlParticipationLink]] = {}
         self._lock = asyncio.Lock()
@@ -590,11 +605,105 @@ class ControlJobManager:
         links = tuple(self._participation_links.get(job.job_id, {}).values())
         return job.model_copy(update={"participation_links": links})
 
+    @staticmethod
+    def _credential_profile(profile_id: str) -> ProviderProfile:
+        try:
+            profile = load_profiles().get(profile_id)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ControlError("profile_unavailable") from exc
+        if (
+            profile is None
+            or profile.provider != "openai"
+            or profile.api_key_env is None
+            or not is_profile_credential_environment_name(profile.api_key_env)
+            or not profile.default_model
+        ):
+            raise ControlError("profile_unavailable")
+        return profile
+
+    def _credential_for_profile(self, profile: ProviderProfile) -> str | None:
+        environment_name = profile.api_key_env
+        if environment_name is None or not is_profile_credential_environment_name(
+            environment_name
+        ):
+            return None
+        with self._credential_lock:
+            runtime_credential = self._runtime_profile_credentials.get(profile.profile_id)
+            if runtime_credential is not None:
+                try:
+                    configuration_matches = (
+                        runtime_credential.configuration_digest
+                        == profile_configuration_digest(profile)
+                    )
+                except (TypeError, ValueError):
+                    configuration_matches = False
+                if (
+                    configuration_matches
+                    and runtime_credential.environment_name == environment_name
+                ):
+                    return runtime_credential.api_key
+                # Never reuse a browser-supplied Key after any trusted Profile
+                # property changes, even when the environment name is unchanged.
+                self._runtime_profile_credentials.pop(profile.profile_id, None)
+        return self._source_environment.get(environment_name)
+
+    def profile_credential_ready(self, profile: ProviderProfile) -> bool:
+        """Return readiness without disclosing the credential or its source."""
+
+        if profile.provider == "ollama":
+            return True
+        return bool(self._credential_for_profile(profile))
+
+    async def set_profile_credential(self, profile_id: str, api_key: str) -> None:
+        """Install one volatile browser-supplied credential for future workers."""
+
+        if (
+            not api_key
+            or len(api_key.encode("utf-8")) > MAX_PROFILE_API_KEY_BYTES
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in api_key)
+        ):
+            raise ControlError("invalid_request")
+        async with self._lock:
+            if self._closing:
+                raise ControlError("control_unavailable")
+            profile = self._credential_profile(profile_id)
+            environment_name = profile.api_key_env
+            if environment_name is None:  # Defensive: _credential_profile already rejects this.
+                raise ControlError("profile_unavailable")
+            try:
+                configuration_digest = profile_configuration_digest(profile)
+            except (TypeError, ValueError) as exc:
+                raise ControlError("profile_unavailable") from exc
+            with self._credential_lock:
+                self._runtime_profile_credentials[profile.profile_id] = (
+                    _RuntimeProfileCredential(
+                        configuration_digest=configuration_digest,
+                        environment_name=environment_name,
+                        api_key=api_key,
+                    )
+                )
+
+    async def clear_profile_credential(self, profile_id: str) -> None:
+        """Forget one volatile credential; an inherited environment value may remain."""
+
+        async with self._lock:
+            if self._closing:
+                raise ControlError("control_unavailable")
+            try:
+                self._credential_profile(profile_id)
+            except ControlError:
+                with self._credential_lock:
+                    self._runtime_profile_credentials.pop(profile_id, None)
+                raise
+            with self._credential_lock:
+                self._runtime_profile_credentials.pop(profile_id, None)
+
     def _child_environment(self, job: ControlJob, token: str) -> dict[str, str]:
         try:
             current_preview = validate_job_spec(
                 job.spec,
                 archive_database=self.store.archive_database,
+                credential_ready=self.profile_credential_ready,
             )
         except ControlError as exc:
             raise ControlError("worker_start_failed") from exc
@@ -629,6 +738,7 @@ class ControlJobManager:
         }
         if set(prepared_profiles) != profile_ids:
             raise ControlError("worker_start_failed")
+        routed_credentials: dict[str, str] = {}
         for profile_id in profile_ids:
             profile = profiles.get(profile_id)
             if (
@@ -637,10 +747,14 @@ class ControlJobManager:
             ):
                 raise ControlError("worker_start_failed")
             if profile.api_key_env is not None:
-                credential = self._source_environment.get(profile.api_key_env)
-                if credential is None:
+                credential = self._credential_for_profile(profile)
+                if not credential:
                     raise ControlError("worker_start_failed")
-                environment[profile.api_key_env] = credential
+                existing = routed_credentials.get(profile.api_key_env)
+                if existing is not None and not secrets.compare_digest(existing, credential):
+                    raise ControlError("worker_start_failed")
+                routed_credentials[profile.api_key_env] = credential
+        environment.update(routed_credentials)
         environment.update(
             {
                 "PYTHONIOENCODING": "utf-8",
@@ -895,6 +1009,8 @@ class ControlJobManager:
             await self._shutdown_owned_processes()
         finally:
             self._participation_links.clear()
+            with self._credential_lock:
+                self._runtime_profile_credentials.clear()
             self._release_manager_lease()
 
     async def _shutdown_owned_processes(self) -> None:

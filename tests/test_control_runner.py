@@ -264,6 +264,218 @@ def test_runner_refuses_a_profile_changed_after_prepare_without_claiming_start(
     assert operations == 0
 
 
+def test_runtime_profile_credential_is_scoped_to_used_child_and_not_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_marker = "runtime-child-secret-sentinel"
+    profile = ProviderProfile(
+        profile_id="runtime",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="RUNTIME_PROFILE_KEY",
+    )
+    unused = ProviderProfile(
+        profile_id="unused",
+        provider="openai",
+        default_model="unused-model",
+        base_url="https://unused.example/v1",
+        api_key_env="UNUSED_PROFILE_KEY",
+    )
+    profiles = {profile.profile_id: profile, unused.profile_id: unused}
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    monkeypatch.setattr(control_runner, "load_profiles", lambda: profiles)
+    monkeypatch.setenv(profile.api_key_env, "prepare-only-placeholder")
+    spec = ControlJobSpec(
+        mode="play",
+        game="math_quiz",
+        players=(
+            ControlPlayerSpec(kind="profile", profile_id=profile.profile_id),
+            ControlPlayerSpec(kind="mock", strategy="fixed"),
+        ),
+        rounds=1,
+        budget=ControlBudgetSpec(
+            max_provider_calls="2",
+            max_input_tokens="1000",
+            max_output_tokens_per_call="128",
+            max_total_output_tokens="256",
+            max_estimated_cost_usd="0",
+        ),
+    )
+    store = JobStore(tmp_path / "runtime-credential.db")
+    job = _prepare(store, spec, key="prepare-runtime-credential")
+    monkeypatch.delenv(profile.api_key_env)
+    captured: dict[str, object] = {}
+
+    async def reject_spawn(*argv: str, **kwargs: object):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        raise OSError("deliberate spawn failure")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_spawn)
+
+    async def exercise() -> None:
+        manager = ControlJobManager(
+            store,
+            environment={"UNUSED_PROFILE_KEY": "ambient-unused-secret"},
+        )
+        try:
+            await manager.set_profile_credential(profile.profile_id, sensitive_marker)
+            with pytest.raises(ControlError, match="worker_start_failed"):
+                await manager.start(
+                    job.job_id,
+                    idempotency_key="start-runtime-credential",
+                    web_base_url="http://localhost:8765",
+                )
+        finally:
+            await manager.shutdown()
+        assert sensitive_marker not in repr(vars(manager))
+
+    asyncio.run(exercise())
+
+    argv = captured["argv"]
+    kwargs = captured["kwargs"]
+    assert isinstance(argv, tuple)
+    assert isinstance(kwargs, dict)
+    environment = kwargs["env"]
+    assert isinstance(environment, dict)
+    assert environment[profile.api_key_env] == sensitive_marker
+    assert unused.api_key_env not in environment
+    assert sensitive_marker not in repr(argv)
+    assert sensitive_marker.encode() not in store.path.read_bytes()
+
+
+def test_clearing_runtime_profile_credential_makes_later_start_fail_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="runtime-clear",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="RUNTIME_CLEAR_KEY",
+    )
+    monkeypatch.setattr(control, "load_profiles", lambda: {profile.profile_id: profile})
+    monkeypatch.setattr(
+        control_runner, "load_profiles", lambda: {profile.profile_id: profile}
+    )
+    monkeypatch.setenv(profile.api_key_env, "prepare-only-placeholder")
+    spec = ControlJobSpec(
+        mode="play",
+        game="math_quiz",
+        players=(
+            ControlPlayerSpec(kind="profile", profile_id=profile.profile_id),
+            ControlPlayerSpec(kind="mock", strategy="fixed"),
+        ),
+        rounds=1,
+        budget=ControlBudgetSpec(
+            max_provider_calls="2",
+            max_input_tokens="1000",
+            max_output_tokens_per_call="128",
+            max_total_output_tokens="256",
+            max_estimated_cost_usd="0",
+        ),
+    )
+    store = JobStore(tmp_path / "runtime-clear.db")
+    job = _prepare(store, spec, key="prepare-runtime-clear")
+    monkeypatch.delenv(profile.api_key_env)
+
+    async def exercise() -> None:
+        manager = ControlJobManager(store, environment={})
+        try:
+            await manager.set_profile_credential(profile.profile_id, "cleared-secret")
+            await manager.clear_profile_credential(profile.profile_id)
+            with pytest.raises(ControlError, match="worker_start_failed"):
+                await manager.start(
+                    job.job_id,
+                    idempotency_key="start-after-clear",
+                    web_base_url="http://localhost:8765",
+                )
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(exercise())
+
+    assert store.get(job.job_id).status == "prepared"
+    with sqlite3.connect(store.path) as connection:
+        claimed = connection.execute(
+            "SELECT count(*) FROM control_operations WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()[0]
+    assert claimed == 0
+    assert b"cleared-secret" not in store.path.read_bytes()
+
+
+def test_runtime_profile_credential_is_invalidated_by_profile_configuration_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ProviderProfile(
+        profile_id="runtime-drift",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="RUNTIME_DRIFT_KEY",
+    )
+    profiles = {original.profile_id: original}
+    monkeypatch.setattr(control_runner, "load_profiles", lambda: profiles)
+    manager = ControlJobManager(JobStore(tmp_path / "runtime-drift.db"), environment={})
+
+    async def exercise() -> None:
+        try:
+            await manager.set_profile_credential(original.profile_id, "drift-secret")
+            assert manager.profile_credential_ready(original)
+            changed = ProviderProfile(
+                profile_id=original.profile_id,
+                provider="openai",
+                default_model=original.default_model,
+                base_url="https://different-provider.example/v1",
+                api_key_env=original.api_key_env,
+            )
+            profiles[original.profile_id] = changed
+            assert not manager.profile_credential_ready(changed)
+            assert original.profile_id not in manager._runtime_profile_credentials
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_runtime_profile_credential_rejects_process_control_environment_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe = ProviderProfile(
+        profile_id="runtime-unsafe-env",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="PYTHONPATH",
+    )
+    monkeypatch.setattr(
+        control_runner,
+        "load_profiles",
+        lambda: {unsafe.profile_id: unsafe},
+    )
+    manager = ControlJobManager(
+        JobStore(tmp_path / "runtime-unsafe-env.db"),
+        environment={"PYTHONPATH": "trusted-parent-path"},
+    )
+
+    async def exercise() -> None:
+        try:
+            assert not manager.profile_credential_ready(unsafe)
+            with pytest.raises(ControlError, match="profile_unavailable"):
+                await manager.set_profile_credential(unsafe.profile_id, "attacker-path")
+            assert not manager._runtime_profile_credentials
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(exercise())
+
+
 def test_runner_binds_resume_profiles_from_the_frozen_preview(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

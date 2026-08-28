@@ -80,6 +80,36 @@
   };
 
   equal(
+    observer.profileCredentialPath("private.openai_profile"),
+    "/api/v1/control/profiles/private.openai_profile/credential",
+    "a named Profile credential uses only its encoded control path",
+  );
+  throwsCode(
+    () => observer.profileCredentialPath("bad/profile"),
+    "invalid_request",
+    "a Profile credential path rejects path injection",
+  );
+  assert(!observer.profileKeyCanApply(""), "an empty Profile Key cannot be applied");
+  assert(observer.profileKeyCanApply("opaque-secret"), "a printable ASCII Profile Key can be applied");
+  assert(!observer.profileKeyCanApply(" secret value "), "Profile Key whitespace fails closed");
+  assert(!observer.profileKeyCanApply("line\nbreak"), "Profile Key control characters fail closed");
+  equal(
+    observer.profileCredentialRequest("PUT", "opaque-secret"),
+    { body: { api_key: "opaque-secret" }, method: "PUT" },
+    "applying a Profile Key sends only the dedicated API field",
+  );
+  equal(
+    observer.profileCredentialRequest("DELETE", "must-not-be-sent"),
+    { body: null, method: "DELETE" },
+    "clearing a Profile Key sends no request body",
+  );
+  throwsCode(
+    () => observer.profileCredentialRequest("PUT", ""),
+    "invalid_request",
+    "an empty Profile Key request fails before fetch",
+  );
+
+  equal(
     observer.classifyReplayClose(1006, "", 0, true),
     { action: "ready" },
     "a verified complete envelope survives an abnormal close",

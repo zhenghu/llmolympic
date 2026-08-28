@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,10 +14,11 @@ const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 const CONTROL_START_TIMEOUT_MS = 20_000;
 const CONTROL_TEST_TIMEOUT_MS = 60_000;
 
-// Admin and seat capabilities are real credentials. Disabling traces keeps
-// Authorization headers, sessionStorage, and DOM link attributes out of
-// retained Playwright artifacts. Neither test ever navigates to a secret URL.
-base.use({ screenshot: "only-on-failure", trace: "off", video: "off" });
+// Admin, seat, and ephemeral Provider credentials are real secrets. Disabling
+// screenshots and traces keeps password fields, Authorization headers,
+// sessionStorage, and DOM link attributes out of retained Playwright artifacts.
+// No test navigates to a secret URL.
+base.use({ screenshot: "off", trace: "off", video: "off" });
 
 function summarizedViolations(results) {
   return results.violations.map((violation) => ({
@@ -98,9 +99,22 @@ async function startControlServer() {
 
   const root = await mkdtemp(join(tmpdir(), "llmolympic-web-control-e2e-"));
   const database = join(root, "control.db");
+  const config = join(root, "config.toml");
   const tokenFile = join(root, "admin.token");
   const port = await reserveLoopbackPort();
   const baseURL = `http://127.0.0.1:${port}`;
+  await writeFile(config, [
+    "[profiles.browser-test]",
+    'provider = "openai"',
+    'default_model = "fake-model"',
+    'base_url = "https://provider.invalid/v1"',
+    'api_key_env = "E2E_BROWSER_PROFILE_KEY"',
+    'display_name = "E2E Provider"',
+    "",
+  ].join("\n"), { encoding: "utf8", mode: 0o600 });
+  const childEnvironment = { ...process.env };
+  delete childEnvironment.E2E_BROWSER_PROFILE_KEY;
+  delete childEnvironment.LLMOLYMPIC_CONFIG;
   const child = spawn(
     executable,
     [
@@ -116,9 +130,10 @@ async function startControlServer() {
     ],
     {
       env: {
-        ...process.env,
+        ...childEnvironment,
         COLUMNS: "500",
         FORCE_COLOR: "0",
+        LLMOLYMPIC_CONFIG: config,
         NO_COLOR: "1",
       },
       // stdout could contain a capability if the CLI regressed. It is never
@@ -226,6 +241,68 @@ async function configureMathQuiz(page, { humanName = null } = {}) {
   await page.getByLabel("每场回合数").fill("1");
   await page.getByLabel("随机种子").fill("4242");
 }
+
+test.describe("ephemeral Provider credentials", () => {
+  test("sets, keeps in service memory, and clears a named Profile Key", async ({
+    browser,
+    controlServer,
+  }) => {
+    const sentinel = "e2e-browser-profile-key-sentinel";
+    const admin = await openAdminPage(browser, controlServer);
+    admin.secrets.push(sentinel);
+    try {
+      const keyInput = admin.page.getByLabel("E2E Provider 的 API Key");
+      await expect(keyInput).toBeVisible();
+      await expect(keyInput).toHaveAttribute("type", "password");
+      await expect(keyInput).toHaveAttribute("autocomplete", "new-password");
+      await expect(admin.page.getByText("Key 未就绪", { exact: true })).toBeVisible();
+      await keyInput.fill(sentinel);
+
+      const applied = admin.page.waitForResponse((response) => (
+        response.request().method() === "PUT"
+        && response.url().endsWith("/api/v1/control/profiles/browser-test/credential")
+      ));
+      await admin.page.getByRole("button", { name: "应用 Key" }).click();
+      expect((await applied).status()).toBe(204);
+
+      await expect(keyInput).toHaveCount(0);
+      await expect(admin.page.getByText("Key 已就绪", { exact: true })).toBeVisible();
+      expect(admin.page.url()).not.toContain(sentinel);
+      expect(await admin.context.cookies()).toEqual([]);
+      const browserState = await admin.page.evaluate(() => ({
+        html: document.documentElement.outerHTML,
+        localStorage: Object.entries(window.localStorage),
+        sessionStorage: Object.entries(window.sessionStorage),
+      }));
+      expect(browserState.html).not.toContain(sentinel);
+      expect(JSON.stringify(browserState.localStorage)).not.toContain(sentinel);
+      expect(JSON.stringify(browserState.sessionStorage)).not.toContain(sentinel);
+      expect(browserState.sessionStorage.some(([key]) => key === "llmolympic.control.admin")).toBeTruthy();
+
+      await admin.page.reload();
+      await expect(admin.page.getByText("Key 已就绪", { exact: true })).toBeVisible();
+      await expect(admin.page.getByLabel("E2E Provider 的 API Key")).toHaveCount(0);
+      await expectNoWcagViolations(admin.page);
+
+      const cleared = admin.page.waitForResponse((response) => (
+        response.request().method() === "DELETE"
+        && response.url().endsWith("/api/v1/control/profiles/browser-test/credential")
+      ));
+      await admin.page.getByRole("button", { name: "清除本次 Key" }).click();
+      expect((await cleared).status()).toBe(204);
+
+      const restoredInput = admin.page.getByLabel("E2E Provider 的 API Key");
+      await expect(admin.page.getByText("Key 未就绪", { exact: true })).toBeVisible();
+      await expect(restoredInput).toBeVisible();
+      await expect(restoredInput).toHaveValue("");
+      await expect(restoredInput).toHaveAttribute("type", "password");
+      await expectNoWcagViolations(admin.page);
+      expect(admin.errors).toEqual([]);
+    } finally {
+      await admin.context.close();
+    }
+  });
+});
 
 async function configureMathQuizChampionship(page) {
   await expect(page.getByRole("heading", { name: "新建比赛 / 任务" })).toBeVisible();

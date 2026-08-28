@@ -15,6 +15,7 @@ const MAX_MATCHES = 100;
 const MAX_MOVE_CHARACTERS = 4096;
 const MAX_PARTICIPATION_PLAYERS = 16;
 const MAX_CONTROL_PLAYERS = 16;
+const MAX_PROFILE_API_KEY_BYTES = 8 * 1024;
 const PARTICIPATION_POLL_INTERVAL = 1000;
 const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
@@ -244,8 +245,9 @@ async function fetchJSON(path, signal) {
     payload = null;
   }
   if (!response.ok) {
-    const code = payload && payload.error && payload.error.code;
-    throw new PublicError(typeof code === "string" ? code : "request_failed", response.status);
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
   }
   if (!isObject(payload) || payload.api_version !== API_VERSION) {
     throw new PublicError("protocol_error");
@@ -354,6 +356,68 @@ async function fetchControlJSON(
     throw new PublicError("protocol_error");
   }
   return payload;
+}
+
+async function fetchControlNoContent(
+  path,
+  adminToken,
+  { body = null, method, signal } = {},
+) {
+  if (!adminToken || !ADMIN_TOKEN.test(adminToken)) throw new PublicError("control_unauthorized", 401);
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${adminToken}`,
+  };
+  if (body !== null) headers["Content-Type"] = "application/json";
+  let response;
+  try {
+    response = await fetch(path, {
+      body: body === null ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers,
+      method,
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    throw new PublicError("network_error");
+  }
+  if (response.status === 204) return;
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
+  }
+  throw new PublicError("protocol_error", response.status);
+}
+
+function profileCredentialPath(profileId) {
+  if (typeof profileId !== "string" || !SAFE_PUBLIC_ID.test(profileId)) {
+    throw new PublicError("invalid_request");
+  }
+  return `/api/v1/control/profiles/${encodeURIComponent(profileId)}/credential`;
+}
+
+function profileKeyCanApply(value) {
+  return typeof value === "string"
+    && value.length <= MAX_PROFILE_API_KEY_BYTES
+    && /^[\x21-\x7e]+$/.test(value);
+}
+
+function profileCredentialRequest(method, apiKey = "") {
+  if (method === "DELETE") return { body: null, method };
+  if (method === "PUT" && profileKeyCanApply(apiKey)) {
+    return { body: { api_key: apiKey }, method };
+  }
+  throw new PublicError("invalid_request");
 }
 
 const participationCapabilities = new Map();
@@ -1644,6 +1708,108 @@ function ControlField({ children, error, help, id, label }) {
   );
 }
 
+function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profile }) {
+  const [apiKey, setApiKey] = useState("");
+  const [state, setState] = useState({ busy: false, error: null });
+  const statusId = `profile-credential-${profile.profileId}-status`;
+  const inputId = `profile-credential-${profile.profileId}-key`;
+
+  const updateCredential = async (method) => {
+    if (state.busy || (method === "PUT" && !profileKeyCanApply(apiKey))) return;
+    setState({ busy: true, error: null });
+    try {
+      const request = profileCredentialRequest(method, apiKey);
+      await fetchControlNoContent(profileCredentialPath(profile.profileId), adminToken, {
+        ...request,
+      });
+      setApiKey("");
+      setState({ busy: false, error: null });
+      onCatalogChanged();
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      setState({ busy: false, error });
+    }
+  };
+
+  return h("li", { className: "profile-credential-row" },
+    h("div", { className: "profile-credential-summary" },
+      h("div", null,
+        h("strong", null, profile.displayName),
+        h("span", null, `${profile.provider}${profile.defaultModel ? ` · ${profile.defaultModel}` : ""}`),
+      ),
+      h("span", {
+        "aria-live": "polite",
+        className: `profile-credential-status ${profile.available ? "ready" : "missing"}`,
+        id: statusId,
+      }, profile.available ? "Key 已就绪" : "Key 未就绪"),
+    ),
+    profile.available
+      ? h("div", { className: "profile-credential-actions" },
+        h("p", { className: "field-help" }, "清除只影响之后启动的任务；正在运行的任务仍持有自己的副本。若环境仍提供 Key，刷新后会继续显示为已就绪。"),
+        h("button", {
+          className: "button small danger-outline",
+          disabled: state.busy,
+          onClick: () => updateCredential("DELETE"),
+          type: "button",
+        }, state.busy ? "正在清除…" : "清除本次 Key"),
+      )
+      : h("div", { className: "profile-credential-entry" },
+        h(ControlField, {
+          help: "仅供当前本机 Web 服务和随后启动的对应任务使用；应用不会将它写入比赛表单、任务记录、Web Storage 或网址。",
+          id: inputId,
+          label: `${profile.displayName} 的 API Key`,
+        }, (attributes) => h("input", {
+          ...attributes,
+          "aria-describedby": `${attributes["aria-describedby"] || ""} ${statusId}`.trim(),
+          autoCapitalize: "none",
+          autoComplete: "new-password",
+          autoCorrect: "off",
+          disabled: state.busy,
+          maxLength: MAX_PROFILE_API_KEY_BYTES,
+          onChange: (event) => setApiKey(event.target.value),
+          spellCheck: false,
+          type: "password",
+          value: apiKey,
+        })),
+        h("button", {
+          className: "button small primary",
+          disabled: state.busy || !profileKeyCanApply(apiKey),
+          onClick: () => updateCredential("PUT"),
+          type: "button",
+        }, state.busy ? "正在应用…" : "应用 Key"),
+      ),
+    state.error ? h("p", { className: "field-error", role: "alert" }, errorCopy(state.error)) : null,
+  );
+}
+
+function ProfileCredentialPanel({ adminToken, onAuthLost, onCatalogChanged, profiles }) {
+  const openAIProfiles = profiles.filter((profile) => (
+    profile.provider === "openai" && profile.defaultModel
+  ));
+  if (!openAIProfiles.length) return null;
+  return h("section", {
+    className: "panel profile-credential-panel",
+    "aria-labelledby": "profile-credentials-heading",
+  },
+  h("div", { className: "panel-head" },
+    h("div", null,
+      h("p", { className: "panel-overline" }, "SESSION CREDENTIALS"),
+      h("h2", { id: "profile-credentials-heading" }, "Provider Key"),
+    ),
+    h("span", { className: "panel-kicker" }, "仅本次服务会话"),
+  ),
+  h("p", { className: "profile-credential-notice" }, "应用不会回显或持久化 Key；它会留在当前服务内存，并按需复制给随后启动的对应任务。服务重启后，本次设置会失效。"),
+  h("ul", { className: "profile-credential-list" },
+    ...openAIProfiles.map((profile) => h(ProfileCredentialRow, {
+      adminToken,
+      key: profile.profileId,
+      onAuthLost,
+      onCatalogChanged,
+      profile,
+    })),
+  ));
+}
+
 function ControlPlayerEditor({ catalog, error, index, mode, onChange, onRemove, player, removable }) {
   const id = `player-${index}`;
   const availableProfiles = catalog.profiles;
@@ -1814,6 +1980,7 @@ function PreparedJobPreview({ backLabel = "取消预览并返回修改", busy, e
 
 function NewJobPage({ adminToken, onAuthLost }) {
   const [catalogState, setCatalogState] = useState({ catalog: null, error: null, loading: true });
+  const [catalogReloadKey, setCatalogReloadKey] = useState(0);
   const [form, setForm] = useState(initialControlForm);
   const [errors, setErrors] = useState({});
   const [prepared, setPrepared] = useState(null);
@@ -1823,6 +1990,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
   const prepareKeyRef = useRef(null);
   const startKeyRef = useRef(null);
   const discardKeyRef = useRef(null);
+  const catalogInitializedRef = useRef(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1831,14 +1999,17 @@ function NewJobPage({ adminToken, onAuthLost }) {
       .then((payload) => {
         const catalog = normalizeControlCatalog(payload);
         const game = catalog.games.find((item) => item.supportedModes.includes("play")) || catalog.games[0];
-        setForm((previous) => ({
-          ...previous,
-          game: game.name,
-          judges: game.requiresJudgePanel
-            ? [0, 1, 2].map((index) => defaultControlJudge(index, catalog))
-            : [],
-          players: [defaultControlPlayer(0, catalog), defaultControlPlayer(1, catalog)],
-        }));
+        if (!catalogInitializedRef.current) {
+          catalogInitializedRef.current = true;
+          setForm((previous) => ({
+            ...previous,
+            game: game.name,
+            judges: game.requiresJudgePanel
+              ? [0, 1, 2].map((index) => defaultControlJudge(index, catalog))
+              : [],
+            players: [defaultControlPlayer(0, catalog), defaultControlPlayer(1, catalog)],
+          }));
+        }
         setCatalogState({ catalog, error: null, loading: false });
       })
       .catch((error) => {
@@ -1847,7 +2018,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
         setCatalogState({ catalog: null, error, loading: false });
       });
     return () => controller.abort();
-  }, [adminToken, onAuthLost]);
+  }, [adminToken, catalogReloadKey, onAuthLost]);
 
   const catalog = catalogState.catalog;
   const changeForm = (updater) => {
@@ -1858,6 +2029,15 @@ function NewJobPage({ adminToken, onAuthLost }) {
     prepareKeyRef.current = null;
     startKeyRef.current = null;
     discardKeyRef.current = null;
+  };
+  const refreshCatalogAfterCredentialChange = () => {
+    setErrors({});
+    setPrepared(null);
+    setPrepareError(null);
+    prepareKeyRef.current = null;
+    startKeyRef.current = null;
+    discardKeyRef.current = null;
+    setCatalogReloadKey((value) => value + 1);
   };
 
   if (catalogState.loading) {
@@ -2046,6 +2226,12 @@ function NewJobPage({ adminToken, onAuthLost }) {
       h("h1", { className: "detail-title", id: "new-title" }, "新建比赛 / 任务"),
       h("p", { className: "hero-copy" }, "先选择项目、参赛者和硬预算，再生成不会自动运行的准备态预览。"),
     ),
+    h(ProfileCredentialPanel, {
+      adminToken,
+      onAuthLost,
+      onCatalogChanged: refreshCatalogAfterCredentialChange,
+      profiles: catalog.profiles,
+    }),
     errorMessages.length ? h("div", {
       className: "form-error-summary",
       ref: errorSummaryRef,
@@ -5092,6 +5278,9 @@ if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
     countCharacters,
     normalizeControlCatalog,
     normalizeControlJob,
+    profileCredentialPath,
+    profileCredentialRequest,
+    profileKeyCanApply,
     participationComponentKey,
     participationErrorClearsCapability,
     participationKeepsCapability,

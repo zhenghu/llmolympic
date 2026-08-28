@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.websockets import WebSocketDisconnect
 
 from llmolympic import __version__
+from llmolympic.config import ProviderProfile
 from llmolympic.control import (
     MAX_CONTROL_BODY_BYTES,
     ControlCatalogResponse,
@@ -27,6 +28,7 @@ from llmolympic.control import (
     ControlJobListResponse,
     ControlJobResponse,
     ControlJobSpec,
+    ControlProfileCredentialRequest,
     JobStore,
     control_catalog,
     validate_job_spec,
@@ -239,6 +241,12 @@ def _public_control_error(exc: ControlError) -> tuple[str, int]:
 
 class _ControlManager(Protocol):
     def public_job(self, job: ControlJob) -> ControlJob: ...
+
+    def profile_credential_ready(self, profile: ProviderProfile) -> bool: ...
+
+    async def set_profile_credential(self, profile_id: str, api_key: str) -> None: ...
+
+    async def clear_profile_credential(self, profile_id: str) -> None: ...
 
     async def start(
         self,
@@ -676,7 +684,56 @@ def create_app(
     )
     async def control_catalog_endpoint(request: Request) -> ControlCatalogResponse:
         require_control(request)
-        return await control_call(control_catalog)
+        credential_ready = (
+            None
+            if control_manager is None
+            else control_manager.profile_credential_ready
+        )
+        return await control_call(
+            lambda: control_catalog(credential_ready=credential_ready)
+        )
+
+    @app.put(
+        "/api/v1/control/profiles/{profile_id}/credential",
+        status_code=204,
+        response_class=Response,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_set_profile_credential(
+        request: Request,
+        profile_id: str,
+    ) -> Response:
+        require_control(request)
+        _require_control_write_context(request)
+        raw_payload = await _bounded_control_body(request)
+        try:
+            credential = ControlProfileCredentialRequest.model_validate(raw_payload)
+        except (TypeError, ValueError) as exc:
+            raise ControlError("invalid_request") from exc
+        if control_manager is None:
+            raise ControlError("control_unavailable")
+        await control_manager.set_profile_credential(
+            profile_id,
+            credential.api_key.get_secret_value(),
+        )
+        return Response(status_code=204)
+
+    @app.delete(
+        "/api/v1/control/profiles/{profile_id}/credential",
+        status_code=204,
+        response_class=Response,
+        responses=_CONTROL_ERROR_RESPONSES,
+    )
+    async def control_clear_profile_credential(
+        request: Request,
+        profile_id: str,
+    ) -> Response:
+        require_control(request)
+        _require_control_write_context(request)
+        if control_manager is None:
+            raise ControlError("control_unavailable")
+        await control_manager.clear_profile_credential(profile_id)
+        return Response(status_code=204)
 
     @app.get(
         "/api/v1/control/jobs",
@@ -710,6 +767,11 @@ def create_app(
             lambda: validate_job_spec(
                 spec,
                 archive_database=store.archive_database,
+                credential_ready=(
+                    None
+                    if control_manager is None
+                    else control_manager.profile_credential_ready
+                ),
             )
         )
         job = await control_call(

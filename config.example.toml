@@ -17,6 +17,7 @@
 
 # 命名 Provider Profiles：同一场可使用多个 OpenAI 兼容端点。
 # Profile 只保存 Key 所在的环境变量名，绝不在此填写真实 Key。
+# 名称须大写，并以 _API_KEY、_TOKEN、_SECRET 或 _KEY 结尾。
 # CLI 写法：profile:<id> 使用 default_model；profile:<id>:<model> 覆盖模型。
 [profiles.kimi]
 provider = "openai"

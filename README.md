@@ -135,6 +135,8 @@ Provider 预算与调用尝试账本；v9 新增锦标赛正式档案关系表�
 Profile ID 只允许字母、数字、点、下划线和连字符。`provider`
 目前支持 `openai` 和 `ollama`。OpenAI 兼容 Profile 必须声明
 `api_key_env`，程序只在创建该 Provider 时读取对应环境变量；
+变量名必须为大写凭据型名称，并以 `_API_KEY`、`_TOKEN`、`_SECRET` 或 `_KEY` 结尾，
+防止误用 `PYTHONPATH`、动态加载器、代理或 LLM Olympics 控制协议变量；
 不会隐式复用另一个端点的 Key，也不会继承全局 OpenAI SDK 的组织、项目或
 自定义请求头，更不会把 Key 写入对局档案。
 所有携带 API Key 的远程 OpenAI 兼容端点都必须使用 HTTPS；明文 HTTP
@@ -364,15 +366,29 @@ Provider Profile，再设置 rounds、seed、超时和硬预算。锦标赛只�
 必须再次确认才会启动固定参数的独立 CLI worker 或产生 Provider 调用。当前同一数据库最多
 运行一个 Web 任务；重复请求使用幂等键返回原任务，不会因双击或响应丢失重复启动和计费。
 
-浏览器不能录入 API Key、环境变量、Provider endpoint、数据库路径、shell 命令或任意模型
-覆盖；Profile 必须先在本机 `config.toml` 配置，页面只显示脱敏名称、Provider 类型、固定默认
-模型和凭据是否就绪。由 macOS `launchd` 启动时不会把交互式终端中的云密钥复制进 plist，
-因此需要云 Profile 时应在已设置相应环境变量的可信终端运行 `llmolympic web`。Human 仍只
-允许用于 `play`；`series`、`round-robin` 和 `championship` 保持既有非人类限制。
-prepare 会把受信 Profile 的无凭据安全投影和配置摘要冻结在准备态；控制器与 child 在构造
-Provider 前会再次核对，如果
-Profile 的 Provider、endpoint、默认模型或凭据环境变量名在确认前发生变化，任务会在任何
-Provider 调用前安全失败。
+浏览器仍不能提供环境变量名、Provider endpoint、数据库路径、shell 命令或任意模型
+覆盖；Profile 必须先在本机 `config.toml` 配置。对已配置 `api_key_env`、`default_model`
+且使用 OpenAI 协议的 Profile，
+持有 admin capability 的管理页可录入或清除 API Key；它不能借此新建 Profile 或改动受信
+配置。浏览器提交的 Key 保存在当前 `llmolympic web` 控制器的非持久运行时凭据库，并绑定
+到由该 Profile 全部无凭据配置派生的摘要；它不会在摘要不同的配置上复用。配置文件不会
+在服务会话中热重载，修改后应重启 Web 服务；重启也会清空网页录入的 Key。
+prepare 会把同一安全投影和摘要冻结在准备态，控制器与 child 在 Provider 构造前
+再次核对，配置漂移会在调用或计费前安全失败。
+
+应用不会主动把浏览器提交的 Key 或其哈希写入 `config.toml`、SQLite 主库或 sidecar、
+job spec/预览、正式档案、URL/fragment、Web Storage 或应用日志。它在提交时会短暂存在于
+浏览器表单/HTTP 请求体以及 Python 进程内存；本机回环页面不应被视为物理内存擦除，或视为对
+浏览器扩展、DevTools、密码管理器、崩溃转储和同一操作系统账户的绝对保密承诺。
+
+启动对应 worker 时，控制器才按需把该 Profile 的 Key 复制到 child 中由 `api_key_env`
+指定的环境变量；与任务无关的 Key 不会加入该 worker 环境。继续支持在启动
+`llmolympic web` 前设置 Profile 所需环境变量；macOS `launchd` 不会自动继承交互式
+终端中的云密钥。服务重启会丢失所有由网页录入的 Key；清除只影响之后启动的
+任务，且不会移除启动环境中已有的同名变量。已运行 worker 拥有自己的环境副本；要阻止它
+继续或完成已发出的 Provider 请求，需要停止任务或在 Provider 端撤销 Key。持有 admin
+capability 的人在 Key 就绪期间可启动使用它的 Provider 任务；调用仍要求完整硬预算和
+显式的二次确认。Human 仍只允许用于 `play`；其他模式保持既有非人类限制。
 
 中断的循环赛和锦标赛都只能显式恢复；未过期的对应 runner lease 仍在活动时不会显示恢复
 入口。Web 只允许恢复全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结
@@ -419,9 +435,10 @@ Unicode 字符的文本提交给对应的 `HumanPlayer` 异步接口。提交成
 现有 ELO 更新。每个 capability 只允许读取并提交对应席位的当前 request；对局的
 公开题面和动作事件仍会进入同机的实时观战页，因此它不是隐藏题目或公开事件的保密通道。
 所有项目继续使用通用文本输入（五子棋坐标、国际象棋 SAN/UCI、问答答案或创意正文）。
-管理页可以从安全目录选择既有 Profile 并控制四种现有比赛模式，包括新建或恢复锦标赛，
-但不会读取凭据、直接调用 Provider、写正式档案或任意修改 ELO；Provider 凭据只由受控 CLI
-worker 从其本机进程环境读取，正式档案、预算账本和 ELO 仍由该 worker 通过既有事务处理。
+管理页可以从安全目录选择既有 Profile、管理其临时 OpenAI Key，并控制四种现有
+比赛模式，包括新建或恢复锦标赛，但 FastAPI 本身不直接调用 Provider、写正式档案或任意
+修改 ELO。Provider 凭据由控制器在启动时最小化地路由到对应 CLI worker，正式档案、预算账本和
+ELO 仍由该 worker 通过既有事务处理。
 它也不开放局域网访问；专用棋盘要等 Game 提供结构化 UI 状态后再实现。
 
 这是可信本机操作者场景，不是同一 macOS/Linux 账户内不同用户之间的保密边界：运行命令的
@@ -461,9 +478,12 @@ manager lock，只用于防止同一数据库被两个 Web 控制器同时管理
 文件；完全停止后可一并删除，之后会按需重建。它们都不是正式存档，不应代替主数据库备份。
 
 Web 层对主档案和实时 sidecar 都使用独立的 SQLite `mode=ro` / `query_only` 连接，不创建、
-迁移或修改它们，也不直接更新 ELO。参与写端点只能推进已有 input request；管理写端点只
-推进独立 jobs sidecar 中经过 admin capability 授权的准备/启动/停止状态。两者都使用同源
-POST、Bearer capability、严格 JSON/体积上限和幂等标识。正式主库写入仅发生在受控比赛
+迁移或修改它们，也不直接更新 ELO。参与写端点只能推进已有 input request；任务管理写端点
+只推进独立 jobs sidecar 中经过 admin capability 授权的准备/启动/停止状态；Provider 凭据
+`PUT`/`DELETE` 只修改 Web 控制器的运行时凭据库，不写 sidecar。所有写端点都要求对应
+Bearer capability 与精确同源 Origin；需要 JSON 请求体的端点另要求严格 JSON 和体积上限。input
+提交及任务 prepare/start/stop 使用既有幂等标识，凭据 `PUT`/`DELETE` 按 HTTP 方法本身幂等。
+正式主库写入仅发生在受控比赛
 worker 的既有原子存档路径。jobs sidecar 和公开 DTO 只保留 Profile ID、脱敏显示名、Provider
 类型、默认模型与无凭据配置摘要，不包含 endpoint、凭据环境变量名或值、请求头或原始失败详情。
 旧版、外部导入、超大或语义不一致的档案不会经 Web 详情接口原样公开。当前锦标赛控制与
@@ -537,7 +557,9 @@ worker 的既有原子存档路径。jobs sidecar 和公开 DTO 只保留 Profil
 项目配置、顺序敏感的选手身份和模型、seed、超时及赛程已由检查点冻结。Profile
 恢复规格会使用开赛时已解析的显式模型，因此之后修改 `default_model` 不会偷换参赛
 模型。检查点只保存无密钥的选手描述，不保存 API Key、Key 哈希或 Provider 客户端；
-恢复进程会从当前的环境变量和 Profile 配置重建 Provider，所需 Key 必须仍可用。如果新赛事
+Web 恢复时，控制器把临时 Key 注入恢复 worker 的对应环境变量；CLI 恢复则直接读取其启动
+环境。worker 再从 Profile 配置与自身环境重建 Provider。服务重启后临时 Key 已失效，因此
+必须重新录入或在启动环境中提供。如果新赛事
 使用了自定义 `--db`，恢复时也必须指向同一数据库。
 创建和恢复 checkpoint 时会先核对已有可信 `entrant_id` 的身份绑定；若同一稳定 ID 已绑定
 到不同模型/Profile 身份，会在首次或下一次 Provider 调用前拒绝，避免跑完整场后才封存失败。
@@ -589,8 +611,8 @@ runner generation 同时 fencing 预算调用：接管时，旧执行者未调�
 不可变准备态和工作量预览，确认后才启动同一个 `llmolympic championship` CLI worker。
 Live schema v2 将每个双局对阵先显示为 provisional，只有整轮 checkpoint 事务成功后才把
 该轮标为 committed；浏览器重连时以服务端物化赛程为准，不从客户端可见名称猜测晋级者，
-最终事务成功后才显示冠军和正式档案链接。浏览器本身不持有 Provider 凭据、不发起 Provider
-请求，也不直接写主档案、预算或 ELO。
+最终事务成功后才显示冠军和正式档案链接。浏览器只在录入和提交时短暂处理 Provider
+Key，不发起 Provider 请求，也不直接写主档案、预算或 ELO。
 
 ### 严格只读赛事审计
 

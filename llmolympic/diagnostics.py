@@ -131,7 +131,11 @@ def _config_diagnostics() -> tuple[list[Diagnostic], bool]:
     for profile in profiles.values():
         if profile.provider == "openai" and not os.environ.get(profile.api_key_env or ""):
             checks.append(
-                Diagnostic("WARN", f"Provider Profile {profile.profile_id} 缺少凭据环境变量")
+                Diagnostic(
+                    "WARN",
+                    f"Provider Profile {profile.profile_id} 启动环境缺少凭据变量"
+                    "（本机 Web 管理页仍可临时录入）",
+                )
             )
         else:
             checks.append(Diagnostic("PASS", f"Provider Profile {profile.profile_id} 配置有效"))
