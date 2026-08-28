@@ -372,6 +372,25 @@ default_model = "llama3.1:8b"
             "环境变量名",
         ),
         (
+            '[profiles.bad]\nprovider = "openai"\napi_key_env = "PYTHONPATH"\n',
+            "大写凭据环境变量名",
+        ),
+        (
+            '[profiles.bad]\nprovider = "openai"\napi_key_env = "HTTP_PROXY"\n',
+            "大写凭据环境变量名",
+        ),
+        (
+            '[profiles.bad]\nprovider = "openai"\napi_key_env = "KEY"\n',
+            "大写凭据环境变量名",
+        ),
+        (
+            (
+                '[profiles.bad]\nprovider = "openai"\n'
+                'api_key_env = "LLMOLYMPIC_CONTROL_PROTOCOL_TOKEN"\n'
+            ),
+            "大写凭据环境变量名",
+        ),
+        (
             '[profiles.bad]\nprovider = "ollama"\napi_key_env = "UNUSED_KEY"\n',
             "不应声明",
         ),

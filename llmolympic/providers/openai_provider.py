@@ -24,6 +24,26 @@ from llmolympic.providers.base import (
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
+def openai_route_id(
+    base_url: str | None,
+    model: str,
+    *,
+    source: str = "OpenAI base_url",
+) -> str:
+    """Derive the credential-free route identity used by OpenAI Profiles."""
+
+    resolved_base_url = validate_base_url(
+        base_url or _DEFAULT_BASE_URL,
+        source=source,
+        require_https_for_remote=True,
+    )
+    return _stable_route_id(
+        family="openai-chat-completions-v1",
+        target=_endpoint_fingerprint(resolved_base_url),
+        model=model,
+    )
+
+
 def _isolate_client(client):
     """Remove OpenAI SDK settings inherited from its global environment."""
     # Passing empty strings prevents the constructor from consulting the
@@ -105,7 +125,7 @@ class OpenAIProvider(Provider):
             require_https_for_remote=True,
         )
         self.profile_id = profile_id
-        self._route_endpoint_fingerprint = _endpoint_fingerprint(resolved_base_url)
+        self._route_base_url = resolved_base_url
         # Profiles always bind a key to one isolated endpoint. Preserve the
         # documented legacy SDK behavior for the exact official endpoint, but
         # never forward ambient OpenAI organization, project, admin, webhook,
@@ -136,11 +156,7 @@ class OpenAIProvider(Provider):
             self._async_client = _isolate_client(self._async_client)
 
     def route_id_for(self, model: str) -> str:
-        return _stable_route_id(
-            family="openai-chat-completions-v1",
-            target=self._route_endpoint_fingerprint,
-            model=model,
-        )
+        return openai_route_id(self._route_base_url, model)
 
     def usage_support_for(self, model: str) -> UsageSupport:
         del model

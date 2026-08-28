@@ -15,6 +15,7 @@ const MAX_MATCHES = 100;
 const MAX_MOVE_CHARACTERS = 4096;
 const MAX_PARTICIPATION_PLAYERS = 16;
 const MAX_CONTROL_PLAYERS = 16;
+const MAX_PROFILE_API_KEY_BYTES = 8 * 1024;
 const PARTICIPATION_POLL_INTERVAL = 1000;
 const SAFE_PUBLIC_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CAPABILITY_TOKEN = /^[A-Za-z0-9_-]{32,256}$/;
@@ -94,6 +95,7 @@ const ERROR_COPY = {
   control_overloaded: "本机比赛控制服务正忙，请稍后重试。",
   large_tournament_confirmation_required: "循环赛规模超过默认保护门槛；请勾选规模确认后重新生成预览。",
   profile_unavailable: "所选 Provider Profile 当前不可用，请检查服务环境后重试。",
+  provider_pricing_required: "所选云端 Profile 缺少当前模型的精确定价，请在 config.toml 的 pricing 中配置后重启服务。",
   preview_stale: "这份准备态预览已经失效，请重新创建任务。",
   resume_unavailable: "无法从这份赛事 checkpoint 恢复，请刷新任务状态或检查本机存档。",
   controller_restarted: "本机控制服务曾重启；为避免重复调用或计费，这项任务不会自动重跑。",
@@ -244,8 +246,9 @@ async function fetchJSON(path, signal) {
     payload = null;
   }
   if (!response.ok) {
-    const code = payload && payload.error && payload.error.code;
-    throw new PublicError(typeof code === "string" ? code : "request_failed", response.status);
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
   }
   if (!isObject(payload) || payload.api_version !== API_VERSION) {
     throw new PublicError("protocol_error");
@@ -354,6 +357,99 @@ async function fetchControlJSON(
     throw new PublicError("protocol_error");
   }
   return payload;
+}
+
+async function fetchControlNoContent(
+  path,
+  adminToken,
+  { body = null, method, signal } = {},
+) {
+  if (!adminToken || !ADMIN_TOKEN.test(adminToken)) throw new PublicError("control_unauthorized", 401);
+  const headers = {
+    Accept: "application/json",
+    Authorization: `Bearer ${adminToken}`,
+  };
+  if (body !== null) headers["Content-Type"] = "application/json";
+  let response;
+  try {
+    response = await fetch(path, {
+      body: body === null ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers,
+      method,
+      referrerPolicy: "no-referrer",
+      signal,
+    });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    throw new PublicError("network_error");
+  }
+  if (response.status === 204) return;
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    const candidate = payload && payload.error && payload.error.code;
+    const code = PUBLIC_ERROR_CODES.has(candidate) ? candidate : "request_failed";
+    throw new PublicError(code, response.status);
+  }
+  throw new PublicError("protocol_error", response.status);
+}
+
+function profileCredentialPath(profileId) {
+  if (typeof profileId !== "string" || !SAFE_PUBLIC_ID.test(profileId)) {
+    throw new PublicError("invalid_request");
+  }
+  return `/api/v1/control/profiles/${encodeURIComponent(profileId)}/credential`;
+}
+
+function profileKeyValidationError(value) {
+  if (typeof value !== "string" || value.length === 0) return "请输入 API Key。";
+  if (value.length > MAX_PROFILE_API_KEY_BYTES) {
+    return `API Key 不能超过 ${MAX_PROFILE_API_KEY_BYTES} 个字符。`;
+  }
+  if (!/^[\x21-\x7e]+$/.test(value)) {
+    return "API Key 只能包含不带空白的可打印 ASCII 字符。";
+  }
+  return null;
+}
+
+function profileKeyCanApply(value) {
+  return profileKeyValidationError(value) === null;
+}
+
+function profileCredentialRequest(method, apiKey = "") {
+  if (method === "DELETE") return { body: null, method };
+  if (method === "PUT" && profileKeyCanApply(apiKey)) {
+    return { body: { api_key: apiKey }, method };
+  }
+  throw new PublicError("invalid_request");
+}
+
+function profileCredentialSuccess(method, profile) {
+  const label = profile && profile.displayName ? profile.displayName : "Provider Profile";
+  const available = Boolean(profile && profile.available);
+  if (method === "PUT") {
+    return {
+      announcement: available
+        ? `${label} 的 Key 已应用。`
+        : `${label} 的 Key 已应用，但服务仍报告未就绪。`,
+      focusTarget: available ? "clear" : "input",
+    };
+  }
+  if (method === "DELETE") {
+    return {
+      announcement: available
+        ? `已清除 ${label} 的网页 Key；启动环境仍提供 Key。`
+        : `${label} 的 Key 已清除。`,
+      focusTarget: available ? "clear" : "input",
+    };
+  }
+  throw new PublicError("invalid_request");
 }
 
 const participationCapabilities = new Map();
@@ -1644,6 +1740,156 @@ function ControlField({ children, error, help, id, label }) {
   );
 }
 
+function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profile }) {
+  const [apiKey, setApiKey] = useState("");
+  const [state, setState] = useState({ announcement: "", busy: false, error: null });
+  const [validationVisible, setValidationVisible] = useState(false);
+  const clearButtonRef = useRef(null);
+  const inputRef = useRef(null);
+  const statusId = `profile-credential-${profile.profileId}-status`;
+  const inputId = `profile-credential-${profile.profileId}-key`;
+  const announcementId = `profile-credential-${profile.profileId}-announcement`;
+  const validationError = validationVisible ? profileKeyValidationError(apiKey) : null;
+
+  const focusControl = (target) => {
+    window.requestAnimationFrame(() => {
+      const element = target === "clear" ? clearButtonRef.current : inputRef.current;
+      if (element) element.focus({ preventScroll: true });
+    });
+  };
+
+  const updateCredential = async (method) => {
+    if (state.busy) return;
+    if (method === "PUT" && !profileKeyCanApply(apiKey)) {
+      setValidationVisible(true);
+      setState({ announcement: "", busy: false, error: null });
+      focusControl("input");
+      return;
+    }
+    setState({ announcement: "", busy: true, error: null });
+    let operationCompleted = false;
+    try {
+      const request = profileCredentialRequest(method, apiKey);
+      await fetchControlNoContent(profileCredentialPath(profile.profileId), adminToken, {
+        ...request,
+      });
+      operationCompleted = true;
+      setApiKey("");
+      setValidationVisible(false);
+      const refreshedProfile = await onCatalogChanged(profile.profileId);
+      if (!refreshedProfile) throw new PublicError("protocol_error");
+      const success = profileCredentialSuccess(method, refreshedProfile);
+      setState({ announcement: success.announcement, busy: false, error: null });
+      focusControl(success.focusTarget);
+    } catch (error) {
+      if ([401, 403].includes(error.status)) onAuthLost();
+      if (operationCompleted) {
+        setApiKey("");
+        setValidationVisible(false);
+      }
+      setState({
+        announcement: operationCompleted
+          ? `${profile.displayName} 的 Key 操作已完成，但状态刷新失败。`
+          : "",
+        busy: false,
+        error,
+      });
+      focusControl(profile.available ? "clear" : "input");
+    }
+  };
+
+  return h("li", { className: "profile-credential-row" },
+    h("div", { className: "profile-credential-summary" },
+      h("div", null,
+        h("strong", null, profile.displayName),
+        h("span", null, `${profile.provider}${profile.defaultModel ? ` · ${profile.defaultModel}` : ""}`),
+      ),
+      h("span", {
+        className: `profile-credential-status ${profile.available ? "ready" : "missing"}`,
+        id: statusId,
+      }, profile.available ? "Key 已就绪" : "Key 未就绪"),
+    ),
+    profile.available
+      ? h("div", { className: "profile-credential-actions" },
+        h("p", { className: "field-help" }, "清除只影响之后启动的任务；正在运行的任务仍持有自己的副本。若环境仍提供 Key，刷新后会继续显示为已就绪。"),
+        h("button", {
+          className: "button small danger-outline",
+          disabled: state.busy,
+          onClick: () => updateCredential("DELETE"),
+          ref: clearButtonRef,
+          type: "button",
+        }, state.busy ? "正在清除…" : "清除本次 Key"),
+      )
+      : h("div", { className: "profile-credential-entry" },
+        h(ControlField, {
+          error: validationError,
+          help: `最多 ${MAX_PROFILE_API_KEY_BYTES} 个字符，只能使用不含空白的可打印 ASCII 字符。仅供当前本机 Web 服务和随后启动的对应任务使用；应用不会将它写入比赛表单、任务记录、Web Storage 或网址。`,
+          id: inputId,
+          label: `${profile.displayName} 的 API Key`,
+        }, (attributes) => h("input", {
+          ...attributes,
+          "aria-describedby": `${attributes["aria-describedby"] || ""} ${statusId}`.trim(),
+          autoCapitalize: "none",
+          autoComplete: "new-password",
+          autoCorrect: "off",
+          disabled: state.busy,
+          maxLength: MAX_PROFILE_API_KEY_BYTES,
+          onBlur: () => setValidationVisible(true),
+          onChange: (event) => {
+            setApiKey(event.target.value);
+            setValidationVisible(true);
+          },
+          ref: inputRef,
+          spellCheck: false,
+          type: "password",
+          value: apiKey,
+        })),
+        h("button", {
+          className: "button small primary",
+          disabled: state.busy,
+          onClick: () => updateCredential("PUT"),
+          type: "button",
+        }, state.busy ? "正在应用…" : "应用 Key"),
+      ),
+    state.error ? h("p", { className: "field-error", role: "alert" }, errorCopy(state.error)) : null,
+    h("p", {
+      "aria-atomic": "true",
+      "aria-live": "polite",
+      className: "profile-credential-announcement",
+      id: announcementId,
+      role: "status",
+    }, state.announcement),
+  );
+}
+
+function ProfileCredentialPanel({ adminToken, onAuthLost, onCatalogChanged, profiles }) {
+  const openAIProfiles = profiles.filter((profile) => (
+    profile.provider === "openai" && profile.defaultModel
+  ));
+  if (!openAIProfiles.length) return null;
+  return h("section", {
+    className: "panel profile-credential-panel",
+    "aria-labelledby": "profile-credentials-heading",
+  },
+  h("div", { className: "panel-head" },
+    h("div", null,
+      h("p", { className: "panel-overline" }, "SESSION CREDENTIALS"),
+      h("h2", { id: "profile-credentials-heading" }, "Provider Key"),
+    ),
+    h("span", { className: "panel-kicker" }, "仅本次服务会话"),
+  ),
+  h("p", { className: "profile-credential-notice" }, "应用不会回显或持久化 Key；它会留在当前服务内存，并按需复制给随后启动的对应任务。服务重启后，本次设置会失效。"),
+  h("ul", { className: "profile-credential-list" },
+    ...openAIProfiles.map((profile) => h(ProfileCredentialRow, {
+      adminToken,
+      key: profile.profileId,
+      onAuthLost,
+      onCatalogChanged,
+      profile,
+    })),
+  ));
+}
+
 function ControlPlayerEditor({ catalog, error, index, mode, onChange, onRemove, player, removable }) {
   const id = `player-${index}`;
   const availableProfiles = catalog.profiles;
@@ -1823,6 +2069,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
   const prepareKeyRef = useRef(null);
   const startKeyRef = useRef(null);
   const discardKeyRef = useRef(null);
+  const catalogInitializedRef = useRef(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1831,14 +2078,17 @@ function NewJobPage({ adminToken, onAuthLost }) {
       .then((payload) => {
         const catalog = normalizeControlCatalog(payload);
         const game = catalog.games.find((item) => item.supportedModes.includes("play")) || catalog.games[0];
-        setForm((previous) => ({
-          ...previous,
-          game: game.name,
-          judges: game.requiresJudgePanel
-            ? [0, 1, 2].map((index) => defaultControlJudge(index, catalog))
-            : [],
-          players: [defaultControlPlayer(0, catalog), defaultControlPlayer(1, catalog)],
-        }));
+        if (!catalogInitializedRef.current) {
+          catalogInitializedRef.current = true;
+          setForm((previous) => ({
+            ...previous,
+            game: game.name,
+            judges: game.requiresJudgePanel
+              ? [0, 1, 2].map((index) => defaultControlJudge(index, catalog))
+              : [],
+            players: [defaultControlPlayer(0, catalog), defaultControlPlayer(1, catalog)],
+          }));
+        }
         setCatalogState({ catalog, error: null, loading: false });
       })
       .catch((error) => {
@@ -1858,6 +2108,32 @@ function NewJobPage({ adminToken, onAuthLost }) {
     prepareKeyRef.current = null;
     startKeyRef.current = null;
     discardKeyRef.current = null;
+  };
+  const refreshCatalogAfterCredentialChange = async (profileId) => {
+    const payload = await fetchControlJSON("/api/v1/control/catalog", adminToken);
+    const refreshedCatalog = normalizeControlCatalog(payload);
+    const refreshedProfile = refreshedCatalog.profiles.find((item) => item.profileId === profileId);
+    if (!refreshedProfile) throw new PublicError("protocol_error");
+    setErrors({});
+    setPrepared(null);
+    setPrepareError(null);
+    prepareKeyRef.current = null;
+    startKeyRef.current = null;
+    discardKeyRef.current = null;
+    setCatalogState((previous) => {
+      if (!previous.catalog) return previous;
+      return {
+        catalog: {
+          ...previous.catalog,
+          profiles: previous.catalog.profiles.map((item) => (
+            item.profileId === profileId ? refreshedProfile : item
+          )),
+        },
+        error: null,
+        loading: false,
+      };
+    });
+    return refreshedProfile;
   };
 
   if (catalogState.loading) {
@@ -2046,6 +2322,12 @@ function NewJobPage({ adminToken, onAuthLost }) {
       h("h1", { className: "detail-title", id: "new-title" }, "新建比赛 / 任务"),
       h("p", { className: "hero-copy" }, "先选择项目、参赛者和硬预算，再生成不会自动运行的准备态预览。"),
     ),
+    h(ProfileCredentialPanel, {
+      adminToken,
+      onAuthLost,
+      onCatalogChanged: refreshCatalogAfterCredentialChange,
+      profiles: catalog.profiles,
+    }),
     errorMessages.length ? h("div", {
       className: "form-error-summary",
       ref: errorSummaryRef,
@@ -5092,6 +5374,11 @@ if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
     countCharacters,
     normalizeControlCatalog,
     normalizeControlJob,
+    profileCredentialPath,
+    profileCredentialRequest,
+    profileCredentialSuccess,
+    profileKeyCanApply,
+    profileKeyValidationError,
     participationComponentKey,
     participationErrorClearsCapability,
     participationKeepsCapability,

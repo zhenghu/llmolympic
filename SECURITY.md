@@ -35,21 +35,43 @@ sidecar 在写入前即使用与 Web DTO 相同的字段白名单，发布失败
 阶段 4.5b 的本机比赛控制面使用另一枚启动时随机生成的 256-bit admin capability。管理链接
 只通过可信终端或项目专属 `0700` 状态目录中的 `0600` 临时文件交给浏览器；fragment 会立即
 从地址栏清除，凭证不写 jobs sidecar、比赛档案、直播事件或日志。所有 control API 都要求
-Bearer admin capability；改变状态的请求还要求精确同源 Origin、严格 JSON、体积上限和
-幂等键。jobs sidecar 只保存脱敏的不可变比赛配置、准备态摘要、任务状态、子进程引用和最终档案
+Bearer admin capability；所有写请求另要求精确同源 Origin，需要 JSON 请求体的端点还要求
+严格 JSON 和体积上限，任务 prepare/start/stop 另要求幂等键。jobs sidecar 只保存脱敏的不可变
+比赛配置、准备态摘要、任务状态、子进程引用和最终档案
 引用，不保存 jobs 租约。权限为 `0600` 的独立 manager lock 文件提供单控制器互斥；它不代表
 任务存活性，也不替代循环赛或锦标赛 checkpoint 的 runner lease。Web 服务或受控 worker
 运行时不得删除 jobs sidecar 或 manager lock；两者在服务和 worker 全部停止后可删除并按需
 重建，不是正式档案。
 
-浏览器控制面只能选择内置 Human/mock 或预先配置的 Profile ID，不能提供 API Key、环境变量
-名、base URL、数据库路径、shell 命令或任意模型覆盖。prepare 只验证请求并保存不可变准备态、
-工作量预览和受信 Profile 的无凭据安全投影，不构造或调用 Provider；配置摘要绑定 Profile ID、
-Provider、endpoint、默认模型和凭据环境变量名。start 必须经过第二次确认，重新核对精确预览与
-Profile 摘要，再以 `shell=False` 的固定参数和最小化环境启动独立 CLI worker。控制器在生成
-child 环境时复核摘要，child 又在构造 Provider 前独立复核；任一处变化都会在调用或计费前安全
-失败。Profile 还必须在启动前确认凭据就绪，并具备调用、输入 Token、单次输出、总输出和估算
-费用的完整硬上限。FastAPI 不直接调用 Provider，也不写正式档案、预算或 ELO。
+浏览器控制面只能选择内置 Human/mock 或预先配置的 Profile ID，不能提供环境变量名、
+base URL、数据库路径、shell 命令或任意模型覆盖。持有 admin capability 的管理页可为已配置
+`api_key_env` 和 `default_model` 的 OpenAI Profile 录入或清除 API Key；Ollama、未知或不完整
+Profile 不接受。浏览器提交的 Key 绑定到 Profile ID 及由全部无凭据 Profile 字段派生的配置摘要，
+不会在摘要不同的配置上复用。配置不会在 Web 服务会话中热重载；修改后需要重启服务，而重启
+也会清空网页录入的 Key。若配置在 prepare 与 child 启动间漂移，child 的独立摘要复核会在
+Provider 构造前安全失败。
+
+Profile 的 `api_key_env` 只接受大写凭据型名称，并须以 `_API_KEY`、`_TOKEN`、`_SECRET` 或
+`_KEY` 结尾；`LLMOLYMPIC_*` 控制协议名也被保留。这样浏览器提交值不能被误路由为
+`PYTHONPATH`、动态加载器、代理、证书或其他会改变 child 执行/网络行为的环境变量。
+
+应用不主动持久化该 Key 或其哈希：它不进入 `config.toml`、SQLite 主库或 sidecar、job spec/预览、
+正式档案、URL/fragment、Web Storage、业务日志或应用级请求体日志。它仍会短暂存在于浏览器
+表单/HTTP 请求体与 Python 进程内存。清除只是最佳努力地移除应用引用，不是可验证的物理内存擦除；
+也不能保证浏览器扩展、DevTools、密码管理器、操作系统换页/崩溃转储或同账户其他进程不可见。
+
+prepare 只验证请求并保存不可变准备态、工作量预览和受信 Profile 的无凭据安全投影，
+不构造或调用 Provider。start 必须经过第二次确认，重新核对精确预览与完整 Profile 摘要，
+再以 `shell=False` 的固定参数和最小化环境启动独立 CLI worker。控制器仅把任务所用 Profile 的 Key
+按其已配置 `api_key_env` 复制到该 child，child 在构造 Provider 前独立复核摘要。继续支持从
+`llmolympic web` 的启动环境变量取得 Key；网页清除不会删除该环境值。网页提交的 Key 在服务
+重启后失效，checkpoint 恢复前必须重新录入或从启动环境提供。
+
+清除 Key 只影响之后启动的任务；已运行 worker 保留自己的 child 环境副本，在途请求也无法撤回。
+需要立即阻止后续使用时，应停止相关任务或在 Provider 端撤销/轮换 Key。admin capability 持有者
+在 Key 就绪期间可启动并使其发生 Provider 调用；这些调用仍需完整的调用、输入 Token、单次输出、
+总输出和估算费用硬上限，但本地估算不是 Provider 端的账号或账单限额。FastAPI 不直接调用
+Provider，也不写正式档案、预算或 ELO。
 
 worker 中断后的 `play`/`series` 不自动重跑。循环赛和锦标赛只允许显式恢复：resume 请求只能
 携带对应 checkpoint ID，不能携带新配置或预算；未过期的对应 runner lease 仍在活动时拒绝恢复。

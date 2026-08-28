@@ -8,13 +8,14 @@ import os
 import sqlite3
 import stat
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from llmolympic import control
-from llmolympic.config import ProviderProfile
+from llmolympic.config import ProviderProfile, ProviderTokenPrice
 from llmolympic.control import (
     CONTROL_SCHEMA_VERSION,
     ControlBudgetSpec,
@@ -504,23 +505,31 @@ def test_resume_preview_binds_named_profile_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile = ProviderProfile(
-        profile_id="local",
-        provider="ollama",
+        profile_id="cloud",
+        provider="openai",
         default_model="model-a",
-        base_url="http://127.0.0.1:11434/v1",
-        display_name="Local profile",
+        base_url="https://provider.example/v1",
+        api_key_env="RESUME_CLOUD_PROFILE_KEY",
+        display_name="Cloud profile",
     )
+    monkeypatch.setenv("RESUME_CLOUD_PROFILE_KEY", "test-only-placeholder")
     database = _profile_checkpoint_database(tmp_path / "profile-resume.db", profile)
-    monkeypatch.setattr(control, "load_profiles", lambda: {"local": profile})
+    monkeypatch.setattr(control, "load_profiles", lambda: {"cloud": profile})
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: pytest.fail("resume must use its frozen budget, not current pricing"),
+    )
 
     preview = validate_job_spec(
         _resume_spec("profile-resume"),
         archive_database=database,
+        require_current_pricing=True,
     )
 
     assert preview.requires_provider_budget is True
     assert preview.uses_frozen_budget is True
-    assert tuple(item.profile_id for item in preview.prepared_profiles) == ("local",)
+    assert tuple(item.profile_id for item in preview.prepared_profiles) == ("cloud",)
     assert preview.prepared_profiles[0].default_model == "model-a"
     assert preview.prepared_profiles[0].effective_models == ("frozen-model",)
     assert preview.prepared_profiles[0].configuration_digest == (
@@ -870,6 +879,181 @@ def test_profile_jobs_require_a_ready_allowlisted_profile_and_complete_budget(
     with pytest.raises(ControlError, match="profile_unavailable") as missing_profile:
         validate_job_spec(unavailable)
     assert missing_profile.value.code == "profile_unavailable"
+
+
+def test_new_profile_job_requires_exact_current_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="priced-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="PRICED_PROFILE_KEY",
+    )
+    monkeypatch.setenv("PRICED_PROFILE_KEY", "secret")
+    monkeypatch.setattr(
+        control,
+        "load_profiles",
+        lambda: {profile.profile_id: profile},
+    )
+    spec = _profile_spec(profile.profile_id)
+
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:priced-profile:other-model": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
+    with pytest.raises(ControlError, match="provider_pricing_required") as missing:
+        validate_job_spec(spec, require_current_pricing=True)
+    assert missing.value.code == "provider_pricing_required"
+
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:priced-profile:fixed-model": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
+    preview = validate_job_spec(spec, require_current_pricing=True)
+    assert preview.prepared_profiles[0].effective_models == ("fixed-model",)
+
+    dynamic = replace(profile, default_model="openrouter/auto")
+    monkeypatch.setattr(
+        control,
+        "load_profiles",
+        lambda: {dynamic.profile_id: dynamic},
+    )
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:priced-profile:openrouter/auto": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
+    with pytest.raises(ControlError, match="provider_pricing_required"):
+        validate_job_spec(spec, require_current_pricing=True)
+
+
+def test_new_profile_job_rejects_conflicting_prices_for_one_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profiles = {
+        "first": ProviderProfile(
+            profile_id="first",
+            provider="openai",
+            default_model="fixed-model",
+            base_url="https://PROVIDER.example:443/v1/",
+            api_key_env="FIRST_PROFILE_KEY",
+        ),
+        "second": ProviderProfile(
+            profile_id="second",
+            provider="openai",
+            default_model="fixed-model",
+            base_url="https://provider.example/v1",
+            api_key_env="SECOND_PROFILE_KEY",
+        ),
+    }
+    monkeypatch.setenv("FIRST_PROFILE_KEY", "first-placeholder")
+    monkeypatch.setenv("SECOND_PROFILE_KEY", "second-placeholder")
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    spec = ControlJobSpec(
+        mode="play",
+        game="math_quiz",
+        players=tuple(
+            ControlPlayerSpec(kind="profile", profile_id=profile_id)
+            for profile_id in profiles
+        ),
+        rounds=1,
+        budget=_profile_spec("first").budget,
+    )
+    first_price = ProviderTokenPrice(Decimal(1), Decimal(2))
+    second_price = ProviderTokenPrice(Decimal(3), Decimal(4))
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:first:fixed-model": first_price,
+            "profile:second:fixed-model": second_price,
+        },
+    )
+
+    with pytest.raises(ControlError, match="provider_pricing_required") as rejected:
+        validate_job_spec(spec, require_current_pricing=True)
+    assert rejected.value.code == "provider_pricing_required"
+
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:first:fixed-model": first_price,
+            "profile:second:fixed-model": first_price,
+        },
+    )
+    preview = validate_job_spec(spec, require_current_pricing=True)
+    assert tuple(item.profile_id for item in preview.prepared_profiles) == (
+        "first",
+        "second",
+    )
+
+    equivalent_first = ProviderTokenPrice(
+        Decimal("1.0000000001"),
+        Decimal("2.0000000001"),
+    )
+    equivalent_second = ProviderTokenPrice(
+        Decimal("1.0000000002"),
+        Decimal("2.0000000002"),
+    )
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:first:fixed-model": equivalent_first,
+            "profile:second:fixed-model": equivalent_second,
+        },
+    )
+    validate_job_spec(spec, require_current_pricing=True)
+
+
+def test_invalid_current_pricing_has_a_stable_control_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="invalid-pricing",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="INVALID_PRICING_KEY",
+    )
+    monkeypatch.setenv("INVALID_PRICING_KEY", "secret")
+    monkeypatch.setattr(
+        control,
+        "load_profiles",
+        lambda: {profile.profile_id: profile},
+    )
+
+    def invalid_pricing() -> dict[str, object]:
+        raise ValueError("private pricing parser detail")
+
+    monkeypatch.setattr(control, "load_provider_pricing", invalid_pricing)
+    with pytest.raises(ControlError, match="provider_pricing_required") as rejected:
+        validate_job_spec(
+            _profile_spec(profile.profile_id),
+            require_current_pricing=True,
+        )
+    assert rejected.value.code == "provider_pricing_required"
+    assert "private pricing parser detail" not in str(rejected.value)
 
 
 def test_profile_projection_validation_errors_are_stable_control_errors(

@@ -20,7 +20,8 @@ from pathlib import Path
 
 _PROJECT_CONFIG = Path(__file__).resolve().parent.parent / "config.toml"
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
-_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_PROFILE_CREDENTIAL_ENV_RE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
+_PROFILE_CREDENTIAL_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")
 _PROFILE_FIELDS = frozenset(
     {"provider", "default_model", "base_url", "api_key_env", "display_name"}
 )
@@ -87,6 +88,17 @@ class ConfigSource:
 
     path: Path
     explicit: bool
+
+
+def is_profile_credential_environment_name(value: str) -> bool:
+    """Return whether a Profile env name is credential-only and child-safe."""
+
+    return (
+        isinstance(value, str)
+        and bool(_PROFILE_CREDENTIAL_ENV_RE.fullmatch(value))
+        and not value.startswith("LLMOLYMPIC_")
+        and value.endswith(_PROFILE_CREDENTIAL_ENV_SUFFIXES)
+    )
 
 
 def _warn_if_config_is_shared(path: Path) -> None:
@@ -415,8 +427,13 @@ def load_profiles() -> dict[str, ProviderProfile]:
         base_url = _optional_profile_string(profile_id, raw_values, "base_url")
         api_key_env = _optional_profile_string(profile_id, raw_values, "api_key_env")
         display_name = _optional_profile_string(profile_id, raw_values, "display_name")
-        if api_key_env is not None and not _ENV_NAME_RE.fullmatch(api_key_env):
-            raise ValueError(f"Profile {profile_id!r} 的 api_key_env 必须是合法的环境变量名")
+        if api_key_env is not None and not is_profile_credential_environment_name(
+            api_key_env
+        ):
+            raise ValueError(
+                f"Profile {profile_id!r} 的 api_key_env 必须是大写凭据环境变量名，"
+                "并以 _API_KEY、_TOKEN、_SECRET 或 _KEY 结尾"
+            )
         if provider == "openai" and api_key_env is None:
             raise ValueError(
                 f"OpenAI 兼容 Profile {profile_id!r} 必须声明 api_key_env，不会隐式复用其他端点的 Key"

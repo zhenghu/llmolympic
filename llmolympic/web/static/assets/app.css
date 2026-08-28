@@ -579,6 +579,21 @@ input[type="range"] { width: 100%; accent-color: var(--coral); cursor: pointer; 
 .control-field input[aria-invalid="true"],
 .control-field select[aria-invalid="true"] { border-color: var(--danger); box-shadow: 0 0 0 2px rgba(169, 52, 48, .08); }
 .control-field select option:disabled { color: #7d8987; }
+.profile-credential-panel { margin-bottom: 20px; }
+.profile-credential-notice { margin: 0; padding: 16px 24px; color: var(--ink-soft); border-bottom: 1px solid var(--line); font-size: 14px; }
+.profile-credential-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }
+.profile-credential-row { display: grid; gap: 14px; padding: 18px 24px; }
+.profile-credential-row + .profile-credential-row { border-top: 1px solid var(--line); }
+.profile-credential-summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.profile-credential-summary > div { display: grid; gap: 3px; min-width: 0; }
+.profile-credential-summary span { color: var(--ink-soft); font-size: 13px; }
+.profile-credential-status { flex: 0 0 auto; padding: 5px 9px; border-radius: 999px; font-size: 12px; font-weight: 800; }
+.profile-credential-status.ready { color: #176b4a; background: rgba(70, 167, 122, .12); }
+.profile-credential-status.missing { color: var(--danger); background: rgba(169, 52, 48, .09); }
+.profile-credential-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; }
+.profile-credential-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.profile-credential-actions .field-help { margin: 0; }
+.profile-credential-announcement { min-height: 1.45em; margin: 0; color: #176b4a; font-size: 12px; line-height: 1.45; }
 .field-error, .section-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.45; }
 .section-error { padding: 12px 14px; border-radius: 12px; background: rgba(169, 52, 48, .05); }
 .roster-list { display: grid; gap: 14px; }
@@ -745,6 +760,10 @@ noscript { display: block; margin: 20px; padding: 16px; border: 1px solid var(--
   .control-job-card .job-status { justify-self: start; grid-column: 1; }
   .control-job-card .match-arrow { grid-column: 2; grid-row: 1 / span 2; position: static; }
   .field-grid, .roster-card-grid, .roster-card.compact .roster-card-grid, .budget-grid, .preview-grid, .budget-preview { grid-template-columns: 1fr; }
+  .profile-credential-summary, .profile-credential-actions { align-items: stretch; flex-direction: column; }
+  .profile-credential-entry { grid-template-columns: 1fr; }
+  .profile-credential-entry .button, .profile-credential-actions .button { width: 100%; }
+  .profile-credential-notice, .profile-credential-row { padding-right: 16px; padding-left: 16px; }
   .form-section-body, .prepared-body { padding: 17px 16px 20px; }
   .roster-card { padding: 15px 13px; }
   .confirmation-box { align-items: stretch; flex-direction: column; }

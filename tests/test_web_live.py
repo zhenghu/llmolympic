@@ -387,14 +387,15 @@ def test_live_spa_routes_keep_writes_inside_participation_and_control(
     assert set(openapi["paths"]["/api/v1/live/{live_id}"]) == {"get"}
     assert "/live/{live_id}" not in openapi["paths"]
     allowed_write_paths = {
-        "/api/v1/control/jobs",
-        "/api/v1/control/jobs/{job_id}/cancel",
-        "/api/v1/control/jobs/{job_id}/start",
+        "/api/v1/control/jobs": {"post"},
+        "/api/v1/control/jobs/{job_id}/cancel": {"post"},
+        "/api/v1/control/jobs/{job_id}/start": {"post"},
+        "/api/v1/control/profiles/{profile_id}/credential": {"delete", "put"},
         (
             "/api/v1/participation/{session_id}/{seat_id}/requests/"
             "{request_id}/submissions"
-        ),
+        ): {"post"},
     }
     for path, path_item in openapi["paths"].items():
         writes = {"post", "put", "patch", "delete"} & set(path_item)
-        assert writes == ({"post"} if path in allowed_write_paths else set())
+        assert writes == allowed_write_paths.get(path, set())
