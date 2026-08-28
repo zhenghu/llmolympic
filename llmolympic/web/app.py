@@ -224,6 +224,7 @@ def _public_control_error(exc: ControlError) -> tuple[str, int]:
         "job_conflict",
         "job_not_stoppable",
         "job_capacity",
+        "provider_pricing_required",
         "resume_unavailable",
     }:
         public_code = (
@@ -551,6 +552,12 @@ def create_app(
             raise ControlError("control_unavailable")
         return job_store
 
+    def require_control_manager(request: Request) -> _ControlManager:
+        _admin_capability(request, control_token)
+        if control_manager is None:
+            raise ControlError("control_unavailable")
+        return control_manager
+
     def public_job(job: ControlJob) -> ControlJob:
         return control_manager.public_job(job) if control_manager is not None else job
 
@@ -703,16 +710,14 @@ def create_app(
         request: Request,
         profile_id: str,
     ) -> Response:
-        require_control(request)
+        manager = require_control_manager(request)
         _require_control_write_context(request)
         raw_payload = await _bounded_control_body(request)
         try:
             credential = ControlProfileCredentialRequest.model_validate(raw_payload)
         except (TypeError, ValueError) as exc:
             raise ControlError("invalid_request") from exc
-        if control_manager is None:
-            raise ControlError("control_unavailable")
-        await control_manager.set_profile_credential(
+        await manager.set_profile_credential(
             profile_id,
             credential.api_key.get_secret_value(),
         )
@@ -728,11 +733,9 @@ def create_app(
         request: Request,
         profile_id: str,
     ) -> Response:
-        require_control(request)
+        manager = require_control_manager(request)
         _require_control_write_context(request)
-        if control_manager is None:
-            raise ControlError("control_unavailable")
-        await control_manager.clear_profile_credential(profile_id)
+        await manager.clear_profile_credential(profile_id)
         return Response(status_code=204)
 
     @app.get(
@@ -772,6 +775,7 @@ def create_app(
                     if control_manager is None
                     else control_manager.profile_credential_ready
                 ),
+                require_current_pricing=True,
             )
         )
         job = await control_call(

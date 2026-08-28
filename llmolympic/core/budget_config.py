@@ -101,7 +101,9 @@ def _player_price_spec(player: LLMPlayer) -> str:
     return f"{player.provider.name}:{player.model}"
 
 
-def _configured_price(value: ProviderTokenPrice) -> TokenPrice:
+def configured_token_price(value: ProviderTokenPrice) -> TokenPrice:
+    """Freeze one configured decimal price exactly as the budget policy does."""
+
     if not isinstance(value, ProviderTokenPrice):
         raise UsageValidationError("pricing entries must be ProviderTokenPrice")
     return TokenPrice(
@@ -123,11 +125,17 @@ def _usage_support(player: LLMPlayer) -> UsageSupport:
         raise UsageValidationError("Provider returned invalid usage support") from exc
 
 
-def _is_dynamic_cost_route(player: LLMPlayer) -> bool:
-    if player.provider.name != "openai":
+def is_dynamic_openrouter_model(model: str) -> bool:
+    """Return whether OpenRouter chooses a billed model after dispatch."""
+
+    if not isinstance(model, str):
         return False
-    model = player.model.casefold()
+    model = model.casefold()
     return model in _DYNAMIC_OPENROUTER_MODELS or model.startswith("openrouter/auto-")
+
+
+def _is_dynamic_cost_route(player: LLMPlayer) -> bool:
+    return player.provider.name == "openai" and is_dynamic_openrouter_model(player.model)
 
 
 def resolve_provider_budget(
@@ -167,7 +175,7 @@ def resolve_provider_budget(
         raw_spec = _player_price_spec(player)
         raw_price = pricing.get(raw_spec)
         if raw_price is not None:
-            price: TokenPrice | None = _configured_price(raw_price)
+            price: TokenPrice | None = configured_token_price(raw_price)
         elif _usage_support(player) is UsageSupport.EXACT_ZERO or player.provider.name == "ollama":
             price = TokenPrice(0, 0)
         else:
@@ -214,5 +222,7 @@ def resolve_provider_budget(
 __all__ = [
     "ResolvedProviderBudget",
     "budget_is_enabled",
+    "configured_token_price",
+    "is_dynamic_openrouter_model",
     "resolve_provider_budget",
 ]

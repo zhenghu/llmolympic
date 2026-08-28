@@ -631,9 +631,14 @@ class ControlJobManager:
             runtime_credential = self._runtime_profile_credentials.get(profile.profile_id)
             if runtime_credential is not None:
                 try:
+                    # Normal config loading is process-cached, but keep this guard for
+                    # injected/reloadable loaders.  A managed child independently
+                    # validates the same digest from its fresh process configuration.
                     configuration_matches = (
-                        runtime_credential.configuration_digest
-                        == profile_configuration_digest(profile)
+                        secrets.compare_digest(
+                            runtime_credential.configuration_digest,
+                            profile_configuration_digest(profile),
+                        )
                     )
                 except (TypeError, ValueError):
                     configuration_matches = False
@@ -689,14 +694,11 @@ class ControlJobManager:
         async with self._lock:
             if self._closing:
                 raise ControlError("control_unavailable")
-            try:
-                self._credential_profile(profile_id)
-            except ControlError:
-                with self._credential_lock:
-                    self._runtime_profile_credentials.pop(profile_id, None)
-                raise
             with self._credential_lock:
-                self._runtime_profile_credentials.pop(profile_id, None)
+                removed = self._runtime_profile_credentials.pop(profile_id, None)
+            if removed is not None:
+                return
+            self._credential_profile(profile_id)
 
     def _child_environment(self, job: ControlJob, token: str) -> dict[str, str]:
         try:
@@ -704,6 +706,7 @@ class ControlJobManager:
                 job.spec,
                 archive_database=self.store.archive_database,
                 credential_ready=self.profile_credential_ready,
+                require_current_pricing=True,
             )
         except ControlError as exc:
             raise ControlError("worker_start_failed") from exc

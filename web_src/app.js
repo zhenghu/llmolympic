@@ -95,6 +95,7 @@ const ERROR_COPY = {
   control_overloaded: "本机比赛控制服务正忙，请稍后重试。",
   large_tournament_confirmation_required: "循环赛规模超过默认保护门槛；请勾选规模确认后重新生成预览。",
   profile_unavailable: "所选 Provider Profile 当前不可用，请检查服务环境后重试。",
+  provider_pricing_required: "所选云端 Profile 缺少当前模型的精确定价，请在 config.toml 的 pricing 中配置后重启服务。",
   preview_stale: "这份准备态预览已经失效，请重新创建任务。",
   resume_unavailable: "无法从这份赛事 checkpoint 恢复，请刷新任务状态或检查本机存档。",
   controller_restarted: "本机控制服务曾重启；为避免重复调用或计费，这项任务不会自动重跑。",
@@ -406,16 +407,47 @@ function profileCredentialPath(profileId) {
   return `/api/v1/control/profiles/${encodeURIComponent(profileId)}/credential`;
 }
 
+function profileKeyValidationError(value) {
+  if (typeof value !== "string" || value.length === 0) return "请输入 API Key。";
+  if (value.length > MAX_PROFILE_API_KEY_BYTES) {
+    return `API Key 不能超过 ${MAX_PROFILE_API_KEY_BYTES} 个字符。`;
+  }
+  if (!/^[\x21-\x7e]+$/.test(value)) {
+    return "API Key 只能包含不带空白的可打印 ASCII 字符。";
+  }
+  return null;
+}
+
 function profileKeyCanApply(value) {
-  return typeof value === "string"
-    && value.length <= MAX_PROFILE_API_KEY_BYTES
-    && /^[\x21-\x7e]+$/.test(value);
+  return profileKeyValidationError(value) === null;
 }
 
 function profileCredentialRequest(method, apiKey = "") {
   if (method === "DELETE") return { body: null, method };
   if (method === "PUT" && profileKeyCanApply(apiKey)) {
     return { body: { api_key: apiKey }, method };
+  }
+  throw new PublicError("invalid_request");
+}
+
+function profileCredentialSuccess(method, profile) {
+  const label = profile && profile.displayName ? profile.displayName : "Provider Profile";
+  const available = Boolean(profile && profile.available);
+  if (method === "PUT") {
+    return {
+      announcement: available
+        ? `${label} 的 Key 已应用。`
+        : `${label} 的 Key 已应用，但服务仍报告未就绪。`,
+      focusTarget: available ? "clear" : "input",
+    };
+  }
+  if (method === "DELETE") {
+    return {
+      announcement: available
+        ? `已清除 ${label} 的网页 Key；启动环境仍提供 Key。`
+        : `${label} 的 Key 已清除。`,
+      focusTarget: available ? "clear" : "input",
+    };
   }
   throw new PublicError("invalid_request");
 }
@@ -1710,24 +1742,59 @@ function ControlField({ children, error, help, id, label }) {
 
 function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profile }) {
   const [apiKey, setApiKey] = useState("");
-  const [state, setState] = useState({ busy: false, error: null });
+  const [state, setState] = useState({ announcement: "", busy: false, error: null });
+  const [validationVisible, setValidationVisible] = useState(false);
+  const clearButtonRef = useRef(null);
+  const inputRef = useRef(null);
   const statusId = `profile-credential-${profile.profileId}-status`;
   const inputId = `profile-credential-${profile.profileId}-key`;
+  const announcementId = `profile-credential-${profile.profileId}-announcement`;
+  const validationError = validationVisible ? profileKeyValidationError(apiKey) : null;
+
+  const focusControl = (target) => {
+    window.requestAnimationFrame(() => {
+      const element = target === "clear" ? clearButtonRef.current : inputRef.current;
+      if (element) element.focus({ preventScroll: true });
+    });
+  };
 
   const updateCredential = async (method) => {
-    if (state.busy || (method === "PUT" && !profileKeyCanApply(apiKey))) return;
-    setState({ busy: true, error: null });
+    if (state.busy) return;
+    if (method === "PUT" && !profileKeyCanApply(apiKey)) {
+      setValidationVisible(true);
+      setState({ announcement: "", busy: false, error: null });
+      focusControl("input");
+      return;
+    }
+    setState({ announcement: "", busy: true, error: null });
+    let operationCompleted = false;
     try {
       const request = profileCredentialRequest(method, apiKey);
       await fetchControlNoContent(profileCredentialPath(profile.profileId), adminToken, {
         ...request,
       });
+      operationCompleted = true;
       setApiKey("");
-      setState({ busy: false, error: null });
-      onCatalogChanged();
+      setValidationVisible(false);
+      const refreshedProfile = await onCatalogChanged(profile.profileId);
+      if (!refreshedProfile) throw new PublicError("protocol_error");
+      const success = profileCredentialSuccess(method, refreshedProfile);
+      setState({ announcement: success.announcement, busy: false, error: null });
+      focusControl(success.focusTarget);
     } catch (error) {
       if ([401, 403].includes(error.status)) onAuthLost();
-      setState({ busy: false, error });
+      if (operationCompleted) {
+        setApiKey("");
+        setValidationVisible(false);
+      }
+      setState({
+        announcement: operationCompleted
+          ? `${profile.displayName} 的 Key 操作已完成，但状态刷新失败。`
+          : "",
+        busy: false,
+        error,
+      });
+      focusControl(profile.available ? "clear" : "input");
     }
   };
 
@@ -1738,7 +1805,6 @@ function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profil
         h("span", null, `${profile.provider}${profile.defaultModel ? ` · ${profile.defaultModel}` : ""}`),
       ),
       h("span", {
-        "aria-live": "polite",
         className: `profile-credential-status ${profile.available ? "ready" : "missing"}`,
         id: statusId,
       }, profile.available ? "Key 已就绪" : "Key 未就绪"),
@@ -1750,12 +1816,14 @@ function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profil
           className: "button small danger-outline",
           disabled: state.busy,
           onClick: () => updateCredential("DELETE"),
+          ref: clearButtonRef,
           type: "button",
         }, state.busy ? "正在清除…" : "清除本次 Key"),
       )
       : h("div", { className: "profile-credential-entry" },
         h(ControlField, {
-          help: "仅供当前本机 Web 服务和随后启动的对应任务使用；应用不会将它写入比赛表单、任务记录、Web Storage 或网址。",
+          error: validationError,
+          help: `最多 ${MAX_PROFILE_API_KEY_BYTES} 个字符，只能使用不含空白的可打印 ASCII 字符。仅供当前本机 Web 服务和随后启动的对应任务使用；应用不会将它写入比赛表单、任务记录、Web Storage 或网址。`,
           id: inputId,
           label: `${profile.displayName} 的 API Key`,
         }, (attributes) => h("input", {
@@ -1766,19 +1834,31 @@ function ProfileCredentialRow({ adminToken, onAuthLost, onCatalogChanged, profil
           autoCorrect: "off",
           disabled: state.busy,
           maxLength: MAX_PROFILE_API_KEY_BYTES,
-          onChange: (event) => setApiKey(event.target.value),
+          onBlur: () => setValidationVisible(true),
+          onChange: (event) => {
+            setApiKey(event.target.value);
+            setValidationVisible(true);
+          },
+          ref: inputRef,
           spellCheck: false,
           type: "password",
           value: apiKey,
         })),
         h("button", {
           className: "button small primary",
-          disabled: state.busy || !profileKeyCanApply(apiKey),
+          disabled: state.busy,
           onClick: () => updateCredential("PUT"),
           type: "button",
         }, state.busy ? "正在应用…" : "应用 Key"),
       ),
     state.error ? h("p", { className: "field-error", role: "alert" }, errorCopy(state.error)) : null,
+    h("p", {
+      "aria-atomic": "true",
+      "aria-live": "polite",
+      className: "profile-credential-announcement",
+      id: announcementId,
+      role: "status",
+    }, state.announcement),
   );
 }
 
@@ -1980,7 +2060,6 @@ function PreparedJobPreview({ backLabel = "取消预览并返回修改", busy, e
 
 function NewJobPage({ adminToken, onAuthLost }) {
   const [catalogState, setCatalogState] = useState({ catalog: null, error: null, loading: true });
-  const [catalogReloadKey, setCatalogReloadKey] = useState(0);
   const [form, setForm] = useState(initialControlForm);
   const [errors, setErrors] = useState({});
   const [prepared, setPrepared] = useState(null);
@@ -2018,7 +2097,7 @@ function NewJobPage({ adminToken, onAuthLost }) {
         setCatalogState({ catalog: null, error, loading: false });
       });
     return () => controller.abort();
-  }, [adminToken, catalogReloadKey, onAuthLost]);
+  }, [adminToken, onAuthLost]);
 
   const catalog = catalogState.catalog;
   const changeForm = (updater) => {
@@ -2030,14 +2109,31 @@ function NewJobPage({ adminToken, onAuthLost }) {
     startKeyRef.current = null;
     discardKeyRef.current = null;
   };
-  const refreshCatalogAfterCredentialChange = () => {
+  const refreshCatalogAfterCredentialChange = async (profileId) => {
+    const payload = await fetchControlJSON("/api/v1/control/catalog", adminToken);
+    const refreshedCatalog = normalizeControlCatalog(payload);
+    const refreshedProfile = refreshedCatalog.profiles.find((item) => item.profileId === profileId);
+    if (!refreshedProfile) throw new PublicError("protocol_error");
     setErrors({});
     setPrepared(null);
     setPrepareError(null);
     prepareKeyRef.current = null;
     startKeyRef.current = null;
     discardKeyRef.current = null;
-    setCatalogReloadKey((value) => value + 1);
+    setCatalogState((previous) => {
+      if (!previous.catalog) return previous;
+      return {
+        catalog: {
+          ...previous.catalog,
+          profiles: previous.catalog.profiles.map((item) => (
+            item.profileId === profileId ? refreshedProfile : item
+          )),
+        },
+        error: null,
+        loading: false,
+      };
+    });
+    return refreshedProfile;
   };
 
   if (catalogState.loading) {
@@ -5280,7 +5376,9 @@ if (globalThis.__LLMOLYMPIC_ENABLE_TEST_HOOKS__) {
     normalizeControlJob,
     profileCredentialPath,
     profileCredentialRequest,
+    profileCredentialSuccess,
     profileKeyCanApply,
+    profileKeyValidationError,
     participationComponentKey,
     participationErrorClearsCapability,
     participationKeepsCapability,

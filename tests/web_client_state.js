@@ -93,6 +93,32 @@
   assert(observer.profileKeyCanApply("opaque-secret"), "a printable ASCII Profile Key can be applied");
   assert(!observer.profileKeyCanApply(" secret value "), "Profile Key whitespace fails closed");
   assert(!observer.profileKeyCanApply("line\nbreak"), "Profile Key control characters fail closed");
+  assert(!observer.profileKeyCanApply("密钥"), "a non-ASCII Profile Key fails closed");
+  equal(
+    observer.profileKeyValidationError(""),
+    "请输入 API Key。",
+    "an empty Profile Key has actionable validation copy",
+  );
+  equal(
+    observer.profileKeyValidationError(" leading-space"),
+    "API Key 只能包含不带空白的可打印 ASCII 字符。",
+    "Profile Key whitespace has actionable validation copy",
+  );
+  equal(
+    observer.profileKeyValidationError("密钥"),
+    "API Key 只能包含不带空白的可打印 ASCII 字符。",
+    "a non-ASCII Profile Key has actionable validation copy",
+  );
+  equal(
+    observer.profileKeyValidationError("a".repeat(8193)),
+    "API Key 不能超过 8192 个字符。",
+    "an oversized Profile Key has bounded validation copy",
+  );
+  equal(
+    observer.profileKeyValidationError("opaque-secret"),
+    null,
+    "a valid Profile Key has no validation error",
+  );
   equal(
     observer.profileCredentialRequest("PUT", "opaque-secret"),
     { body: { api_key: "opaque-secret" }, method: "PUT" },
@@ -107,6 +133,38 @@
     () => observer.profileCredentialRequest("PUT", ""),
     "invalid_request",
     "an empty Profile Key request fails before fetch",
+  );
+  equal(
+    observer.profileCredentialSuccess("PUT", {
+      available: true,
+      displayName: "Ready profile",
+    }),
+    { announcement: "Ready profile 的 Key 已应用。", focusTarget: "clear" },
+    "applying a Profile Key announces success and moves focus to its clear action",
+  );
+  equal(
+    observer.profileCredentialSuccess("DELETE", {
+      available: false,
+      displayName: "Cleared profile",
+    }),
+    { announcement: "Cleared profile 的 Key 已清除。", focusTarget: "input" },
+    "clearing a runtime-only Profile Key announces success and restores input focus",
+  );
+  equal(
+    observer.profileCredentialSuccess("DELETE", {
+      available: true,
+      displayName: "Environment profile",
+    }),
+    {
+      announcement: "已清除 Environment profile 的网页 Key；启动环境仍提供 Key。",
+      focusTarget: "clear",
+    },
+    "clearing a Profile Key explains an inherited environment fallback",
+  );
+  throwsCode(
+    () => observer.profileCredentialSuccess("POST", {}),
+    "invalid_request",
+    "an unsupported Profile Key result fails closed",
   );
 
   equal(

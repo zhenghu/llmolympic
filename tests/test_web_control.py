@@ -8,6 +8,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -18,7 +19,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 
 from llmolympic import control
-from llmolympic.config import ProviderProfile
+from llmolympic.config import ProviderProfile, ProviderTokenPrice
 from llmolympic.core.player import LLMPlayer
 from llmolympic.core.storage import SQLiteStore
 from llmolympic.core.tournament import prepare_round_robin
@@ -165,6 +166,16 @@ def test_runtime_profile_credential_requires_admin_same_origin_and_never_echoes_
     monkeypatch.delenv(profile.api_key_env, raising=False)
     monkeypatch.setattr(control, "load_profiles", lambda: profiles)
     monkeypatch.setattr("llmolympic.control_runner.load_profiles", lambda: profiles)
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:browser-profile:fixed-model": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
     client = client_factory(database)
     path = f"/api/v1/control/profiles/{profile.profile_id}/credential"
     sensitive_marker = "runtime-only-secret-sentinel"
@@ -685,6 +696,58 @@ def test_control_mock_prepare_does_not_load_broken_profiles(
 
     assert response.status_code == 201
     assert _job(response)["status"] == "prepared"
+
+
+def test_control_profile_prepare_requires_exact_current_pricing(
+    tmp_path: Path,
+    client_factory: Callable[[Path], TestClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="priced-profile",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="WEB_PRICED_PROFILE_KEY",
+    )
+    profiles = {profile.profile_id: profile}
+    monkeypatch.setattr(control, "load_profiles", lambda: profiles)
+    monkeypatch.setattr("llmolympic.control_runner.load_profiles", lambda: profiles)
+    monkeypatch.setattr(control, "load_provider_pricing", dict)
+    client = client_factory(tmp_path / "profile-pricing.db")
+    credential_path = f"/api/v1/control/profiles/{profile.profile_id}/credential"
+    assert client.put(
+        credential_path,
+        headers=_admin_headers(),
+        json={"api_key": "runtime-only-pricing-secret"},
+    ).status_code == 204
+
+    missing = client.post(
+        "/api/v1/control/jobs",
+        headers=_admin_headers(idempotency_key=_key("missing-profile-pricing")),
+        json=_profile_prepare_payload(profile.profile_id),
+    )
+    assert missing.status_code == 409
+    assert missing.json() == {"error": {"code": "provider_pricing_required"}}
+    assert "runtime-only-pricing-secret" not in missing.text
+
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:priced-profile:fixed-model": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
+    prepared = client.post(
+        "/api/v1/control/jobs",
+        headers=_admin_headers(idempotency_key=_key("exact-profile-pricing")),
+        json=_profile_prepare_payload(profile.profile_id),
+    )
+    assert prepared.status_code == 201
+    assert _job(prepared)["status"] == "prepared"
 
 
 def test_control_prepare_forbids_extra_fields_and_untrusted_route_configuration(

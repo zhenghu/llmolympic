@@ -8,12 +8,13 @@ import sqlite3
 import sys
 import textwrap
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from llmolympic import control, control_runner
-from llmolympic.config import ProviderProfile
+from llmolympic.config import ProviderProfile, ProviderTokenPrice
 from llmolympic.control import (
     ControlBudgetSpec,
     ControlError,
@@ -286,6 +287,16 @@ def test_runtime_profile_credential_is_scoped_to_used_child_and_not_persisted(
     profiles = {profile.profile_id: profile, unused.profile_id: unused}
     monkeypatch.setattr(control, "load_profiles", lambda: profiles)
     monkeypatch.setattr(control_runner, "load_profiles", lambda: profiles)
+    monkeypatch.setattr(
+        control,
+        "load_provider_pricing",
+        lambda: {
+            "profile:runtime:fixed-model": ProviderTokenPrice(
+                Decimal(0),
+                Decimal(0),
+            )
+        },
+    )
     monkeypatch.setenv(profile.api_key_env, "prepare-only-placeholder")
     spec = ControlJobSpec(
         mode="play",
@@ -406,6 +417,44 @@ def test_clearing_runtime_profile_credential_makes_later_start_fail_before_claim
         ).fetchone()[0]
     assert claimed == 0
     assert b"cleared-secret" not in store.path.read_bytes()
+
+
+@pytest.mark.parametrize("profile_change", ["removed", "invalid"])
+def test_clearing_stored_credential_succeeds_after_profile_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_change: str,
+) -> None:
+    profile = ProviderProfile(
+        profile_id="runtime-removed",
+        provider="openai",
+        default_model="fixed-model",
+        base_url="https://provider.example/v1",
+        api_key_env="RUNTIME_REMOVED_KEY",
+    )
+    profiles = {profile.profile_id: profile}
+    monkeypatch.setattr(control_runner, "load_profiles", lambda: profiles)
+    manager = ControlJobManager(JobStore(tmp_path / "runtime-removed.db"), environment={})
+
+    async def exercise() -> None:
+        try:
+            await manager.set_profile_credential(profile.profile_id, "removed-secret")
+            if profile_change == "removed":
+                profiles.clear()
+            else:
+                profiles[profile.profile_id] = replace(
+                    profile,
+                    provider="ollama",
+                    api_key_env=None,
+                )
+            await manager.clear_profile_credential(profile.profile_id)
+            assert not manager._runtime_profile_credentials
+            with pytest.raises(ControlError, match="profile_unavailable"):
+                await manager.clear_profile_credential(profile.profile_id)
+        finally:
+            await manager.shutdown()
+
+    asyncio.run(exercise())
 
 
 def test_runtime_profile_credential_is_invalidated_by_profile_configuration_drift(

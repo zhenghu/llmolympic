@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +15,7 @@ const PARTICIPATION_PATH = /^\/participate\/([A-Za-z0-9._:-]+)\/([A-Za-z0-9._:-]
 const WCAG_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 const CONTROL_START_TIMEOUT_MS = 20_000;
 const CONTROL_TEST_TIMEOUT_MS = 60_000;
+const FAKE_PROVIDER_MAX_BODY_BYTES = 64 * 1024;
 
 // Admin, seat, and ephemeral Provider credentials are real secrets. Disabling
 // screenshots and traces keeps password fields, Authorization headers,
@@ -43,20 +46,29 @@ function redactSensitiveText(value, secrets = []) {
   return safe.slice(-2_000);
 }
 
-function monitorBrowserErrors(page, errors, secrets) {
-  page.on("console", (message) => {
-    if (message.type() === "error") {
-      errors.push(`console: ${redactSensitiveText(message.text(), secrets)}`);
+function monitorBrowserMessages(page, monitor, secrets) {
+  const record = (label, value, { error = false } = {}) => {
+    const raw = String(value);
+    if (secrets.some((secret) => secret && raw.includes(secret))) {
+      monitor.sensitive = true;
     }
+    const safe = `${label}: ${redactSensitiveText(raw, secrets)}`;
+    monitor.messages.push(safe);
+    if (error) monitor.errors.push(safe);
+  };
+  page.on("console", (message) => {
+    record(`console:${message.type()}`, message.text(), {
+      error: message.type() === "error",
+    });
   });
   page.on("pageerror", (error) => {
-    errors.push(`pageerror: ${redactSensitiveText(error.message, secrets)}`);
+    record("pageerror", error.message, { error: true });
   });
 }
 
 async function reserveLoopbackPort() {
   return new Promise((resolve, reject) => {
-    const server = createServer();
+    const server = createNetServer();
     server.unref();
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
@@ -73,6 +85,203 @@ async function reserveLoopbackPort() {
   });
 }
 
+function digestAuthorization(value) {
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function sendFakeProviderJSON(response, status, payload) {
+  if (response.destroyed || response.writableEnded) return;
+  response.writeHead(status, {
+    "connection": "close",
+    "content-type": "application/json; charset=utf-8",
+  });
+  response.end(JSON.stringify(payload));
+}
+
+async function startFakeOpenAI(expectedCredential) {
+  const expectedAuthorizationDigest = digestAuthorization(
+    `Bearer ${expectedCredential}`,
+  );
+  const summary = {
+    authorizationMatched: true,
+    bodyCredentialFree: true,
+    bodyWithinLimit: true,
+    contentTypeHeaderMatched: true,
+    jsonMatched: true,
+    maxTokensMatched: true,
+    messageContentTypesMatched: true,
+    methodMatched: true,
+    modelMatched: true,
+    pathMatched: true,
+    promptMatched: true,
+    requestCount: 0,
+    rolesMatched: true,
+    transportMatched: true,
+  };
+  const server = createHttpServer((request, response) => {
+    summary.requestCount += 1;
+    const receivedDigest = digestAuthorization(
+      typeof request.headers.authorization === "string"
+        ? request.headers.authorization
+        : "",
+    );
+    const authorizationMatched = timingSafeEqual(
+      expectedAuthorizationDigest,
+      receivedDigest,
+    );
+    const contentTypeHeader = request.headers["content-type"];
+    const contentTypeHeaderMatched = typeof contentTypeHeader === "string"
+      && contentTypeHeader.split(";", 1)[0].trim().toLowerCase() === "application/json";
+    const methodMatched = request.method === "POST";
+    const pathMatched = request.url === "/v1/chat/completions";
+    summary.authorizationMatched = summary.authorizationMatched && authorizationMatched;
+    summary.contentTypeHeaderMatched = summary.contentTypeHeaderMatched
+      && contentTypeHeaderMatched;
+    summary.methodMatched = summary.methodMatched && methodMatched;
+    summary.pathMatched = summary.pathMatched && pathMatched;
+
+    let bodyBytes = 0;
+    let chunks = [];
+    request.on("data", (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > FAKE_PROVIDER_MAX_BODY_BYTES) {
+        summary.bodyWithinLimit = false;
+        chunks = [];
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("error", () => {
+      summary.transportMatched = false;
+      sendFakeProviderJSON(response, 400, {
+        error: { message: "request rejected", type: "invalid_request_error" },
+      });
+    });
+    request.on("end", () => {
+      if (bodyBytes > FAKE_PROVIDER_MAX_BODY_BYTES) {
+        sendFakeProviderJSON(response, 413, {
+          error: { message: "request rejected", type: "invalid_request_error" },
+        });
+        return;
+      }
+
+      const rawBody = Buffer.concat(chunks, bodyBytes);
+      summary.bodyCredentialFree = summary.bodyCredentialFree
+        && !rawBody.includes(Buffer.from(expectedCredential, "utf8"));
+      let body;
+      try {
+        body = JSON.parse(rawBody.toString("utf8"));
+      } catch (_error) {
+        summary.jsonMatched = false;
+        sendFakeProviderJSON(response, 400, {
+          error: { message: "request rejected", type: "invalid_request_error" },
+        });
+        return;
+      } finally {
+        chunks = [];
+      }
+
+      const messages = body && typeof body === "object" && Array.isArray(body.messages)
+        ? body.messages
+        : [];
+      const modelMatched = body && typeof body === "object" && body.model === "fake-model";
+      const rolesMatched = messages.length === 2
+        && messages[0] && messages[0].role === "system"
+        && messages[1] && messages[1].role === "user";
+      const messageContentTypesMatched = messages.length === 2
+        && messages.every((message) => (
+          message && typeof message === "object" && typeof message.content === "string"
+        ));
+      const promptMatched = messageContentTypesMatched
+        && messages[0].content.includes("LLM Olympics")
+        && messages[1].content.includes("数学问答")
+        && messages[1].content.includes("只输出最终数字答案");
+      const maxTokensMatched = body && typeof body === "object"
+        && body.max_tokens === 1
+        && !Object.prototype.hasOwnProperty.call(body, "max_completion_tokens");
+      summary.messageContentTypesMatched = summary.messageContentTypesMatched
+        && messageContentTypesMatched;
+      summary.maxTokensMatched = summary.maxTokensMatched && maxTokensMatched;
+      summary.modelMatched = summary.modelMatched && modelMatched;
+      summary.promptMatched = summary.promptMatched && promptMatched;
+      summary.rolesMatched = summary.rolesMatched && rolesMatched;
+
+      if (
+        !authorizationMatched
+        || !contentTypeHeaderMatched
+        || !methodMatched
+        || !pathMatched
+        || !modelMatched
+        || !rolesMatched
+        || !messageContentTypesMatched
+        || !promptMatched
+        || !maxTokensMatched
+      ) {
+        sendFakeProviderJSON(response, authorizationMatched ? 400 : 401, {
+          error: { message: "request rejected", type: "invalid_request_error" },
+        });
+        return;
+      }
+
+      sendFakeProviderJSON(response, 200, {
+        choices: [{
+          finish_reason: "stop",
+          index: 0,
+          message: { content: "0", role: "assistant" },
+        }],
+        created: 0,
+        id: "local-test-completion",
+        model: "fake-model",
+        object: "chat.completion",
+        usage: { completion_tokens: 1, prompt_tokens: 1, total_tokens: 2 },
+      });
+    });
+  });
+  server.on("clientError", (_error, socket) => {
+    summary.transportMatched = false;
+    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  server.removeAllListeners("error");
+  server.on("error", () => {
+    summary.transportMatched = false;
+  });
+  server.unref();
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise((resolve) => server.close(resolve));
+    throw new Error("local fake Provider did not bind a loopback port");
+  }
+
+  return {
+    baseURL: `http://127.0.0.1:${address.port}`,
+    snapshot: () => ({ ...summary }),
+    stop: async () => {
+      if (!server.listening) return;
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          if (typeof server.closeAllConnections === "function") {
+            server.closeAllConnections();
+          }
+          reject(new Error("local fake Provider did not stop in time"));
+        }, 2_000);
+        server.close((error) => {
+          clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve();
+        });
+        if (typeof server.closeIdleConnections === "function") {
+          server.closeIdleConnections();
+        }
+      });
+    },
+  };
+}
+
 async function waitForExit(child, timeoutMs = 5_000) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await Promise.race([
@@ -81,16 +290,108 @@ async function waitForExit(child, timeoutMs = 5_000) {
   ]);
 }
 
-async function stopControlServer(server) {
-  if (server.child.exitCode === null && server.child.signalCode === null) {
-    server.child.kill("SIGTERM");
-    await waitForExit(server.child);
+async function directoryContainsSecret(root, secret) {
+  if (!secret) return false;
+  const needle = Buffer.from(secret, "utf8");
+  const visit = async (path) => {
+    let entries;
+    try {
+      entries = await readdir(path, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT") return false;
+      throw new Error("temporary control files could not be scanned");
+    }
+    for (const entry of entries) {
+      const candidate = join(path, entry.name);
+      if (entry.isDirectory()) {
+        if (await visit(candidate)) return true;
+      } else if (entry.isFile()) {
+        let bytes;
+        try {
+          bytes = await readFile(candidate);
+        } catch (error) {
+          if (error && error.code === "ENOENT") continue;
+          throw new Error("temporary control files could not be scanned");
+        }
+        if (bytes.includes(needle)) return true;
+      }
+    }
+    return false;
+  };
+  return visit(root);
+}
+
+async function stopControlServer(server, { cleanup = true } = {}) {
+  let failed = false;
+  try {
+    if (
+      server.child
+      && server.child.exitCode === null
+      && server.child.signalCode === null
+    ) {
+      server.child.kill("SIGTERM");
+      await waitForExit(server.child);
+    }
+    if (
+      server.child
+      && server.child.exitCode === null
+      && server.child.signalCode === null
+    ) {
+      server.child.kill("SIGKILL");
+      await waitForExit(server.child, 2_000);
+    }
+  } catch (_error) {
+    failed = true;
   }
-  if (server.child.exitCode === null && server.child.signalCode === null) {
-    server.child.kill("SIGKILL");
-    await waitForExit(server.child, 2_000);
+  try {
+    if (server.fakeProvider) await server.fakeProvider.stop();
+  } catch (_error) {
+    failed = true;
   }
-  await rm(server.root, { force: true, recursive: true });
+  if (cleanup) {
+    try {
+      await rm(server.root, { force: true, recursive: true });
+    } catch (_error) {
+      failed = true;
+    }
+  }
+  if (failed) throw new Error("local Web control fixture did not stop cleanly");
+}
+
+async function stopAuditAndCleanControlServer(server) {
+  let stopFailed = false;
+  let scanFailed = false;
+  let credentialPersisted = false;
+  let cleanupFailed = false;
+  let stderrContainedCredential = false;
+  try {
+    await stopControlServer(server, { cleanup: false });
+  } catch (_error) {
+    stopFailed = true;
+  }
+  stderrContainedCredential = server.stderrContains(server.providerCredential);
+  try {
+    credentialPersisted = await directoryContainsSecret(
+      server.root,
+      server.providerCredential,
+    );
+  } catch (_error) {
+    scanFailed = true;
+  }
+  try {
+    await rm(server.root, { force: true, recursive: true });
+  } catch (_error) {
+    cleanupFailed = true;
+  }
+  if (credentialPersisted) {
+    throw new Error("temporary control files retained a Provider credential");
+  }
+  if (stderrContainedCredential) {
+    throw new Error("server stderr contained a redacted Provider credential");
+  }
+  if (scanFailed) throw new Error("temporary control files could not be scanned");
+  if (cleanupFailed) throw new Error("temporary control files could not be removed");
+  if (stopFailed) throw new Error("local Web control fixture did not stop cleanly");
 }
 
 async function startControlServer() {
@@ -101,56 +402,81 @@ async function startControlServer() {
   const database = join(root, "control.db");
   const config = join(root, "config.toml");
   const tokenFile = join(root, "admin.token");
-  const port = await reserveLoopbackPort();
-  const baseURL = `http://127.0.0.1:${port}`;
-  await writeFile(config, [
-    "[profiles.browser-test]",
-    'provider = "openai"',
-    'default_model = "fake-model"',
-    'base_url = "https://provider.invalid/v1"',
-    'api_key_env = "E2E_BROWSER_PROFILE_KEY"',
-    'display_name = "E2E Provider"',
-    "",
-  ].join("\n"), { encoding: "utf8", mode: 0o600 });
-  const childEnvironment = { ...process.env };
-  delete childEnvironment.E2E_BROWSER_PROFILE_KEY;
-  delete childEnvironment.LLMOLYMPIC_CONFIG;
-  const child = spawn(
-    executable,
-    [
-      "web",
-      "--db",
-      database,
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(port),
-      "--control-token-file",
-      tokenFile,
-    ],
-    {
-      env: {
-        ...childEnvironment,
-        COLUMNS: "500",
-        FORCE_COLOR: "0",
-        LLMOLYMPIC_CONFIG: config,
-        NO_COLOR: "1",
-      },
-      // stdout could contain a capability if the CLI regressed. It is never
-      // retained or surfaced by this fixture.
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  );
-  child.stderr.setEncoding("utf8");
-  let stderr = "";
-  child.stderr.on("data", (chunk) => {
-    stderr = `${stderr}${chunk}`.slice(-8_000);
-  });
-
-  const deadline = Date.now() + CONTROL_START_TIMEOUT_MS;
-  let adminToken = null;
-  let lastStatus = null;
+  const providerCredential = randomBytes(32).toString("base64url");
+  let child = null;
+  let fakeProvider = null;
   try {
+    fakeProvider = await startFakeOpenAI(providerCredential);
+    const port = await reserveLoopbackPort();
+    const baseURL = `http://127.0.0.1:${port}`;
+    await writeFile(config, [
+      "[profiles.browser-test]",
+      'provider = "openai"',
+      'default_model = "fake-model"',
+      `base_url = "${fakeProvider.baseURL}/v1"`,
+      'api_key_env = "E2E_BROWSER_PROFILE_KEY"',
+      'display_name = "E2E Provider"',
+      "",
+      '[pricing."profile:browser-test:fake-model"]',
+      'input_usd_per_million_tokens = "0"',
+      'output_usd_per_million_tokens = "0"',
+      "",
+    ].join("\n"), { encoding: "utf8", mode: 0o600 });
+    const childEnvironment = { ...process.env };
+    for (const name of [
+      "ALL_PROXY",
+      "HTTPS_PROXY",
+      "HTTP_PROXY",
+      "all_proxy",
+      "https_proxy",
+      "http_proxy",
+    ]) {
+      delete childEnvironment[name];
+    }
+    delete childEnvironment.E2E_BROWSER_PROFILE_KEY;
+    delete childEnvironment.LLMOLYMPIC_CONFIG;
+    childEnvironment.NO_PROXY = "127.0.0.1,localhost,::1";
+    childEnvironment.no_proxy = "127.0.0.1,localhost,::1";
+    child = spawn(
+      executable,
+      [
+        "web",
+        "--db",
+        database,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--control-token-file",
+        tokenFile,
+      ],
+      {
+        env: {
+          ...childEnvironment,
+          COLUMNS: "500",
+          FORCE_COLOR: "0",
+          LLMOLYMPIC_CONFIG: config,
+          NO_COLOR: "1",
+        },
+        // stdout could contain a capability if the CLI regressed. It is never
+        // retained or surfaced by this fixture.
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    child.stderr.setEncoding("utf8");
+    let stderr = "";
+    let stderrContainedProviderCredential = false;
+    child.stderr.on("data", (chunk) => {
+      const combined = `${stderr}${chunk}`;
+      if (combined.includes(providerCredential)) {
+        stderrContainedProviderCredential = true;
+      }
+      stderr = combined.slice(-8_000);
+    });
+
+    const deadline = Date.now() + CONTROL_START_TIMEOUT_MS;
+    let adminToken = null;
+    let lastStatus = null;
     while (Date.now() < deadline) {
       if (child.exitCode !== null || child.signalCode !== null) break;
       if (adminToken === null) {
@@ -169,7 +495,23 @@ async function startControlServer() {
           });
           lastStatus = response.status;
           if (response.ok) {
-            return { adminToken, baseURL, child, database, root };
+            return {
+              adminToken,
+              baseURL,
+              child,
+              database,
+              fakeProvider,
+              fakeProviderSummary: () => fakeProvider.snapshot(),
+              providerCredential,
+              root,
+              stderrContains: (secret) => Boolean(
+                secret
+                && (
+                  (secret === providerCredential && stderrContainedProviderCredential)
+                  || stderr.includes(secret)
+                )
+              ),
+            };
           }
         } catch (_error) {
           // The server may still be binding the loopback socket.
@@ -180,11 +522,15 @@ async function startControlServer() {
     throw new Error(
       `local Web control server did not become ready` +
         (lastStatus === null ? "" : ` (HTTP ${lastStatus})`) +
-        `\nstderr: ${redactSensitiveText(stderr, [adminToken])}` +
+        `\nstderr: ${redactSensitiveText(stderr, [adminToken, providerCredential])}` +
         "\nserver stdout withheld because it may contain a capability",
     );
   } catch (error) {
-    await stopControlServer({ child, root });
+    try {
+      await stopControlServer({ child, fakeProvider, root });
+    } catch (_cleanupError) {
+      throw new Error("local Web control fixture setup could not be cleaned up");
+    }
     throw error;
   }
 }
@@ -195,14 +541,14 @@ const test = base.extend({
     try {
       await use(server);
     } finally {
-      await stopControlServer(server);
+      await stopAuditAndCleanControlServer(server);
     }
   },
 });
 
 async function openAdminPage(browser, server, pathname = "/new") {
   const secrets = [server.adminToken];
-  const errors = [];
+  const monitor = { errors: [], messages: [], sensitive: false };
   const context = await browser.newContext({
     baseURL: server.baseURL,
     colorScheme: "light",
@@ -221,10 +567,17 @@ async function openAdminPage(browser, server, pathname = "/new") {
     throw new Error("browser could not stage a local admin credential");
   }
   const page = await context.newPage();
-  monitorBrowserErrors(page, errors, secrets);
+  monitorBrowserMessages(page, monitor, secrets);
   await page.goto(pathname);
   expect(await page.evaluate(() => window.location.hash)).toBe("");
-  return { context, errors, page, secrets };
+  return {
+    browserMessages: monitor.messages,
+    context,
+    errors: monitor.errors,
+    page,
+    secrets,
+    sensitiveMessageSeen: () => monitor.sensitive,
+  };
 }
 
 async function configureMathQuiz(page, { humanName = null } = {}) {
@@ -247,36 +600,79 @@ test.describe("ephemeral Provider credentials", () => {
     browser,
     controlServer,
   }) => {
-    const sentinel = "e2e-browser-profile-key-sentinel";
+    const sentinel = controlServer.providerCredential;
     const admin = await openAdminPage(browser, controlServer);
     admin.secrets.push(sentinel);
     try {
       const keyInput = admin.page.getByLabel("E2E Provider 的 API Key");
+      const applyButton = admin.page.getByRole("button", { name: "应用 Key" });
+      const announcement = admin.page.locator(
+        "#profile-credential-browser-test-announcement",
+      );
       await expect(keyInput).toBeVisible();
       await expect(keyInput).toHaveAttribute("type", "password");
       await expect(keyInput).toHaveAttribute("autocomplete", "new-password");
       await expect(admin.page.getByText("Key 未就绪", { exact: true })).toBeVisible();
+      await expect(announcement).toHaveText("");
+      const announcementHandle = await announcement.elementHandle();
+      expect(announcementHandle).not.toBeNull();
+
+      await keyInput.fill(" leading-space");
+      await applyButton.click();
+      await expect(keyInput).toHaveAttribute("aria-invalid", "true");
+      await expect(admin.page.getByText(
+        "API Key 只能包含不带空白的可打印 ASCII 字符。",
+        { exact: true },
+      )).toBeVisible();
+      await expect(keyInput).toBeFocused();
+
+      await keyInput.fill("密钥");
+      await expect(keyInput).toHaveAttribute("aria-invalid", "true");
+      await expect(admin.page.getByText(
+        "API Key 只能包含不带空白的可打印 ASCII 字符。",
+        { exact: true },
+      )).toBeVisible();
+
+      await keyInput.fill("");
+      await applyButton.click();
+      await expect(keyInput).toHaveAttribute("aria-invalid", "true");
+      await expect(admin.page.getByText("请输入 API Key。", { exact: true })).toBeVisible();
+
       await keyInput.fill(sentinel);
+      await expect(keyInput).not.toHaveAttribute("aria-invalid", "true");
 
       const applied = admin.page.waitForResponse((response) => (
         response.request().method() === "PUT"
         && response.url().endsWith("/api/v1/control/profiles/browser-test/credential")
       ));
-      await admin.page.getByRole("button", { name: "应用 Key" }).click();
+      await applyButton.click();
       expect((await applied).status()).toBe(204);
 
       await expect(keyInput).toHaveCount(0);
       await expect(admin.page.getByText("Key 已就绪", { exact: true })).toBeVisible();
-      expect(admin.page.url()).not.toContain(sentinel);
+      await expect(announcement).toHaveText("E2E Provider 的 Key 已应用。");
+      await expect(admin.page.getByRole("button", { name: "清除本次 Key" })).toBeFocused();
+      expect(await announcement.evaluate(
+        (node, original) => node === original,
+        announcementHandle,
+      )).toBeTruthy();
       expect(await admin.context.cookies()).toEqual([]);
       const browserState = await admin.page.evaluate(() => ({
         html: document.documentElement.outerHTML,
         localStorage: Object.entries(window.localStorage),
         sessionStorage: Object.entries(window.sessionStorage),
+        url: window.location.href,
       }));
-      expect(browserState.html).not.toContain(sentinel);
-      expect(JSON.stringify(browserState.localStorage)).not.toContain(sentinel);
-      expect(JSON.stringify(browserState.sessionStorage)).not.toContain(sentinel);
+      const browserStateRetainedCredential = [
+        browserState.html,
+        JSON.stringify(browserState.localStorage),
+        JSON.stringify(browserState.sessionStorage),
+        browserState.url,
+      ].some((value) => value.includes(sentinel));
+      expect(
+        browserStateRetainedCredential,
+        "browser state retained a redacted Provider credential",
+      ).toBe(false);
       expect(browserState.sessionStorage.some(([key]) => key === "llmolympic.control.admin")).toBeTruthy();
 
       await admin.page.reload();
@@ -296,9 +692,144 @@ test.describe("ephemeral Provider credentials", () => {
       await expect(restoredInput).toBeVisible();
       await expect(restoredInput).toHaveValue("");
       await expect(restoredInput).toHaveAttribute("type", "password");
+      await expect(restoredInput).toBeFocused();
+      await expect(announcement).toHaveText("E2E Provider 的 Key 已清除。");
       await expectNoWcagViolations(admin.page);
       expect(admin.errors).toEqual([]);
     } finally {
+      expect.soft(
+        admin.sensitiveMessageSeen(),
+        "browser messages contained a redacted Provider credential",
+      ).toBe(false);
+      expect.soft(
+        controlServer.stderrContains(sentinel),
+        "server stderr contained a redacted Provider credential",
+      ).toBe(false);
+      await admin.context.close();
+    }
+  });
+
+  test("runs a real worker through a local fake OpenAI endpoint", async ({
+    browser,
+    controlServer,
+  }) => {
+    test.setTimeout(CONTROL_TEST_TIMEOUT_MS);
+    const credential = controlServer.providerCredential;
+    const admin = await openAdminPage(browser, controlServer);
+    admin.secrets.push(credential);
+    try {
+      const keyInput = admin.page.getByLabel("E2E Provider 的 API Key");
+      await keyInput.fill(credential);
+      const applied = admin.page.waitForResponse((response) => (
+        response.request().method() === "PUT"
+        && response.url().endsWith("/api/v1/control/profiles/browser-test/credential")
+      ));
+      await admin.page.getByRole("button", { name: "应用 Key" }).click();
+      expect((await applied).status()).toBe(204);
+      await expect(admin.page.getByText("Key 已就绪", { exact: true })).toBeVisible();
+
+      await admin.page.getByLabel("比赛项目").selectOption("math_quiz");
+      await admin.page.locator("#player-0-kind").selectOption("profile");
+      await admin.page.locator("#player-0-profile").selectOption("browser-test");
+      await admin.page.locator("#player-1-kind").selectOption("mock");
+      await admin.page.locator("#player-1-strategy").selectOption("fixed");
+      await admin.page.getByLabel("每场回合数").fill("1");
+      await admin.page.getByLabel("随机种子").fill("7331");
+      await admin.page.getByLabel("最大调用数").fill("2");
+      await admin.page.getByLabel("最大输入 Token").fill("4096");
+      await admin.page.getByLabel("单次最大输出 Token").fill("1");
+      await admin.page.getByLabel("累计最大输出 Token").fill("1");
+      await admin.page.getByLabel("最大预估成本（USD）").fill("0");
+
+      await prepareAndStart(admin.page);
+      await expect(admin.page.locator(
+        ".job-status.status-completed, .job-status.status-failed",
+      )).toBeVisible({ timeout: 25_000 });
+      const providerSummary = controlServer.fakeProviderSummary();
+      expect(providerSummary, "fake Provider safe contract summary").toEqual({
+        authorizationMatched: true,
+        bodyCredentialFree: true,
+        bodyWithinLimit: true,
+        contentTypeHeaderMatched: true,
+        jsonMatched: true,
+        maxTokensMatched: true,
+        messageContentTypesMatched: true,
+        methodMatched: true,
+        modelMatched: true,
+        pathMatched: true,
+        promptMatched: true,
+        requestCount: 1,
+        rolesMatched: true,
+        transportMatched: true,
+      });
+      const { archivePath } = await waitForCompletedJob(admin.page);
+
+      const jobId = new URL(admin.page.url()).pathname.split("/").pop();
+      const jobResponse = await admin.page.request.get(
+        `${controlServer.baseURL}/api/v1/control/jobs/${encodeURIComponent(jobId)}`,
+        { headers: { Authorization: `Bearer ${controlServer.adminToken}` } },
+      );
+      expect(jobResponse.ok()).toBeTruthy();
+      const jobText = await jobResponse.text();
+      expect(
+        jobText.includes(credential),
+        "control job response retained a redacted Provider credential",
+      ).toBe(false);
+      const { job } = JSON.parse(jobText);
+      expect(job).toEqual(expect.objectContaining({
+        failure_code: null,
+        final_kind: "match",
+        status: "completed",
+      }));
+      expect(job.final_match_ids).toHaveLength(1);
+
+      const detailResponse = await admin.page.request.get(`/api/v1${archivePath}`);
+      expect(detailResponse.ok()).toBeTruthy();
+      const archiveText = await detailResponse.text();
+      expect(
+        archiveText.includes(credential),
+        "public archive retained a redacted Provider credential",
+      ).toBe(false);
+      const detail = JSON.parse(archiveText);
+      expect(detail.match).toEqual(expect.objectContaining({
+        game: "math_quiz",
+        players: ["E2E Provider", "mock:fixed"],
+        rated: true,
+      }));
+      expect(job.final_match_ids).toEqual([detail.match.match_id]);
+      expect(
+        detail.events.some((event) => (
+          event.type === "move_received"
+          && event.player === "E2E Provider"
+          && event.data && event.data.move === "0"
+        )),
+        "public archive omitted the fake Provider move",
+      ).toBe(true);
+      expect(
+        await directoryContainsSecret(controlServer.root, credential),
+        "running control files retained a redacted Provider credential",
+      ).toBe(false);
+
+      const browserStateRetainedCredential = await admin.page.evaluate((secret) => (
+        window.location.href.includes(secret)
+        || document.documentElement.outerHTML.includes(secret)
+        || JSON.stringify(Object.entries(window.localStorage)).includes(secret)
+        || JSON.stringify(Object.entries(window.sessionStorage)).includes(secret)
+      ), credential);
+      expect(
+        browserStateRetainedCredential,
+        "browser state retained a redacted Provider credential",
+      ).toBe(false);
+      expect(admin.errors).toEqual([]);
+    } finally {
+      expect.soft(
+        admin.sensitiveMessageSeen(),
+        "browser messages contained a redacted Provider credential",
+      ).toBe(false);
+      expect.soft(
+        controlServer.stderrContains(credential),
+        "server stderr contained a redacted Provider credential",
+      ).toBe(false);
       await admin.context.close();
     }
   });
@@ -420,7 +951,7 @@ test("full Web control starts a browser Human seat in a second context and archi
     const participation = await extractParticipationCredential(admin.page);
     admin.secrets.push(participation.capability);
 
-    const participantErrors = [];
+    const participantMonitor = { errors: [], messages: [], sensitive: false };
     participantContext = await browser.newContext({
       baseURL: controlServer.baseURL,
       colorScheme: "light",
@@ -442,9 +973,9 @@ test("full Web control starts a browser Human seat in a second context and archi
       throw new Error("browser could not stage a local participation credential");
     }
     const participantPage = await participantContext.newPage();
-    monitorBrowserErrors(
+    monitorBrowserMessages(
       participantPage,
-      participantErrors,
+      participantMonitor,
       [controlServer.adminToken, participation.capability],
     );
     await participantPage.goto(participation.pathname);
@@ -488,7 +1019,7 @@ test("full Web control starts a browser Human seat in a second context and archi
     await expect(admin.page.getByText("WebSocket 同源回放", { exact: true })).toBeVisible();
     await expectNoWcagViolations(admin.page);
     expect(admin.errors).toEqual([]);
-    expect(participantErrors).toEqual([]);
+    expect(participantMonitor.errors).toEqual([]);
   } finally {
     if (participantContext !== null) await participantContext.close();
     await admin.context.close();

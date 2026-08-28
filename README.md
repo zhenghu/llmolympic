@@ -388,7 +388,9 @@ job spec/预览、正式档案、URL/fragment、Web Storage 或应用日志。�
 任务，且不会移除启动环境中已有的同名变量。已运行 worker 拥有自己的环境副本；要阻止它
 继续或完成已发出的 Provider 请求，需要停止任务或在 Provider 端撤销 Key。持有 admin
 capability 的人在 Key 就绪期间可启动使用它的 Provider 任务；调用仍要求完整硬预算和
-显式的二次确认。Human 仍只允许用于 `play`；其他模式保持既有非人类限制。
+显式的二次确认。新建任务会在 prepare 阶段核对每条云端 Profile 默认模型是否存在精确
+`profile:<id>:<model>` 定价；缺失或价格配置无效时，页面会要求修复 `[pricing]` 并重启服务，
+不会先启动 worker。Human 仍只允许用于 `play`；其他模式保持既有非人类限制。
 
 中断的循环赛和锦标赛都只能显式恢复；未过期的对应 runner lease 仍在活动时不会显示恢复
 入口。Web 只允许恢复全 Mock 且无预算的 checkpoint，或者只含命名 Profile、并已持久化冻结

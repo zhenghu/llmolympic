@@ -593,6 +593,7 @@ input[type="range"] { width: 100%; accent-color: var(--coral); cursor: pointer; 
 .profile-credential-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; }
 .profile-credential-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .profile-credential-actions .field-help { margin: 0; }
+.profile-credential-announcement { min-height: 1.45em; margin: 0; color: #176b4a; font-size: 12px; line-height: 1.45; }
 .field-error, .section-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.45; }
 .section-error { padding: 12px 14px; border-radius: 12px; background: rgba(169, 52, 48, .05); }
 .roster-list { display: grid; gap: 14px; }
