@@ -27,6 +27,9 @@
   运行时 Key。它以 Profile ID 及全部无凭据 Profile 配置的摘要为索引，保存在 Web 控制器的
   非持久运行时凭据库；启动对应 worker 时按需复制到其环境。它不会在摘要不同的配置上复用，
   服务重启会清空。Profile 中的 `api_key_env` 启动路径仍然支持。
+- 新建 Web 云端 Profile 任务在 prepare 阶段要求每个有效模型存在精确
+  `profile:<id>:<model>` 定价，并按规范 Provider route 拒绝冲突价格；恢复任务不读取当前
+  `[pricing]`，继续使用 checkpoint 中已冻结的预算与价格策略。
 - 没有 Profile 或显式 `entrant_id` 的兼容 Provider 调用，会以 provider、模型、
   展示名和安全采样参数生成确定性摘要；这种兼容身份重命名后会变化，需要跨名称
   延续身份时应使用命名 Profile 或显式 ID。
