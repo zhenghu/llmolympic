@@ -4,12 +4,19 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-28
+
+- 首个 1.x 正式版本线：继续以 Python 3.11+、SQLite v11 和仅绑定回环地址的本机 Web
+  控制面为稳定发布基础，GitHub Release 提供 wheel、sdist 与 SHA-256 校验和。
+- 本次主版本号提升不改变 SQLite v11、control/live sidecar、档案或公开 Web API schema；
+  从 v0.11.0 升级到 v1.0.0 不需要数据库迁移。
 - 本机 Web 管理页现可为已配置 `api_key_env` 和 `default_model` 的 OpenAI Profile 录入或
   清除 API Key。网页提交的 Key 绑定全部无凭据 Profile 配置的摘要，保存在 Web 控制器的
   非持久运行时凭据库；启动对应 CLI worker 时才按需复制到它的环境变量。环境变量启动方式
   仍然支持。
 - Profile 凭据变量名现在须为大写凭据型名称并使用 `_API_KEY`、`_TOKEN`、`_SECRET` 或
-  `_KEY` 后缀，且不能占用 `LLMOLYMPIC_*` 控制变量，避免把网页输入误路由到进程控制环境。
+  `_KEY` 后缀，且不能占用 `LLMOLYMPIC_*` 控制变量，避免把网页输入误路由到进程控制环境；
+  旧配置不符合规则时，升级前须同步重命名 `api_key_env` 和对应环境变量，并运行 `doctor`。
 - 应用不主动把该 Key 或哈希写入配置、SQLite/jobs、档案、URL、Web Storage 或日志；服务重启
   后临时 Key 失效。清除只影响后续启动的任务，已运行 worker 需停止或在 Provider 端撤销 Key。
   这是应用级最小化保留，不承诺物理内存擦除或对浏览器/同一操作系统账户的绝对保密。
