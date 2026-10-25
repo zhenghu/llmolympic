@@ -12,10 +12,10 @@
     "verify:web-vendor": "node scripts/verify_web_vendor.mjs"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.13.0",
-    "@playwright/test": "1.62.1",
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.64.1",
     "esbuild": "0.28.2",
-    "playwright-core": "1.62.1",
+    "playwright-core": "1.64.1",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   }
